@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"io"
 	"sync"
 
 	"github.com/xtls/xray-core/common"
@@ -20,6 +21,14 @@ type stream struct {
 
 	isUDP     bool
 	udpTarget *xnet.Destination
+
+	// udpPipe 为 true 时走 canonical full-cone 路径:PSH 帧体喂进 uplink pipe,由 handleUDPStream
+	// 逐包解目标写进单条 freedom link;fork 自身客户端(client=xray)不置此位,仍走 raw 透传。
+	udpPipe      bool
+	uplinkR      *io.PipeReader
+	uplinkW      *io.PipeWriter
+	uotConnected bool
+	uotDest      xnet.Destination
 }
 
 func newStream(sid uint32, link *transport.Link) *stream {
@@ -31,6 +40,14 @@ func newStream(sid uint32, link *transport.Link) *stream {
 }
 
 func (st *stream) close(err error) {
+	// 关闭 uplink pipe 两端:让 handleUDPStream 的读循环拿到 EOF/ErrClosedPipe 退出,
+	// 并解阻塞可能卡在 feedUDPUplink 写入的 readLoop。io.Pipe 的 Close 幂等,可重复调用。
+	if st.uplinkW != nil {
+		st.uplinkW.Close()
+	}
+	if st.uplinkR != nil {
+		st.uplinkR.Close()
+	}
 	if st.done == nil {
 		if st.link != nil {
 			common.Close(st.link.Reader)

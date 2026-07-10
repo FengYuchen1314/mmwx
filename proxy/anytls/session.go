@@ -44,6 +44,9 @@ type session struct {
 	dispatcher       routing.Dispatcher
 	handshakeDone    bool
 	clientPaddingMD5 string
+	// peerIsXrayClient 为 true 表示对端是 fork 自身的 anytls 客户端(settings 里 client=xray)。
+	// 该客户端的 UDP 走非 spec 的 raw 透传;canonical 客户端(mihomo/sing-box)走 full-cone uot 路径。
+	peerIsXrayClient bool
 
 	client       *Client
 	nextSID      atomic.Uint32
@@ -91,9 +94,19 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	// Check for UDP-over-TCP v2 magic domain in a new stream request.
 	if strings.Contains(dest.Address.String(), "udp-over-tcp.arpa") {
 		st.isUDP = true
+		// canonical 客户端(非 fork xray):走 full-cone uot 路径 —— 建 per-stream pipe,
+		// 后续 PSH 帧体全喂进 pipe,由 handleUDPStream 逐包解目标写进单条 freedom link。
+		// fork 自身客户端仍走 raw 路径(handleFirstUDPFrame/handlePSH),行为不变。
+		if !s.peerIsXrayClient {
+			st.udpPipe = true
+			st.uplinkR, st.uplinkW = io.Pipe()
+		}
 		if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
 			errors.LogWarning(ctx, "anytls: UDP SYNACK send error, streamId=", st.sid, " err=", err)
 			return err
+		}
+		if st.udpPipe {
+			go s.handleUDPStream(ctx, st)
 		}
 		return nil
 	}
@@ -318,6 +331,11 @@ func (s *session) readLoop(ctx context.Context) error {
 						}
 					case "padding-md5":
 						s.clientPaddingMD5 = strings.ToLower(kv[1])
+					case "client":
+						// fork 自身客户端标识,用于 UDP 分支(raw 透传 vs full-cone uot)。
+						if kv[1] == "xray" {
+							s.peerIsXrayClient = true
+						}
 					}
 				}
 			}
@@ -392,6 +410,12 @@ func (s *session) readLoop(ctx context.Context) error {
 				err := errors.New("anytls: received PSH for unknown stream, streamId=", sid)
 				s.finishStream(sid, err)
 				return nil
+			} else if st.udpPipe {
+				// canonical full-cone 路径:帧体喂进 per-stream pipe,由 handleUDPStream 解码。
+				if err := s.feedUDPUplink(st, length); err != nil {
+					return err
+				}
+				continue
 			} else if st.isUDP && st.link == nil {
 				if err := s.handleFirstUDPFrame(ctx, st, s.br); err != nil {
 					return err
