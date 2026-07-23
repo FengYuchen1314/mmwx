@@ -2,8 +2,10 @@ package snell
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -22,18 +24,17 @@ import (
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
 
-// Server 是 Snell inbound。v4/v5:per-user PSK 试解 + obfs;v6:shared PSK 派生 profile + clientID 区分用户。
+// Server 是 Snell inbound。v4/v5 与 v6 都按 per-user PSK 逐一试解首个 record 定位用户
+// (v6 default 从 saltBlock 提取 salt、unshaped 读明文 salt),从而支持 per-user 流量统计 / 限速 /
+// 限连接数;unsafe-raw 无任何密钥无法区分用户,回落首个用户。
 type Server struct {
 	policyManager policy.Manager
 	users         []*protocol.MemoryUser
 	obfs          obfsConfig
 
 	// v6 专用(version==6 时生效)
-	version       uint32
-	v6Mode        Mode
-	sharedPSK     []byte
-	profile       *Profile
-	clientIDUsers map[string]*protocol.MemoryUser
+	version uint32
+	v6Mode  Mode
 }
 
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
@@ -58,24 +59,16 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	s.version = acc0.Version
 
 	if s.version == 6 {
-		// v6:整个 inbound 共享一个 PSK(服务器密码),派生一个 profile;各用户用 clientID 区分。
-		if len(acc0.PSK) < 12 || len(acc0.PSK) > 255 {
-			return nil, errors.New("snell: v6 psk length must be 12..255 bytes")
-		}
+		// v6:每个用户各自的 PSK 派生 profile / AEAD;服务端逐 PSK 试解首个 record 定位用户
+		// (见 identifyV6User),从而支持 per-user 流量统计 / 限速 / 限连接数。整形本身即混淆,无 obfs。
 		mode, err := ParseMode(acc0.V6Mode)
 		if err != nil {
 			return nil, err
 		}
 		s.v6Mode = mode
-		s.sharedPSK = acc0.PSK
-		if mode == ModeDefault {
-			s.profile = NewProfile(acc0.PSK)
-		}
-		s.clientIDUsers = make(map[string]*protocol.MemoryUser)
 		for _, u := range s.users {
-			acc := u.Account.(*MemoryAccount)
-			if len(acc.ClientID) > 0 {
-				s.clientIDUsers[string(acc.ClientID)] = u
+			if psk := u.Account.(*MemoryAccount).PSK; len(psk) < 12 || len(psk) > 255 {
+				return nil, errors.New("snell: v6 psk length must be 12..255 bytes")
 			}
 		}
 		return s, nil
@@ -88,17 +81,6 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	}
 	s.obfs = obfsConfig{mode: mode, host: acc0.ObfsHost}
 	return s, nil
-}
-
-// lookupV6User 按 clientID 查用户;单用户(无 clientID 配置)时直接用 users[0]。
-func (s *Server) lookupV6User(clientID []byte) *protocol.MemoryUser {
-	if u, ok := s.clientIDUsers[string(clientID)]; ok {
-		return u
-	}
-	if len(s.clientIDUsers) == 0 {
-		return s.users[0]
-	}
-	return nil
 }
 
 func (s *Server) Network() []xnet.Network {
@@ -162,26 +144,114 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	return s.serve(ctx, req, reader, writer, dispatcher, sessPolicy)
 }
 
-// processV6:共享 PSK 派生 profile,shaped/unshaped/raw reader 读握手,按 clientID 查用户。
+// processV6:逐 PSK 试解首个 record 定位用户(default/unshaped),再按该用户各自的 PSK 建 reader/writer。
+// unsafe-raw 无密钥无法区分用户,回落 users[0](明文调试模式,不用于多用户统计)。
 func (s *Server) processV6(ctx context.Context, conn stat.Connection, dispatcher routing.Dispatcher, sessPolicy policy.Session) error {
 	// v6 无 obfs(整形本身即混淆)。
-	reader := newV6Reader(conn, s.v6Mode, s.sharedPSK, s.profile)
+	user, profile, head, err := s.identifyV6User(conn)
+	if err != nil {
+		return errors.New("snell v6: identify user").Base(err)
+	}
+	account := user.Account.(*MemoryAccount)
+
+	// head 是识别阶段已从 conn 消费的首 record 前缀(salt/saltBlock + prefix + header)。
+	// 用 MultiReader 把它拼回 conn,让 reader 从头重读 salt+header —— 与未消费时逻辑完全一致。
+	var src io.Reader = conn
+	if len(head) > 0 {
+		src = io.MultiReader(bytes.NewReader(head), conn)
+	}
+	reader := newV6Reader(src, s.v6Mode, account.PSK, profile)
 	req, err := readRequest(reader)
 	if err != nil {
 		return errors.New("snell v6: read request").Base(err)
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	user := s.lookupV6User(req.clientID)
-	if user == nil {
-		return errors.New("snell v6: unknown clientID")
-	}
 	s.setInbound(ctx, user)
-	writer, err := newV6Writer(conn, s.v6Mode, s.sharedPSK, s.profile)
+	writer, err := newV6Writer(conn, s.v6Mode, account.PSK, profile)
 	if err != nil {
 		return errors.New("snell v6: create writer").Base(err)
 	}
 	return s.serve(ctx, req, reader, writer, dispatcher, sessPolicy)
+}
+
+// identifyV6User 逐 PSK 试解首个 record 的 header(AEAD tag 即认证)定位用户。返回:命中用户、
+// 其 profile(default 模式非 nil;unshaped/raw 为 nil)、以及识别阶段已从 conn 消费的首 record 前缀
+// head(供 processV6 用 MultiReader 拼回)。raw 模式线上无任何密钥,直接回落 users[0]。
+func (s *Server) identifyV6User(conn io.Reader) (*protocol.MemoryUser, *Profile, []byte, error) {
+	switch s.v6Mode {
+	case ModeUnsafeRaw:
+		return s.users[0], nil, nil, nil
+	case ModeUnshaped:
+		return s.identifyV6Unshaped(conn)
+	default:
+		return s.identifyV6Shaped(conn)
+	}
+}
+
+// identifyV6Unshaped:salt 是明文前缀,各用户 need 相同(saltLen+headerCipherLen),读一次逐 PSK 试解。
+func (s *Server) identifyV6Unshaped(conn io.Reader) (*protocol.MemoryUser, *Profile, []byte, error) {
+	head := make([]byte, saltLen+headerCipherLen)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		return nil, nil, nil, err
+	}
+	salt := head[:saltLen]
+	nonce := make([]byte, nonceLen)
+	for _, u := range s.users {
+		aead, err := newAEAD(deriveKey(u.Account.(*MemoryAccount).PSK, salt))
+		if err != nil {
+			continue
+		}
+		tmp := make([]byte, headerCipherLen)
+		copy(tmp, head[saltLen:])
+		if _, err := aead.Open(tmp[:0], nonce, tmp, nil); err == nil {
+			return u, nil, head, nil
+		}
+	}
+	return nil, nil, nil, errors.New("snell v6 unshaped: no user matched")
+}
+
+// identifyV6Shaped:salt 藏在 saltBlock 里,saltBlock/prefix 长度由各用户 profile 决定(need 各异)。
+// 按 need 升序增量读取:命中即止,绝不读超过命中候选的 need(= 正确用户首 record 必然有的字节数),
+// 从而不会为 need 更大的错误候选阻塞等待不存在的字节(否则会握手超时)。
+func (s *Server) identifyV6Shaped(conn io.Reader) (*protocol.MemoryUser, *Profile, []byte, error) {
+	type candidate struct {
+		user    *protocol.MemoryUser
+		profile *Profile
+		need    int
+	}
+	cands := make([]candidate, len(s.users))
+	for i, u := range s.users {
+		p := NewProfile(u.Account.(*MemoryAccount).PSK)
+		cands[i] = candidate{user: u, profile: p, need: p.saltBlockLen + p.recordPrefixLen(0) + headerCipherLen}
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].need < cands[j].need })
+
+	nonce := make([]byte, nonceLen)
+	var head []byte
+	for _, c := range cands {
+		for len(head) < c.need {
+			chunk := make([]byte, c.need-len(head))
+			n, err := io.ReadFull(conn, chunk)
+			head = append(head, chunk[:n]...)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
+		salt := c.profile.extractSalt(head[:c.profile.saltBlockLen])
+		aead, err := newAEAD(deriveKey(c.user.Account.(*MemoryAccount).PSK, salt[:]))
+		if err != nil {
+			continue
+		}
+		prefixLen := c.profile.recordPrefixLen(0)
+		prefix := head[c.profile.saltBlockLen : c.profile.saltBlockLen+prefixLen]
+		headerCipher := make([]byte, headerCipherLen)
+		copy(headerCipher, head[c.need-headerCipherLen:c.need])
+		if _, err := aead.Open(headerCipher[:0], nonce, headerCipher, prefix); err == nil {
+			return c.user, c.profile, head, nil
+		}
+	}
+	return nil, nil, nil, errors.New("snell v6 shaped: no user matched")
 }
 
 func (s *Server) setInbound(ctx context.Context, user *protocol.MemoryUser) {

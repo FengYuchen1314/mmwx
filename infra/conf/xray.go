@@ -37,6 +37,7 @@ var (
 		"tun":           func() interface{} { return new(TunConfig) },
 		"anytls":        func() interface{} { return new(AnyTLSServerConfig) },
 		"snell":         func() interface{} { return new(SnellServerConfig) },
+		"mieru":         func() interface{} { return new(MieruServerConfig) },
 	}, "protocol", "settings")
 
 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
