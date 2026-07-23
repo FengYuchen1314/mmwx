@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package xray.proxy.mieru;
+option csharp_namespace = "Xray.Proxy.Mieru";
+option go_package = "github.com/xtls/xray-core/proxy/mieru";
+option java_package = "com.xray.proxy.mieru";
+option java_multiple_files = true;
+
+import "common/protocol/user.proto";
+
+// Account 是 mieru 的用户凭据。mieru 用 username+password 派生 AEAD key
+// (SHA256/PBKDF2/timeSalt),多用户时服务端用 nonce 末 4 字节的 userTag 快速定位用户后试解。
+message Account {
+  string username = 1;
+  string password = 2;
+}
+
+message ServerConfig {
+  repeated xray.common.protocol.User users = 1;
+  // 传输层:目前仅 "tcp"(UDP underlay 为后续阶段)。
+  string transport = 2;
+}
