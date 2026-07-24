@@ -3624,12 +3624,15 @@ func (h *RemoteManageHandler) HandleSyncInboundsToNodes(w http.ResponseWriter, r
 }
 
 // chooseClashServerHost 给一台 remote server 选合适的 clash_config.server 值。
-// 优先级:Domain → PullAddress (仅当不是 IP) → IPAddress。
+// 优先级:Domain → PullAddress (仅当不是 IP) → IPAddress → DomainV6 → IPAddressV6。
 //
 // 关键规则:PullAddress 是 IP 字符串(v4/v6)→ 跳过,fall to IPAddress。
 // 因为 IPAddress 由 agent 心跳实时上报,IP 漂移自动跟随;而 PullAddress 是用户表单写入的静态字符串,
 // 漂了不会自己更新,如果用作 clash.server 会让节点指向旧 IP。
 // 反过来 PullAddress 是域名/反代地址时保留 — 域名是稳定的,用户特意填的就是要走它。
+//
+// IPv6 放在 IPv4 之后作为兜底:双栈服务器保持既有的 IPv4 默认行为;纯 IPv6 服务器也能生成节点,
+// 不会因为 serverHost 为空而在入站事件/手动同步路径提前退出。
 func chooseClashServerHost(server *storage.RemoteServer) string {
 	if server == nil {
 		return ""
@@ -3640,7 +3643,13 @@ func chooseClashServerHost(server *storage.RemoteServer) string {
 	if p := strings.TrimSpace(server.PullAddress); p != "" && net.ParseIP(p) == nil {
 		return p
 	}
-	return strings.TrimSpace(server.IPAddress)
+	if ip := strings.TrimSpace(server.IPAddress); ip != "" {
+		return ip
+	}
+	if d := strings.TrimSpace(server.DomainV6); d != "" {
+		return d
+	}
+	return strings.TrimSpace(server.IPAddressV6)
 }
 
 // silentlyRemoveOrphanInbound 在后台静默删除 agent 上的"孤儿入站"(listInbounds 返回但 settings 缺失)。
