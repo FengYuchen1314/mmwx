@@ -81,9 +81,23 @@ func (h *XraySnapshotHandler) handleExpectRecovery(w http.ResponseWriter, r *htt
 		writeBadRequest(w, err.Error())
 		return
 	}
+	if h.rejectFederated(w, r, serverID) {
+		return
+	}
 	h.remoteManage.SetExpectRecovery(serverID)
 	log.Printf("[XraySnapshot] server=%d expect_recovery marker set", serverID)
 	respondJSON(w, http.StatusOK, map[string]interface{}{"success": true})
+}
+
+// rejectFederated 联邦(分享)服务器的 agent 由拥有方主控独占管理,消费方不做快照恢复/对账
+// (否则会把消费方落后的 snapshot 推给 agent 覆盖拥有方配置 → 抹掉入站 / xray 重启失联)。
+// 命中联邦服务器则写 400 并返回 true。
+func (h *XraySnapshotHandler) rejectFederated(w http.ResponseWriter, r *http.Request, serverID int64) bool {
+	if _, ferr := h.repo.GetFederatedServer(r.Context(), serverID); ferr == nil {
+		writeBadRequest(w, "分享服务器由拥有方管理,消费方不做 xray 配置恢复")
+		return true
+	}
+	return false
 }
 
 func parseServerIDQuery(r *http.Request) (int64, error) {
@@ -157,6 +171,9 @@ func (h *XraySnapshotHandler) handleRecoveryApply(w http.ResponseWriter, r *http
 	serverID, err := parseServerIDQuery(r)
 	if err != nil {
 		writeBadRequest(w, err.Error())
+		return
+	}
+	if h.rejectFederated(w, r, serverID) {
 		return
 	}
 	current, cerr := h.repo.GetCurrentXraySnapshot(r.Context(), serverID)
@@ -240,7 +257,8 @@ func (h *XraySnapshotHandler) handleList(w http.ResponseWriter, r *http.Request)
 
 // handleRestore: 把指定历史 snapshot 下发到 agent。test → PUT。不动 snapshot 表的状态
 // (restore 后 master 写后 refresh hook 会自动把"现在的 agent 配置"upsert 成新 current,
-//  原来的 current 自然变 old —— 选中的历史 snapshot 在 history 列表里仍叫 old)。
+//
+//	原来的 current 自然变 old —— 选中的历史 snapshot 在 history 列表里仍叫 old)。
 func (h *XraySnapshotHandler) handleRestore(w http.ResponseWriter, r *http.Request) {
 	raw := r.URL.Query().Get("snapshot_id")
 	id, err := strconv.ParseInt(raw, 10, 64)

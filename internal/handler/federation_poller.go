@@ -27,7 +27,7 @@ func SetFederationLicense(lic *license.Manager) {
 	federationLicense = lic
 }
 
-func StartFederationPoller(ctx context.Context, repo *storage.TrafficRepository) {
+func StartFederationPoller(ctx context.Context, repo *storage.TrafficRepository, probeStore *ProbeMetricsStore) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	ticker := time.NewTicker(federationPollInterval)
 	defer ticker.Stop()
@@ -36,12 +36,12 @@ func StartFederationPoller(ctx context.Context, repo *storage.TrafficRepository)
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			pollFederatedServers(ctx, repo, client)
+			pollFederatedServers(ctx, repo, client, probeStore)
 		}
 	}
 }
 
-func pollFederatedServers(ctx context.Context, repo *storage.TrafficRepository, client *http.Client) {
+func pollFederatedServers(ctx context.Context, repo *storage.TrafficRepository, client *http.Client, probeStore *ProbeMetricsStore) {
 	// 散布验签:无 license 直接跳过整轮 ticker。
 	if federationLicense != nil && !federationLicense.HasFeature("server_share") {
 		return
@@ -56,7 +56,34 @@ func pollFederatedServers(ctx context.Context, repo *storage.TrafficRepository, 
 			continue
 		}
 		applyFederationInfo(ctx, repo, fed.ServerID, info)
+		ingestFederationProbeSys(fed.ServerID, info, probeStore)
 	}
+}
+
+// ingestFederationProbeSys 把拥有方透传的探针系统指标(probe_sys)写进本地 probeStore,
+// 让分享服务器在接收方探针页(HTTP + WS 两端都读 probeStore)里 cpu/mem/disk/load 数据完整。
+func ingestFederationProbeSys(serverID int64, info map[string]any, probeStore *ProbeMetricsStore) {
+	if probeStore == nil {
+		return
+	}
+	ps, ok := info["probe_sys"].(map[string]any)
+	if !ok {
+		return
+	}
+	loadavg, _ := ps["loadavg"].(string)
+	snap := ProbeSysSnapshot{
+		CPUPct:    jsonFloat(ps["cpu_pct"]),
+		LoadAvg:   loadavg,
+		MemUsed:   jsonInt(ps["mem_used"]),
+		MemTotal:  jsonInt(ps["mem_total"]),
+		DiskUsed:  jsonInt(ps["disk_used"]),
+		DiskTotal: jsonInt(ps["disk_total"]),
+		HasCPU:    jsonBool(ps["has_cpu"]),
+		HasMem:    jsonBool(ps["has_mem"]),
+		HasDisk:   jsonBool(ps["has_disk"]),
+		At:        jsonInt(ps["at"]),
+	}
+	probeStore.IngestSys(serverID, snap)
 }
 
 func fetchFederationServerInfo(ctx context.Context, client *http.Client, fed storage.FederatedServer) (map[string]any, error) {
@@ -136,4 +163,22 @@ func jsonInt(v any) int64 {
 	default:
 		return 0
 	}
+}
+
+func jsonFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int64:
+		return float64(n)
+	case int:
+		return float64(n)
+	default:
+		return 0
+	}
+}
+
+func jsonBool(v any) bool {
+	b, _ := v.(bool)
+	return b
 }

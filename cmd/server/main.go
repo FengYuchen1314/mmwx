@@ -568,7 +568,7 @@ func main() {
 	// 删除套餐:解绑所有绑定用户(移除入站凭据/清 package_id/删套餐订阅)后再删,故依赖 remoteManageHandler/limiterPusher
 	mux.Handle("/api/admin/packages/", auth.RequireAdmin(tokenStore, userRepo, handler.NewPackageDeleteHandler(repo, remoteManageHandler, limiterPusher)))
 	// 服务器分享(PRO):拥有方生成/管理分享令牌
-	mux.Handle("/api/admin/server-share/", auth.RequireAdmin(tokenStore, userRepo, handler.NewServerShareHandler(repo, licenseManager)))
+	mux.Handle("/api/admin/server-share/", auth.RequireAdmin(tokenStore, userRepo, handler.NewServerShareHandler(repo, licenseManager, remoteManageHandler)))
 	// 自定义品牌(PRO):管理员设置站点标题/左上角标题/logo;是否生效由 license.FeatureCustomBranding 门控。
 	brandingHandler := handler.NewBrandingHandler(repo, licenseManager)
 	mux.Handle("/api/admin/system-settings/branding", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(brandingHandler.Admin)))
@@ -906,7 +906,8 @@ func main() {
 	// capN=1440(1 分钟间隔约 1 天窗口):伪装页延迟折线图/24 小时色块条据此回溯。
 	// 内存量级:1440 点 × 16B × 目标数(≤30) × 服务器数,几十台机也就几 MB,可接受。
 	probeMetricsStore := handler.NewProbeMetricsStore(1440)
-	remoteWSHandler.SetProbeStore(probeMetricsStore) // 写侧:接收 agent 上报的 sysmetrics/latency
+	remoteWSHandler.SetProbeStore(probeMetricsStore)   // 写侧:接收 agent 上报的 sysmetrics/latency
+	federationHandler.SetProbeStore(probeMetricsStore) // 拥有方 server-info 透传 cpu/mem/disk 给消费方探针
 	// HTTP/pull 模式的 agent 没有 WS 连接,探针指标只能从 /api/remote/traffic 这条 POST 进来;
 	// 采集开关也只能搭该请求的响应车下发。两者都注入后,两种连接模式的探针数据才一致。
 	remoteTrafficHandler.SetProbeStore(probeMetricsStore)
@@ -1394,7 +1395,7 @@ func main() {
 	}
 	// 启动分享服务器(联邦)状态/流量轮询（每 30 秒从拥有方拉取）
 	handler.SetFederationLicense(licenseManager)
-	go handler.StartFederationPoller(collectorCtx, repo)
+	go handler.StartFederationPoller(collectorCtx, repo, probeMetricsStore)
 	// 启动证书自动续订检查程序（每 24 小时检查一次是否有 30 天内过期的证书）
 	certHandler.StartRenewalChecker(collectorCtx)
 	// TODO: 启动远程服务器离线检测任务（功能尚未实现）

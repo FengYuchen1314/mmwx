@@ -137,6 +137,9 @@ type RemoteServersListResponse struct {
 // RemoteServerDeleteRequest 表示删除远程服务器的请求
 type RemoteServerDeleteRequest struct {
 	ID int64 `json:"id"`
+	// DeleteNodes 是否连带删除该服务器下的节点(original_server 匹配)。
+	// 前端删除确认默认勾选(true);不传(nil)时保持旧行为=不删节点,兼容其它调用方。
+	DeleteNodes *bool `json:"delete_nodes,omitempty"`
 }
 
 // RemoteServerUpdateRequest 表示更新远程服务器的请求
@@ -693,6 +696,13 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	}
 
 	ctx := r.Context()
+
+	// 删服务器前先拿到名字,供连带删节点用(节点按 original_server=服务器名 关联)。
+	var serverName string
+	if srv, gerr := h.repo.GetRemoteServer(ctx, req.ID); gerr == nil && srv != nil {
+		serverName = srv.Name
+	}
+
 	if err := h.repo.DeleteRemoteServer(ctx, req.ID); err != nil {
 		msg := "删除服务器失败"
 		if err == storage.ErrRemoteServerNotFound {
@@ -704,6 +714,16 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			Message: msg,
 		})
 		return
+	}
+
+	// 连带删节点:前端删除确认默认勾选(delete_nodes=true)。否则节点残留、订阅里仍可连
+	// (分享服务器场景尤其明显:移除分享服务器后接收方建的节点还有效)。
+	if req.DeleteNodes != nil && *req.DeleteNodes && serverName != "" {
+		if n, derr := h.repo.DeleteNodesByOriginalServer(ctx, serverName); derr != nil {
+			log.Printf("[Remote Server] delete nodes for %s failed: %v", serverName, derr)
+		} else if n > 0 {
+			log.Printf("[Remote Server] deleted %d nodes for removed server %s", n, serverName)
+		}
 	}
 
 	// 删后清掉该 server 的 inbound 内存缓存,避免残留(否则同 id 复用时会读到旧 inbound 数据)。

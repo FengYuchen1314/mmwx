@@ -26,11 +26,15 @@ type FederationHandler struct {
 	remoteManage *RemoteManageHandler
 	license      *license.Manager
 	sessions     *securechan.SessionCache // 拥有方侧:按分享令牌缓存与消费方的会话
+	probeStore   *ProbeMetricsStore       // 拥有方侧探针指标(cpu/mem/disk),server-info 透传给消费方
 }
 
 func NewFederationHandler(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, lic *license.Manager) *FederationHandler {
 	return &FederationHandler{repo: repo, remoteManage: remoteManage, license: lic, sessions: securechan.NewSessionCache(30 * time.Minute)}
 }
+
+// SetProbeStore 注入拥有方探针指标存储(probeStore 在 main 里晚于本 handler 创建,故用 setter)。
+func (h *FederationHandler) SetProbeStore(s *ProbeMetricsStore) { h.probeStore = s }
 
 func (h *FederationHandler) proEnabled() bool {
 	if h.license == nil {
@@ -124,6 +128,8 @@ func (h *FederationHandler) handleManage(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadGateway, ferr)
 		return
 	}
+	// 联邦入站溯源:接收方经本分享加/删入站时记录/删除,供吊销分享时删 agent 入站(让接收方节点随之失效)。
+	h.trackFederationInbound(r, serverID, req.Method, req.Path, body)
 	if session != nil {
 		if enc, eerr := session.Encrypt(result); eerr == nil {
 			w.Header().Set("X-Encrypted", "1")
@@ -135,6 +141,47 @@ func (h *FederationHandler) handleManage(w http.ResponseWriter, r *http.Request,
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(result)
+}
+
+// trackFederationInbound 解析接收方经联邦转发的入站命令,记录/删除入站溯源。
+// 加入站(action add / 空)→ 记 inbound.tag;删入站(action remove)→ 删 tag。非入站命令忽略。
+func (h *FederationHandler) trackFederationInbound(r *http.Request, serverID int64, method, path string, body []byte) {
+	if method != http.MethodPost {
+		return
+	}
+	if i := strings.Index(path, "?"); i >= 0 {
+		path = path[:i]
+	}
+	if path != "/api/child/inbounds" {
+		return
+	}
+	var inb struct {
+		Action  string `json:"action"`
+		Tag     string `json:"tag"`
+		Inbound struct {
+			Tag string `json:"tag"`
+		} `json:"inbound"`
+	}
+	if json.Unmarshal(body, &inb) != nil {
+		return
+	}
+	tag := inb.Tag
+	if tag == "" {
+		tag = inb.Inbound.Tag
+	}
+	if tag == "" {
+		return
+	}
+	share, err := h.repo.GetSharedServerByTokenHash(r.Context(), hashShareToken(fedToken(r)))
+	if err != nil {
+		return
+	}
+	switch strings.ToLower(inb.Action) {
+	case "", "add":
+		_ = h.repo.RecordSharedInbound(r.Context(), share.ID, serverID, tag)
+	case "remove":
+		_ = h.repo.UnrecordSharedInbound(r.Context(), share.ID, tag)
+	}
 }
 
 // fedToken 取分享令牌(与 authShare 一致),用作会话缓存键。
@@ -210,8 +257,7 @@ func (h *FederationHandler) handleServerInfo(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	trafficUsed, _ := h.repo.GetServerTrafficUsed(r.Context(), serverID)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	resp := map[string]any{
 		"name":                   srv.Name,
 		"status":                 srv.Status,
 		"ip_address":             srv.IPAddress,
@@ -224,5 +270,26 @@ func (h *FederationHandler) handleServerInfo(w http.ResponseWriter, r *http.Requ
 		"xray_running":           srv.XrayRunning,
 		"xray_version":           srv.XrayVersion,
 		"last_heartbeat":         srv.LastHeartbeat,
-	})
+	}
+	// 探针系统指标(cpu/mem/disk/loadavg):拥有方从 agent WS 上报里拿到,透传给消费方,
+	// 让分享服务器在接收方探针里数据完整(消费方本地无 agent WS,不透传就只有速率/流量)。
+	if h.probeStore != nil {
+		if view, ok := h.probeStore.Snapshot(serverID, 0); ok && view.HasSys {
+			s := view.Sys
+			resp["probe_sys"] = map[string]any{
+				"cpu_pct":    s.CPUPct,
+				"loadavg":    s.LoadAvg,
+				"mem_used":   s.MemUsed,
+				"mem_total":  s.MemTotal,
+				"disk_used":  s.DiskUsed,
+				"disk_total": s.DiskTotal,
+				"has_cpu":    s.HasCPU,
+				"has_mem":    s.HasMem,
+				"has_disk":   s.HasDisk,
+				"at":         s.At,
+			}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }

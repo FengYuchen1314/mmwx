@@ -20,12 +20,13 @@ import (
 const featureServerShare = "server_share"
 
 type ServerShareHandler struct {
-	repo    *storage.TrafficRepository
-	license *license.Manager
+	repo         *storage.TrafficRepository
+	license      *license.Manager
+	remoteManage *RemoteManageHandler // 吊销时删接收方经联邦创建的 agent 入站
 }
 
-func NewServerShareHandler(repo *storage.TrafficRepository, lic *license.Manager) *ServerShareHandler {
-	return &ServerShareHandler{repo: repo, license: lic}
+func NewServerShareHandler(repo *storage.TrafficRepository, lic *license.Manager, rm *RemoteManageHandler) *ServerShareHandler {
+	return &ServerShareHandler{repo: repo, license: lic, remoteManage: rm}
 }
 
 func hashShareToken(token string) string {
@@ -112,15 +113,35 @@ func (h *ServerShareHandler) handleList(w http.ResponseWriter, r *http.Request) 
 func (h *ServerShareHandler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID int64 `json:"id"`
+		// DeleteInbounds 吊销时是否删掉接收方经本分享在 agent 上创建的入站(让其节点随之失效)。
+		// 前端确认默认勾选(true);nil 时保守=不删(兼容其它调用方)。
+		DeleteInbounds *bool `json:"delete_inbounds,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID <= 0 {
 		writeError(w, http.StatusBadRequest, errors.New("id required"))
 		return
 	}
+
+	// 吊销前:若选择删入站,把该分享溯源到的 agent 入站逐个删掉(经 owner→agent 直连,不依赖分享令牌)。
+	deleted := 0
+	if req.DeleteInbounds != nil && *req.DeleteInbounds && h.remoteManage != nil {
+		if serverID, serr := h.repo.GetSharedServerServerID(r.Context(), req.ID); serr == nil && serverID > 0 {
+			tags, _ := h.repo.ListSharedInboundTags(r.Context(), req.ID)
+			for _, tag := range tags {
+				body, _ := json.Marshal(map[string]any{"action": "remove", "tag": tag})
+				if _, ferr := h.remoteManage.ForwardToAgent(r.Context(), serverID, http.MethodPost, "/api/child/inbounds", body); ferr == nil {
+					deleted++
+				}
+			}
+		}
+	}
+	// 溯源记录清掉(无论是否删入站,吊销后该分享的溯源都无意义)。
+	_ = h.repo.ClearSharedInbounds(r.Context(), req.ID)
+
 	if err := h.repo.RevokeSharedServer(r.Context(), req.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"status": "revoked"})
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "revoked", "inbounds_deleted": deleted})
 }

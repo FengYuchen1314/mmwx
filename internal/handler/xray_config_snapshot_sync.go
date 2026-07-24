@@ -171,6 +171,13 @@ func shouldRefreshXraySnapshotAfter(method, path string) bool {
 func (h *RemoteManageHandler) refreshXraySnapshot(serverID int64) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// 联邦(分享)服务器:agent 由拥有方主控独占管理,消费方不该给它维护 xray 快照。
+	// 两个主控各自快照同一 agent 后,掉线自动恢复会用某方落后的 snapshot 全量覆盖 agent,
+	// 抹掉对方入站 / 触发 xray 重启("加节点后 xray 失联")。消费方彻底退出快照/恢复对账,
+	// 让拥有方做唯一的配置管理者。
+	if _, ferr := h.repo.GetFederatedServer(ctx, serverID); ferr == nil {
+		return
+	}
 	raw, err := h.forwardToRemoteServer(ctx, serverID, "GET", "/api/child/xray/config", nil)
 	if err != nil {
 		log.Printf("[XraySync] refresh after master write skipped for server=%d: %v", serverID, err)

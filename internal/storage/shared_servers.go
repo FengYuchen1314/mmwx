@@ -104,3 +104,86 @@ func (r *TrafficRepository) RevokeSharedServer(ctx context.Context, id int64) er
 	_, err := r.db.ExecContext(ctx, `UPDATE shared_servers SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
 	return err
 }
+
+// ===== 联邦入站溯源 =====
+// 拥有方记录"某个分享(share_id)的接收方经联邦在本服务器 agent 上创建了哪些入站(tag)",
+// 吊销分享时据此从 agent 删掉这些入站,让接收方的节点随之失效(否则吊销后仍能连)。
+
+func (r *TrafficRepository) ensureSharedInboundsTable(ctx context.Context) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	_, err := r.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS shared_server_inbounds (
+		share_id    INTEGER NOT NULL,
+		server_id   INTEGER NOT NULL,
+		inbound_tag TEXT NOT NULL,
+		created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(share_id, inbound_tag)
+	)`)
+	return err
+}
+
+// RecordSharedInbound 记录一条联邦入站(接收方经该分享在 agent 上加的入站)。幂等。
+func (r *TrafficRepository) RecordSharedInbound(ctx context.Context, shareID, serverID int64, tag string) error {
+	if err := r.ensureSharedInboundsTable(ctx); err != nil {
+		return err
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO shared_server_inbounds (share_id, server_id, inbound_tag) VALUES (?, ?, ?)`,
+		shareID, serverID, tag)
+	return err
+}
+
+// UnrecordSharedInbound 删除一条联邦入站溯源(接收方经联邦删了该入站时)。
+func (r *TrafficRepository) UnrecordSharedInbound(ctx context.Context, shareID int64, tag string) error {
+	if err := r.ensureSharedInboundsTable(ctx); err != nil {
+		return err
+	}
+	_, err := r.db.ExecContext(ctx,
+		`DELETE FROM shared_server_inbounds WHERE share_id = ? AND inbound_tag = ?`, shareID, tag)
+	return err
+}
+
+// ListSharedInboundTags 列出某分享溯源到的全部入站 tag(吊销时据此删 agent 入站)。
+func (r *TrafficRepository) ListSharedInboundTags(ctx context.Context, shareID int64) ([]string, error) {
+	if err := r.ensureSharedInboundsTable(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT inbound_tag FROM shared_server_inbounds WHERE share_id = ?`, shareID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tags []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		tags = append(tags, t)
+	}
+	return tags, rows.Err()
+}
+
+// GetSharedServerServerID 按分享 id 取其 server_id(吊销时删 agent 入站要用)。
+func (r *TrafficRepository) GetSharedServerServerID(ctx context.Context, shareID int64) (int64, error) {
+	if err := r.ensureSharedServersTable(ctx); err != nil {
+		return 0, err
+	}
+	var sid int64
+	err := r.db.QueryRowContext(ctx, `SELECT server_id FROM shared_servers WHERE id = ? LIMIT 1`, shareID).Scan(&sid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrSharedServerNotFound
+	}
+	return sid, err
+}
+
+// ClearSharedInbounds 清掉某分享的全部入站溯源(吊销后)。
+func (r *TrafficRepository) ClearSharedInbounds(ctx context.Context, shareID int64) error {
+	if err := r.ensureSharedInboundsTable(ctx); err != nil {
+		return err
+	}
+	_, err := r.db.ExecContext(ctx, `DELETE FROM shared_server_inbounds WHERE share_id = ?`, shareID)
+	return err
+}
