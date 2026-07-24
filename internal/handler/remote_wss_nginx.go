@@ -210,7 +210,7 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 			"nginx_config":  "",
 			"domain_config": conf,
 		})
-		if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/nginx/setup-ssl", payload); err != nil {
+		if _, err := h.forwardNginxSetupSSL(ctx, serverID, payload); err != nil {
 			return fmt.Errorf("下发偷自己 nginx 配置失败: %v", err)
 		}
 		log.Printf("[WSS-Nginx] server %d domain=%s 偷自己模式:伪装站 + %d 条 ws location(listen 8001)已下发", serverID, domain, len(infos))
@@ -248,7 +248,7 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 		"nginx_config":  "", // 留空 → agent 跳过主 nginx.conf 写入(reality 已下过的不动)
 		"domain_config": buf.String(),
 	})
-	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/nginx/setup-ssl", payload); err != nil {
+	if _, err := h.forwardNginxSetupSSL(ctx, serverID, payload); err != nil {
 		return fmt.Errorf("下发 nginx 配置失败: %v", err)
 	}
 	log.Printf("[WSS-Nginx] server %d domain=%s 已下发 %d 条 WSS location", serverID, domain, len(infos))

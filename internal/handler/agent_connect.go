@@ -916,16 +916,29 @@ if [ "$AUTO_STEAL_SELF" = "1" ]; then
     echo "=========================================="
     echo ""
 
-    NGINX_INSTALLED=0
-    if command -v nginx >/dev/null 2>&1 || [ -x /usr/local/nginx/sbin/nginx ]; then
-        NGINX_INSTALLED=1
-    fi
-
-    if [ "$NGINX_INSTALLED" = "1" ]; then
-        echo "[Auto] Nginx already installed, skip."
+    if [ -x /usr/local/nginx/sbin/nginx ]; then
+        NGINX_INFO=$(/usr/local/nginx/sbin/nginx -V 2>&1)
+        NGINX_VERSION=$(echo "$NGINX_INFO" | sed -n 's#^nginx version: nginx/\([0-9.]*\).*$#\1#p')
+        NGINX_OLDEST=$(printf '%s\n%s\n' "1.25.1" "$NGINX_VERSION" | sort -V | head -n 1)
+        if [ -z "$NGINX_VERSION" ] || [ "$NGINX_OLDEST" != "1.25.1" ] \
+            || ! echo "$NGINX_INFO" | grep -q -- "--with-http_ssl_module" \
+            || ! echo "$NGINX_INFO" | grep -q -- "--with-http_v2_module" \
+            || ! echo "$NGINX_INFO" | grep -q -- "--with-http_v3_module" \
+            || ! echo "$NGINX_INFO" | grep -q -- "--with-http_realip_module" \
+            || ! echo "$NGINX_INFO" | grep -q -- "--with-stream_ssl_module" \
+            || ! echo "$NGINX_INFO" | grep -q -- "--with-stream_ssl_preread_module"; then
+            echo "ERROR: 现有 Nginx 不兼容妙妙屋X（要求 >= 1.25.1，并启用 HTTP/2、HTTP/3、Stream SSL 模块）。" >&2
+            echo "请先卸载现有 Nginx，再重新执行本安装脚本，由妙妙屋X安装受支持的版本。" >&2
+            exit 1
+        fi
+        echo "[Auto] Compatible Nginx already installed, skip."
+    elif command -v nginx >/dev/null 2>&1; then
+        echo "ERROR: 检测到非妙妙屋X管理的 Nginx: $(command -v nginx)" >&2
+        echo "为避免覆盖用户配置，安装已停止。请先卸载系统 Nginx，再重新执行本安装脚本。" >&2
+        exit 1
     else
         echo "[Auto] Installing Nginx..."
-        curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash
+        bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash'
     fi
     echo ""
     echo "Auto install complete (front service: ${FRONT_SERVICE}, xray mode: ${XRAY_MODE})"

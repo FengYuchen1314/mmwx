@@ -75,7 +75,7 @@ func (h *RemoteManageHandler) deployMasterProxy(ctx context.Context, server *sto
 		"nginx_config":  string(nginxConf),
 		"domain_config": domainConf,
 	})
-	if _, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload); err != nil {
+	if _, err := h.forwardNginxSetupSSL(ctx, server.ID, sslPayload); err != nil {
 		return fmt.Errorf("下发 nginx 反代配置失败: %w", err)
 	}
 

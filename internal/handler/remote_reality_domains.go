@@ -375,7 +375,7 @@ func (h *RemoteManageHandler) HandleSetupSSL(w http.ResponseWriter, r *http.Requ
 		"nginx_config":  string(nginxConf),
 		"domain_config": domainConf,
 	})
-	_, err = h.forwardToRemoteServer(r.Context(), id, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload)
+	_, err = h.forwardNginxSetupSSL(r.Context(), id, sslPayload)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("配置 Nginx SSL 失败: %v", err))
 		return

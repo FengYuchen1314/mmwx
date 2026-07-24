@@ -167,6 +167,43 @@ func isNginxInstalled() bool {
 	return findNginxBinary() != ""
 }
 
+func validateManagedNginx(nginxBin string) error {
+	if filepath.Clean(nginxBin) != "/usr/local/nginx/sbin/nginx" {
+		return fmt.Errorf(
+			"检测到非妙妙屋X管理的 Nginx（%s）；为避免覆盖用户配置，请先卸载系统 Nginx，再通过妙妙屋X安装",
+			nginxBin,
+		)
+	}
+
+	output, err := exec.Command(nginxBin, "-V").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("无法读取 Nginx 版本信息: %w", err)
+	}
+	info := string(output)
+	current := parseNginxVersion(info)
+	if current == "" || compareSemver(current, minimumManagedNginxVersion) < 0 {
+		return fmt.Errorf(
+			"当前 Nginx %s 不兼容（要求 >= %s）；请使用 install-nginx.sh 重新安装",
+			current,
+			minimumManagedNginxVersion,
+		)
+	}
+	requiredModules := []string{
+		"--with-http_ssl_module",
+		"--with-http_v2_module",
+		"--with-http_v3_module",
+		"--with-http_realip_module",
+		"--with-stream_ssl_module",
+		"--with-stream_ssl_preread_module",
+	}
+	for _, module := range requiredModules {
+		if !strings.Contains(info, module) {
+			return fmt.Errorf("当前 Nginx 缺少 %s；请使用 install-nginx.sh 重新安装", module)
+		}
+	}
+	return nil
+}
+
 func installNginxLocal() error {
 	// Docker 镜像里 nginx 已经 apt 预装 + symlink 兼容(见 Dockerfile),不用跑 install-nginx.sh —
 	// 那个脚本依赖 systemctl daemon-reload + enable --now,容器里没 systemd 会失败。
@@ -174,7 +211,7 @@ func installNginxLocal() error {
 	if isDocker() {
 		return nil
 	}
-	cmd := exec.Command("bash", "-c", "curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash")
+	cmd := exec.Command("bash", "-o", "pipefail", "-c", "curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -234,6 +271,16 @@ func (h *CertificateHandler) EnableHTTPS(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	nginxBin := findNginxBinary()
+	if nginxBin == "" {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "未找到 nginx 可执行文件"})
+		return
+	}
+	if err := validateManagedNginx(nginxBin); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
+		return
+	}
+
 	dirs := []string{"/usr/local/nginx/conf", "/usr/local/nginx/servers", "/usr/local/nginx/stream_servers", "/usr/local/nginx/cert", "/usr/local/nginx/html"}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -288,12 +335,6 @@ func (h *CertificateHandler) EnableHTTPS(w http.ResponseWriter, r *http.Request)
 	}
 	if err := os.WriteFile(keyPath, []byte(cert.KeyPEM), 0600); err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("写入密钥失败: %v", err)})
-		return
-	}
-
-	nginxBin := findNginxBinary()
-	if nginxBin == "" {
-		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "未找到 nginx 可执行文件"})
 		return
 	}
 
