@@ -1135,6 +1135,7 @@ func main() {
 	remoteWSHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
 	mux.Handle("/api/admin/certificates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListCertificates)))
 	mux.Handle("/api/admin/certificates/valid", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListValidCertificates)))
+	mux.Handle("/api/admin/certificates/self-signed", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.GenerateSelfSignedCert)))
 	mux.Handle("/api/admin/certificates/create", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.CreateCertificate)))
 	mux.Handle("/api/admin/certificates/renew", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.RenewCertificate)))
 	mux.Handle("/api/admin/certificates/auto-renew", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.SetAutoRenew)))

@@ -2171,6 +2171,21 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// 不安全(自签证书):insecure 是前端挂在 inbound 上的带外字段,agent/xray 不需要 —— 转发前剥掉,
+	// 仅用于建节点时给 HY2 clash 节点配 skip-cert-verify(自签证书客户端需跳过校验才能连)。
+	var inboundInsecure bool
+	if r.Method == http.MethodPost && inboundReq != nil {
+		if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
+			if iv, _ := inbound["insecure"].(bool); iv {
+				inboundInsecure = true
+				delete(inbound, "insecure")
+				if nb, mErr := json.Marshal(inboundReq); mErr == nil {
+					body = nb
+				}
+			}
+		}
+	}
+
 	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/inbounds", body)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadGateway, err.Error())
@@ -2231,6 +2246,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 							IPVersion:     ipVersion,
 							RelayServer:   relayServer,
 							RelayPort:     relayPort,
+							Insecure:      inboundInsecure,
 						})
 					}
 					// VLESS+WS 入站添加成功 → 异步聚合渲染该 server 全部 WSS location 下发 nginx

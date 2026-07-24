@@ -30,6 +30,8 @@ type InboundEvent struct {
 	// relay_orig_*（供列表展示 + 取消中转还原）。设了中转则忽略 IPVersion（中转是单一地址）。
 	RelayServer string
 	RelayPort   int
+	// Insecure=true：入站用了自签证书，生成的 clash 节点需 skip-cert-verify（客户端跳过证书校验）。
+	Insecure bool
 }
 
 // Listener 事件监听器接口

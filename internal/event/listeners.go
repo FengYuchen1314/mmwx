@@ -80,6 +80,10 @@ func (l *NodeSyncListener) handleAdded(ctx context.Context, event InboundEvent) 
 		log.Printf("[NodeSync] Failed to convert inbound to clash: %v", err)
 		return
 	}
+	// 自签证书:给 clash 节点加 skip-cert-verify(客户端跳过证书校验才能连自签证书)。
+	if event.Insecure {
+		clashConfig = withSkipCertVerify(clashConfig)
+	}
 
 	// 先扫所有"外部节点"(从 mmw 迁移过来的、original_server='' 的节点),
 	// 按 server 地址(可能是 IP / Domain / PullAddress 之一)+ port + protocol 匹配,
@@ -221,6 +225,20 @@ func cloneClashWithServerPort(clashMap map[string]any, name, serverHost string, 
 		return "", err
 	}
 	return string(b), nil
+}
+
+// withSkipCertVerify 给 clash proxy JSON 顶层加 skip-cert-verify=true(自签证书客户端跳过校验)。
+func withSkipCertVerify(clashJSON string) string {
+	var m map[string]any
+	if json.Unmarshal([]byte(clashJSON), &m) != nil {
+		return clashJSON
+	}
+	m["skip-cert-verify"] = true
+	b, err := json.Marshal(m)
+	if err != nil {
+		return clashJSON
+	}
+	return string(b)
 }
 
 // clashPortOf 从 clash proxy map 读出顶层 port(float64/int 兼容),取不到返回 0。
@@ -469,6 +487,10 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 	if err != nil {
 		log.Printf("[NodeSync] Failed to convert inbound to clash: %v", err)
 		return
+	}
+	// 自签证书:给 clash 节点加 skip-cert-verify(客户端跳过证书校验才能连自签证书)。
+	if event.Insecure {
+		clashConfig = withSkipCertVerify(clashConfig)
 	}
 
 	// 中转:该 (server,tag) 下若存在中转节点 —— 本次编辑新填了中转地址,或节点本就配了中转 ——
