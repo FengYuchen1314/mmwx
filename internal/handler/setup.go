@@ -306,6 +306,14 @@ func getOutboundIP() string {
 }
 
 func deployLocalNginx(domain string, repo *storage.TrafficRepository) error {
+	nginxBin := findNginxBinary()
+	if nginxBin == "" {
+		return fmt.Errorf("未找到 nginx 可执行文件")
+	}
+	if err := validateManagedNginx(nginxBin); err != nil {
+		return err
+	}
+
 	nginxConf, err := templates.ReadFile("single_nginx.conf")
 	if err != nil {
 		return fmt.Errorf("读取 single_nginx.conf 模板失败: %w", err)
@@ -342,10 +350,6 @@ func deployLocalNginx(domain string, repo *storage.TrafficRepository) error {
 		deployCertToLocal(domain, repo)
 	}
 
-	nginxBin := findNginxBinary()
-	if nginxBin == "" {
-		return fmt.Errorf("未找到 nginx 可执行文件")
-	}
 	if err := ensureNginxRunning(nginxBin); err != nil {
 		return fmt.Errorf("nginx 启动失败: %w", err)
 	}
@@ -361,6 +365,14 @@ func deployLocalNginx(domain string, repo *storage.TrafficRepository) error {
 }
 
 func deployLocalNginxWithCert(domain string, cert *storage.Certificate) error {
+	nginxBin := findNginxBinary()
+	if nginxBin == "" {
+		return fmt.Errorf("未找到 nginx 可执行文件")
+	}
+	if err := validateManagedNginx(nginxBin); err != nil {
+		return err
+	}
+
 	nginxConf, err := templates.ReadFile("single_nginx.conf")
 	if err != nil {
 		return fmt.Errorf("读取 single_nginx.conf 模板失败: %w", err)
@@ -395,10 +407,6 @@ func deployLocalNginxWithCert(domain string, cert *storage.Certificate) error {
 		if err := os.WriteFile(filepath.Join("/usr/local/nginx/cert", certName+".key"), []byte(cert.KeyPEM), 0600); err != nil {
 			return fmt.Errorf("写入密钥失败: %w", err)
 		}
-	}
-	nginxBin := findNginxBinary()
-	if nginxBin == "" {
-		return fmt.Errorf("未找到 nginx 可执行文件")
 	}
 	// 统一走 ensureNginxRunning:先 reload,失败时 Docker 用裸 nginx 拉起、裸机才 systemctl。
 	// 之前这里直接 fallback systemctl,Docker 容器无 systemd → 报「systemctl 不在 $PATH」。

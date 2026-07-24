@@ -326,6 +326,57 @@ func (h *RemoteManageHandler) HandleServicesStatus(w http.ResponseWriter, r *htt
 	w.Write(result)
 }
 
+const minimumManagedNginxVersion = "1.25.1"
+
+// forwardNginxSetupSSL 在下发新版 nginx 配置前检查远端版本。
+// 老版发行版 nginx（如 Debian 12 的 1.22.1）不支持模板使用的 `http2 on;`，
+// 与其覆盖配置后才在 reload 阶段报错，不如直接把可操作的提示返回给现有前端。
+func (h *RemoteManageHandler) forwardNginxSetupSSL(ctx context.Context, serverID int64, payload []byte) ([]byte, error) {
+	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/services/status", nil)
+	if err != nil {
+		return nil, fmt.Errorf("无法检查远端 Nginx 兼容性: %w", err)
+	}
+
+	var status ChildServicesStatusResponse
+	if err := json.Unmarshal(result, &status); err != nil || status.Nginx == nil {
+		return nil, fmt.Errorf("远端 Agent 未返回 Nginx 版本信息，请先升级 Agent 后重试")
+	}
+	if !status.Nginx.Installed {
+		return nil, fmt.Errorf("未检测到 Nginx，请先在服务管理中安装 Nginx 后重试")
+	}
+	current := parseNginxVersion(status.Nginx.Version)
+	if current == "" {
+		return nil, fmt.Errorf("无法识别远端 Nginx 版本（%s），请通过服务管理重新安装 Nginx 后重试", status.Nginx.Version)
+	}
+	if compareSemver(current, minimumManagedNginxVersion) < 0 {
+		return nil, fmt.Errorf(
+			"检测到 Nginx %s，不兼容当前配置（要求 >= %s）；请先卸载系统自带 Nginx，再通过服务管理安装 Nginx 后重试",
+			current,
+			minimumManagedNginxVersion,
+		)
+	}
+
+	return h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/nginx/setup-ssl", payload)
+}
+
+func parseNginxVersion(output string) string {
+	const marker = "nginx/"
+	start := strings.Index(output, marker)
+	if start < 0 {
+		return ""
+	}
+	start += len(marker)
+	end := start
+	for end < len(output) {
+		c := output[end]
+		if (c < '0' || c > '9') && c != '.' {
+			break
+		}
+		end++
+	}
+	return strings.Trim(output[start:end], ".")
+}
+
 // 将服务控制请求代理到远程服务器
 func (h *RemoteManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -4497,7 +4548,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 		"domain":        domain,
 		"domain_config": domainConf,
 	})
-	if _, err := h.forwardToRemoteServer(ctx, req.ServerID, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload); err != nil {
+	if _, err := h.forwardNginxSetupSSL(ctx, req.ServerID, sslPayload); err != nil {
 		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("部署 nginx 配置失败: %v", err))
 		return
 	}

@@ -43,7 +43,7 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 		"nginx_config":  string(nginxConf),
 		"domain_config": domainConf,
 	})
-	if _, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/nginx/setup-ssl", sslPayload); err != nil {
+	if _, err := h.forwardNginxSetupSSL(ctx, server.ID, sslPayload); err != nil {
 		return fmt.Errorf("配置 Nginx SSL 失败: %w", err)
 	}
 	log.Printf("[DeployTunnel] Deployed nginx config to server %d (%s)", server.ID, server.Name)
