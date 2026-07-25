@@ -264,7 +264,37 @@ func NewUpdateApplySSEHandler() http.Handler {
 }
 
 // 从 GitHub 获取最新版本信息
+// checkLatestVersion:优先走更新 CDN(绕开 GitHub 限流),失败/未配置则回退 GitHub API。
 func checkLatestVersion() (*UpdateInfo, error) {
+	if cdn := UpdateCDNBase(); cdn != "" {
+		if info, err := checkLatestVersionCDN(cdn); err == nil {
+			return info, nil
+		} else {
+			logger.Info("[系统更新] CDN 版本检查失败,回退 GitHub", "error", err.Error())
+		}
+	}
+	return checkLatestVersionGitHub()
+}
+
+// checkLatestVersionCDN 从 {cdn}/miaomiaowux/version.json 拿版本,下载 URL 指向同目录的固定命名二进制。
+func checkLatestVersionCDN(cdn string) (*UpdateInfo, error) {
+	meta, err := fetchCDNVersion(cdn, "miaomiaowux")
+	if err != nil {
+		return nil, err
+	}
+	latestVersion := strings.TrimPrefix(meta.Version, "v")
+	binaryName := fmt.Sprintf("mmwx-%s-%s", runtime.GOOS, runtime.GOARCH)
+	return &UpdateInfo{
+		CurrentVersion: version.Version,
+		LatestVersion:  latestVersion,
+		HasUpdate:      compareVersions(version.Version, latestVersion),
+		ReleaseURL:     meta.HTMLURL,
+		DownloadURL:    cdn + "/miaomiaowux/" + binaryName,
+		ReleaseNotes:   meta.Notes,
+	}, nil
+}
+
+func checkLatestVersionGitHub() (*UpdateInfo, error) {
 	url := fmt.Sprintf(githubAPIURL, githubRepo)
 
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -373,6 +403,11 @@ func downloadBinaryWithProgressAndRetry(url string, onProgress func(downloaded, 
 	tempFile, err := downloadBinaryDirect(url, onProgress, 60*time.Second)
 	if err == nil {
 		return tempFile, nil
+	}
+
+	// CDN 直链下载失败不套 GitHub 代理(gh-proxy 只代理 github),直接返回错误
+	if !strings.Contains(url, "github") {
+		return "", fmt.Errorf("下载失败: %w", err)
 	}
 
 	logger.Warn("[系统更新] 直接下载失败，尝试使用代理下载", "error", err)

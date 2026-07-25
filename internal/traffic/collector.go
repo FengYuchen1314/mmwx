@@ -87,7 +87,15 @@ type Collector struct {
 	// 历史 BUG 来源:启发式把 client 增删导致的 user counter reset 误判为 xray 重启
 	// → user_email_traffic.total_downlink 渐进累积偏移(实测 382MB)。
 	restartDetector *XrayRestartDetector
+
+	// wsConnected 查服务器是否有活跃 WS 连接(注入自 RemoteWSHandler.IsConnected)。
+	// WS 在线的服务器 traffic/speed 由 agent 经 WS 推送,collector 不再 HTTP 拉取,
+	// 避免 WS stealth 关闭 :23889 后 HTTP 轮询疯狂 refused 刷屏、持续写库拖住 WAL。
+	wsConnected func(token string) bool
 }
+
+// SetWSChecker 注入「服务器是否 WS 在线」的判断(来自 RemoteWSHandler.IsConnected)。
+func (c *Collector) SetWSChecker(fn func(token string) bool) { c.wsConnected = fn }
 
 // 创建一个新的流量收集器
 func NewCollector(repo *storage.TrafficRepository) *Collector {
@@ -203,6 +211,11 @@ func (c *Collector) collectAll(ctx context.Context) {
 	}
 
 	for _, remote := range remoteServers {
+		// WS 在线的服务器:traffic 由 agent 经 WS 推送,跳过 HTTP 拉取。
+		// 否则 auto 模式 WS 重连(stealth 关 :23889)后仍按 fallback 标志拉取 → refused 刷屏 + 拖住 WAL。
+		if c.wsConnected != nil && c.wsConnected(remote.Token) {
+			continue
+		}
 		if remote.Status == storage.RemoteServerStatusOffline && c.repo.ShouldUsePullMode(remote) {
 			continue
 		}
@@ -387,18 +400,18 @@ func (c *Collector) ProcessRemoteMetrics(ctx context.Context, serverID int64, st
 
 	isRestart := c.restartDetector.CheckAndUpdate(serverID, xrayBootTime)
 
-	// 处理入站流量
+	// 处理入站/出站流量 —— 合并成一个批量事务。此前每个 tag 一个独立自动提交事务
+	// (inbound+outbound 各 N 个),几十台 agent 高频上报时把单个 SQLite writer 打满、
+	// 写锁争用导致上报延迟指数上升。批量后每次上报的 node 写事务数从 N 降到 1。
+	nodeItems := make([]storage.NodeTrafficItem, 0, len(stats.Inbound)+len(stats.Outbound))
 	for tag, data := range stats.Inbound {
-		if err := c.repo.UpsertNodeTraffic(ctx, serverID, tag, "inbound", data.Uplink, data.Downlink, isRestart); err != nil {
-			log.Printf("[Traffic Collector] Failed to upsert remote inbound traffic for %s: %v", tag, err)
-		}
+		nodeItems = append(nodeItems, storage.NodeTrafficItem{Tag: tag, Type: "inbound", Uplink: data.Uplink, Downlink: data.Downlink})
 	}
-
-	// 处理出站流量
 	for tag, data := range stats.Outbound {
-		if err := c.repo.UpsertNodeTraffic(ctx, serverID, tag, "outbound", data.Uplink, data.Downlink, isRestart); err != nil {
-			log.Printf("[Traffic Collector] Failed to upsert remote outbound traffic for %s: %v", tag, err)
-		}
+		nodeItems = append(nodeItems, storage.NodeTrafficItem{Tag: tag, Type: "outbound", Uplink: data.Uplink, Downlink: data.Downlink})
+	}
+	if err := c.repo.UpsertNodeTrafficBatch(ctx, serverID, nodeItems, isRestart); err != nil {
+		log.Printf("[Traffic Collector] Failed to batch upsert node traffic for server %d (%d tags): %v", serverID, len(nodeItems), err)
 	}
 
 	// 用户流量同上 — 必须先按 username 聚合
@@ -665,6 +678,10 @@ func (c *Collector) collectSpeedFromPullServers(ctx context.Context) {
 	for _, remote := range remoteServers {
 		// 跳过离线服务器以避免日志垃圾邮件
 		if remote.Status == storage.RemoteServerStatusOffline {
+			continue
+		}
+		// WS 在线的服务器:speed 由 agent 经 WS 推送,跳过 HTTP 拉取(避免 stealth 关端口后 refused 刷屏)
+		if c.wsConnected != nil && c.wsConnected(remote.Token) {
 			continue
 		}
 		// 仅使用拉模式从服务器收集

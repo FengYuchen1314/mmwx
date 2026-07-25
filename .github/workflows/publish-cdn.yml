@@ -1,0 +1,74 @@
+name: Publish to R2 CDN
+
+# 发版后把面板二进制 + version.json 推到 Cloudflare R2,供面板自更新走 CDN(绕开 api.github.com 限流)。
+# 触发:GitHub Release 发布时(assets 已由 build.yml 上传完毕)。
+# 需要的 Secrets(仓库 Settings → Secrets and variables → Actions):
+#   R2_ACCOUNT_ID        Cloudflare 账号 ID
+#   R2_ACCESS_KEY_ID     R2 API Token 的 Access Key ID
+#   R2_SECRET_ACCESS_KEY R2 API Token 的 Secret Access Key
+#   R2_BUCKET            R2 bucket 名(如 mmwx-dl)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '手动补传的 release tag(如 v0.3.7)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Push panel binaries + version.json to R2
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      NOTES: ${{ github.event.release.body }}
+      URL: ${{ github.event.release.html_url }}
+      PROJECT: miaomiaowux
+    steps:
+      - name: Download release assets (mmwx-*)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern 'mmwx-*' --dir dist
+          ls -la dist
+
+      - name: Generate version.json
+        run: |
+          # 用 jq -n + 环境变量构造,避免 release body 里的引号/换行破坏 JSON 或注入
+          jq -n \
+            --arg version "$TAG" \
+            --arg tag "$TAG" \
+            --arg notes "${NOTES:-}" \
+            --arg html_url "${URL:-}" \
+            '{version:$version, tag:$tag, notes:$notes, html_url:$html_url}' > dist/version.json
+          cat dist/version.json
+
+      - name: Upload to R2 (S3-compatible)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          # 二进制:长缓存(内容随版本名变,可安全长缓存)
+          for f in dist/mmwx-*; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            aws s3 cp "$f" "s3://$BUCKET/$PROJECT/$name" \
+              --endpoint-url "$R2_ENDPOINT" \
+              --content-type application/octet-stream \
+              --cache-control "public, max-age=86400"
+          done
+          # version.json:短缓存,发新版后 1 分钟内全球生效
+          aws s3 cp dist/version.json "s3://$BUCKET/$PROJECT/version.json" \
+            --endpoint-url "$R2_ENDPOINT" \
+            --content-type application/json \
+            --cache-control "public, max-age=60"
+          echo "已发布到 R2: $PROJECT/ (tag=$TAG)"

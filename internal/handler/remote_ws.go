@@ -1142,6 +1142,13 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	authResultPayload, _ := json.Marshal(WSAuthResultPayload{Success: true, Message: "Authenticated"})
 	h.sendEncryptedMessage(wsConn, WSMessage{Type: WSMsgTypeAuthResult, Payload: authResultPayload})
 
+	// WS 认证成功即清除「回退到 HTTP 拉取」标志:auto 模式服务器曾因 WS 断连累计失败触发 fallback_to_pull=1,
+	// WS 重连后若不清,collector 会继续 HTTP 轮询 agent 的 :23889(WS stealth 下已关闭)→ 疯狂 refused
+	// 刷屏 + 持续写库拖住 WAL checkpoint。WS 在线时 traffic/speed 走 WS 推送,无需 HTTP 拉取。
+	if err := h.repo.ResetRemoteServerPushFailCount(ctx, server.ID); err != nil {
+		log.Printf("[Remote WS] Failed to reset push fail count for server %d: %v", server.ID, err)
+	}
+
 	// 推送许可证状态给 Agent
 	if h.licenseManager != nil {
 		go h.SendLicenseStatus(wsConn)

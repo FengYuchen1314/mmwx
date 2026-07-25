@@ -950,6 +950,44 @@ func (h *SystemSettingsHandler) SetDefaultTheme(w http.ResponseWriter, r *http.R
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "默认主题已更新"})
 }
 
+// UpdateCDNEnabledKey 是「更新走 CDN 加速」开关的 KV 键。值 "1"(默认开启)/ "0"(关闭走 GitHub)。
+// CDN 域名写死在代码(见 update_cdn.go),此开关只控制启用与否。
+const UpdateCDNEnabledKey = "update_cdn_enabled"
+
+func (h *SystemSettingsHandler) GetUpdateCDNStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"success":  true,
+		"enabled":  UpdateCDNEnabled(),
+		"cdn_base": updateCDNBaseURL,
+	})
+}
+
+func (h *SystemSettingsHandler) SetUpdateCDNStatus(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请求格式错误"})
+		return
+	}
+	val := "0"
+	if req.Enabled {
+		val = "1"
+	}
+	if err := h.repo.SetSystemSetting(r.Context(), UpdateCDNEnabledKey, val); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})
+		return
+	}
+	SetUpdateCDNEnabled(req.Enabled) // 同步包级开关,立即生效(下次检查更新即走新设置)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "已更新"})
+}
+
 // LoginWallpaperKey 是「自定义登录页壁纸」的 KV 键(存图片 URL,可为空)。
 const LoginWallpaperKey = "login_wallpaper"
 

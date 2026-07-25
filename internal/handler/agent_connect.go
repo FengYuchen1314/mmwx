@@ -128,11 +128,11 @@ func (h *ChildAPIHandler) authenticate(r *http.Request) bool {
 
 // RemoteHeartbeatRequest代表来自远程服务器的心跳请求
 type RemoteHeartbeatRequest struct {
-	BootTime     int64  `json:"boot_time"`      // MMWX进程启动时间（Unix时间戳）
-	XrayBootTime int64  `json:"xray_boot_time"` // Xray 进程开始时间（Unix 时间戳）
-	XrayPID      int    `json:"xray_pid"`       // 当前 X 射线进程 ID
-	ListenPort   int    `json:"listen_port"`    // 代理HTTP监听端口
-	LocalTime    int64  `json:"local_time"`     // agent 本地 Unix 时间戳，用于时钟偏差检测
+	BootTime     int64 `json:"boot_time"`      // MMWX进程启动时间（Unix时间戳）
+	XrayBootTime int64 `json:"xray_boot_time"` // Xray 进程开始时间（Unix 时间戳）
+	XrayPID      int   `json:"xray_pid"`       // 当前 X 射线进程 ID
+	ListenPort   int   `json:"listen_port"`    // 代理HTTP监听端口
+	LocalTime    int64 `json:"local_time"`     // agent 本地 Unix 时间戳，用于时钟偏差检测
 	// PublicIPv4/v6 由 agent 端 ipProbeLoop 缓存后随心跳上报(WS auth/heartbeat 同款字段)。
 	// master 优先用上报值写 db,fallback 才用 r.RemoteAddr 并强校验类型(避免 v6 写 v4 字段)。
 	// 老 agent 不发 → 字段为空 → 走 fallback 路径,行为退化为现状。
@@ -472,7 +472,7 @@ func validInstallToken(s string) bool {
 }
 
 // shSingleQuote 把任意字符串安全包成 bash 单引号字面量(单引号内除 ' 外无特殊字符)。
-// 规则:整体套单引号,内部每个 ' 替换成 '\'' 序列。用于把外部输入写进安装脚本时防注入。
+// 规则:整体套单引号,内部每个 ' 替换成 '\” 序列。用于把外部输入写进安装脚本时防注入。
 func shSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
@@ -772,11 +772,16 @@ esac
 # 注:GitHub Release binary 重定向到 objects.githubusercontent.com(只有 A 记录,无 AAAA),
 # 纯 v6 机器直连 github 会 "network is unreachable" → 会快速失败(近乎即时,非超时)后降级到
 # ghproxy / gh-proxy(v4+v6 双栈反代)。
-MIRRORS=(
-    "https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    "https://mirror.ghproxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-)
+# 更新 CDN(Cloudflare R2)优先 — CDN_BASE 由后端按 CDN 加速开关注入(默认开启、域名写死),非空才加入;
+# 失败自动降级到 GitHub / gh-proxy。
+CDN_BASE="__MMWX_UPDATE_CDN__"
+MIRRORS=()
+if [ -n "$CDN_BASE" ]; then
+    MIRRORS+=("${CDN_BASE}/mmw-agent/mmw-agent-linux-${ARCH_NAME}")
+fi
+MIRRORS+=("https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
+MIRRORS+=("https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
+MIRRORS+=("https://mirror.ghproxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
 
 # Download binary — 优先用 curl(更普遍),没有就用 wget;两者都没就按发行版包管理器装一个,
 # 杜绝 "wget: command not found" 噪声 / "ERROR: 都没装" 卡死。
@@ -945,6 +950,9 @@ if [ "$AUTO_STEAL_SELF" = "1" ]; then
 fi
 echo ""
 `
+
+	// 注入更新 CDN base(开关开→写死域名,开关关→空);空则脚本里 CDN_BASE 为空、MIRRORS 只用 GitHub / gh-proxy
+	script = strings.ReplaceAll(script, "__MMWX_UPDATE_CDN__", UpdateCDNBase())
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Header().Set("Content-Disposition", "attachment; filename=install.sh")

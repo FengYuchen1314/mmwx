@@ -459,6 +459,9 @@ func main() {
 
 	// 远程服务器的 WebSocket 处理程序
 	remoteWSHandler := handler.NewRemoteWSHandler(repo, trafficCollector)
+	// WS 在线判断注入 collector:WS 连着的服务器 traffic/speed 走 WS 推送,collector 不再 HTTP 拉取
+	// (消除 auto 模式 agent 进 stealth 后 collector 疯狂 refused 刷屏 + 拖住 WAL)
+	trafficCollector.SetWSChecker(remoteWSHandler.IsConnected)
 	remoteWSHandler.SetCrypto(cryptoConfig)
 	mux.Handle("/api/remote/ws", remoteWSHandler)
 
@@ -835,6 +838,10 @@ func main() {
 	if theme, _ := repo.GetSystemSetting(context.Background(), handler.DefaultThemeKey); theme != "" {
 		web.SetDefaultTheme(theme)
 	}
+	// 更新走 CDN 加速开关:默认开启(域名写死在代码);DB 里显式存 "0"/"false" 才关闭 → 回退直连 GitHub
+	if v, _ := repo.GetSystemSetting(context.Background(), handler.UpdateCDNEnabledKey); v == "0" || v == "false" {
+		handler.SetUpdateCDNEnabled(false)
+	}
 	// 日志管理(admin):系统日志(主控自身 mmwx.log)只读查询。定时/agent 日志端点见后续注册。
 	mux.Handle("/api/admin/logs/system", auth.RequireAdmin(tokenStore, userRepo, handler.NewSystemLogHandler(repo)))
 	// 安全日志:探测/封禁事件流 + 当前封禁列表 + 手动封禁/解封。子路径 events / bans / bans/{ip}。
@@ -954,6 +961,17 @@ func main() {
 			if theme, _ := repo.GetSystemSetting(r.Context(), handler.DefaultThemeKey); theme != "" {
 				web.SetDefaultTheme(theme)
 			}
+		default:
+			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		}
+	})))
+	// 更新走 CDN 加速开关(admin GET 回显 / PUT 切换)。CDN 域名写死在代码,默认开启,关闭则回退直连 GitHub。
+	mux.Handle("/api/admin/system-settings/update-cdn", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			systemSettingsHandler.GetUpdateCDNStatus(w, r)
+		case http.MethodPut:
+			systemSettingsHandler.SetUpdateCDNStatus(w, r)
 		default:
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
@@ -1557,8 +1575,11 @@ func startWALCheckpointTask(ctx context.Context, repo *storage.TrafficRepository
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := repo.Checkpoint(); err != nil {
+			if truncated, remaining, err := repo.CheckpointBestEffort(); err != nil {
 				log.Printf("[WAL] periodic checkpoint failed: %v", err)
+			} else if !truncated {
+				// TRUNCATE 抢不到窗口(有长读/写事务持 WAL mark)已降级 PASSIVE 尽力抽干,-wal 不会无界
+				log.Printf("[WAL] checkpoint 未能截断(WAL 仍剩 %d 帧,已降级 PASSIVE 尽力抽干,不影响可用)", remaining)
 			}
 		}
 	}

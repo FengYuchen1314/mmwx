@@ -1010,6 +1010,29 @@ func (r *TrafficRepository) Checkpoint() error {
 	return nil
 }
 
+// CheckpointBestEffort 供周期巡检用:先试 TRUNCATE(等 reader、成功则把 -wal 截回 0);抢不到窗口(busy)
+// 就降级 PASSIVE —— 不等 reader、不截文件,但推进 checkpoint 指针、让已提交帧空间可被后续写复用,
+// 从而即使 TRUNCATE 长期 busy(有长读事务持 WAL mark),-wal 也不会无界追加膨胀。
+// 返回:truncated=是否成功截断,remaining=降级后 WAL 仍剩的帧数(供观测)。
+func (r *TrafficRepository) CheckpointBestEffort() (truncated bool, remaining int, err error) {
+	if r == nil || r.db == nil {
+		return false, 0, nil
+	}
+	var busy, logFrames, checkpointed int
+	if err = r.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return false, 0, fmt.Errorf("wal checkpoint truncate: %w", err)
+	}
+	if busy == 0 {
+		return true, 0, nil
+	}
+	// TRUNCATE 抢不到窗口 → PASSIVE 尽力抽干(总是"成功"返回,只是可能没抽完)
+	var pbusy, plog, pcp int
+	if err = r.db.QueryRow("PRAGMA wal_checkpoint(PASSIVE)").Scan(&pbusy, &plog, &pcp); err != nil {
+		return false, logFrames, fmt.Errorf("wal checkpoint passive: %w", err)
+	}
+	return false, plog, nil
+}
+
 func (r *TrafficRepository) migrate() error {
 	const trafficSchema = `
 CREATE TABLE IF NOT EXISTS traffic_records (

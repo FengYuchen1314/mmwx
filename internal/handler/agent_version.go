@@ -125,6 +125,20 @@ func (h *AgentVersionHandler) fetchLatest(ctx context.Context) (string, string) 
 		return cached, ""
 	}
 
+	// 优先走更新 CDN 的 version.json(绕开 api.github.com 限流);失败再回退 GitHub。
+	if cdn := UpdateCDNBase(); cdn != "" {
+		if meta, err := fetchCDNVersion(cdn, "mmw-agent"); err == nil {
+			if v := strings.TrimPrefix(strings.TrimSpace(meta.Version), "v"); v != "" {
+				h.latestMu.Lock()
+				h.latestVersion = v
+				h.latestFetched = time.Now()
+				h.latestErr = ""
+				h.latestMu.Unlock()
+				return v, ""
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, githubLatestReleaseURL, nil)
