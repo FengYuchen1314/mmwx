@@ -673,6 +673,56 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 }
 
 // 通过 ID 删除远程服务器
+// SyncNodeAddress 手动把指定服务器下所有节点的 clash server 地址校正为服务器当前地址。
+// 换机 / IP 漂移后,心跳与入站同步两条自动刷新都按 original_server=服务器名 匹配刷新;但个别场景
+// (某次 IP 变化触发被错过、或历史节点)可能没被刷到,导致「服务管理显示新 IP、节点生成仍是旧 IP」。
+// 本端点给管理员一键强制校正:v4/域名节点刷到 chooseClashServerHost(Domain→PullAddress域名→IPAddress),
+// v6 节点刷到 IPAddressV6。仍按 original_server 匹配(与自动刷新同口径,不误伤别的服务器的节点)。
+func (h *XrayServerHandler) SyncNodeAddress(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	if r.Method != "POST" {
+		stdhttp.Error(w, "Method not allowed", stdhttp.StatusMethodNotAllowed)
+		return
+	}
+
+	var req RemoteServerDeleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID <= 0 {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "无效的服务器ID"})
+		return
+	}
+
+	ctx := r.Context()
+	server, err := h.repo.GetRemoteServer(ctx, req.ID)
+	if err != nil || server == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "服务器不存在"})
+		return
+	}
+
+	var total int64
+	host := chooseClashServerHost(server)
+	if host != "" {
+		if n, e := h.repo.RefreshNodesServerAddress(ctx, server.Name, host); e != nil {
+			log.Printf("[Sync Node Address] v4 refresh failed for %s: %v", server.Name, e)
+		} else {
+			total += n
+		}
+	}
+	if v6 := strings.TrimSpace(server.IPAddressV6); v6 != "" {
+		if n, e := h.repo.RefreshNodesServerAddressV6(ctx, server.Name, v6); e != nil {
+			log.Printf("[Sync Node Address] v6 refresh failed for %s: %v", server.Name, e)
+		} else {
+			total += n
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(RemoteServerResponse{
+		Success: true,
+		Message: fmt.Sprintf("已同步 %d 个节点地址到 %s", total, host),
+	})
+}
+
 func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	if r.Method != "POST" {
 		stdhttp.Error(w, "Method not allowed", stdhttp.StatusMethodNotAllowed)

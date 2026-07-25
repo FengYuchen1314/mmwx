@@ -10359,7 +10359,7 @@ func (r *TrafficRepository) MarkRemoteServerOfflineByID(ctx context.Context, ser
 		return prevStatus, name, ip, nil
 	}
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE remote_servers SET status = ?, offline_since = CURRENT_TIMESTAMP, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?`,
+		`UPDATE remote_servers SET status = ?, current_upload_speed = 0, current_download_speed = 0, offline_since = CURRENT_TIMESTAMP, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?`,
 		RemoteServerStatusOffline, serverID, RemoteServerStatusConnected,
 	)
 	if err != nil {
@@ -11258,7 +11258,7 @@ func (r *TrafficRepository) MarkOfflineRemoteServers(ctx context.Context, timeou
 	}
 
 	// 现在执行更新
-	const stmt = `UPDATE remote_servers SET status = ?, offline_since = CURRENT_TIMESTAMP, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE status = ? AND last_heartbeat < ?`
+	const stmt = `UPDATE remote_servers SET status = ?, current_upload_speed = 0, current_download_speed = 0, offline_since = CURRENT_TIMESTAMP, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE status = ? AND last_heartbeat < ?`
 
 	result, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusOffline, RemoteServerStatusConnected, cutoff)
 	if err != nil {
