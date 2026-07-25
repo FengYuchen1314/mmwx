@@ -827,6 +827,10 @@ func main() {
 	mux.Handle("/api/admin/xray/generate-keys", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayKeyGenHandler.GenerateKeys)))
 	mux.Handle("/api/admin/xray/generate-x25519", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayKeyGenHandler.GenerateX25519)))
 
+	// 高层 inbound 构建器:吃高层意图拼出完整入站(供 MCP/自动化,无需复刻前端配置逻辑)
+	buildInboundHandler := handler.NewBuildInboundHandler()
+	mux.Handle("/api/admin/xray/build-inbound", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(buildInboundHandler.HandleBuildInbound)))
+
 	// 系统设置 API（仅限管理员）
 	systemSettingsHandler := handler.NewSystemSettingsHandler(repo, cryptoConfig)
 	systemSettingsHandler.SetCollector(trafficCollector)
