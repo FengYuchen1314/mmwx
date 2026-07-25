@@ -90,6 +90,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	// 三段追加(套餐物理 / 套餐 routed / 用户私有 routed)全部完成后再统一注入,
 	// 这样 dialer-proxy 能引用倍率改名后的最终名字,且只在目标真的出现在输出里时才注入。
 	finalNameByNodeID := make(map[int64]string)
+	relayGroupSpecs := make(map[string][]int64) // 组名 → 成员节点 ID(按 ID 存,收齐后按最终名建组)
 	var dialerRefs []dialerRef
 	noteProxy := func(node storage.Node, proxyConfig map[string]any) {
 		if nm, ok := proxyConfig["name"].(string); ok && nm != "" {
@@ -97,6 +98,13 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		}
 		if node.ChainProxyNodeID != nil {
 			dialerRefs = append(dialerRefs, dialerRef{proxy: proxyConfig, target: *node.ChainProxyNodeID})
+		}
+		// 中转组:源节点 dialer-proxy 指向组名;成员按 ID 记录,收齐后按最终名(倍率改名后)建 url-test 组
+		if len(node.RelayGroupNodeIDs) > 0 && node.RelayGroupName != "" {
+			proxyConfig["dialer-proxy"] = node.RelayGroupName
+			if _, seen := relayGroupSpecs[node.RelayGroupName]; !seen {
+				relayGroupSpecs[node.RelayGroupName] = node.RelayGroupNodeIDs
+			}
 		}
 	}
 	for _, nodeID := range orderedNodeIDs {
@@ -144,6 +152,23 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 
 	// 所有节点已收齐 → 注入 dialer-proxy(引用倍率改名后的最终名,目标缺席则跳过不产生悬空引用)
 	injectDialerProxyRefs(dialerRefs, finalNameByNodeID)
+
+	// 中转组:按最终名(倍率改名后)建 url-test 组;成员缺席(未下发到本订阅)则跳过,防悬空
+	var relayGroups []map[string]any
+	for groupName, memberIDs := range relayGroupSpecs {
+		var groupProxies []string
+		for _, rid := range memberIDs {
+			if nm, ok := finalNameByNodeID[rid]; ok {
+				groupProxies = append(groupProxies, nm)
+			}
+		}
+		if len(groupProxies) > 0 {
+			relayGroups = append(relayGroups, map[string]any{
+				"name": groupName, "type": "url-test", "proxies": groupProxies,
+				"url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50,
+			})
+		}
+	}
 
 	if len(proxies) == 0 {
 		writeError(w, http.StatusNotFound, errors.New("套餐内无可用节点"))
@@ -197,6 +222,13 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	if len(renameMap) > 0 {
 		if rewritten, rerr := rewriteProxyGroupRefs([]byte(result), renameMap); rerr == nil {
 			result = string(rewritten)
+		}
+	}
+
+	// 中转组:把 url-test 组追加进 proxy-groups(成员名已是倍率改名后的最终名)
+	if len(relayGroups) > 0 {
+		if rg, rgErr := injectRelayGroupsIntoTemplate(result, relayGroups); rgErr == nil {
+			result = rg
 		}
 	}
 

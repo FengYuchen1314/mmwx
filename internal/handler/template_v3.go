@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/logger"
 	"miaomiaowux/internal/storage"
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 
 	"gopkg.in/yaml.v3"
 )
@@ -213,40 +213,95 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 		sortNodesByNodeOrder(nodes, settings.NodeOrder)
 	}
 
-	// 构建节点 ID -> 名称映射（用于链式代理解析）
+	// 构建节点 ID -> 名称 / 节点映射(链式、中转组都按 ID 解析当前名)
 	nodeIDToName := make(map[int64]string, len(nodes))
+	nodeByID := make(map[int64]storage.Node, len(nodes))
 	for _, node := range nodes {
 		nodeIDToName[node.ID] = node.NodeName
+		nodeByID[node.ID] = node
 	}
 
-	// Filter nodes by selected tags and enabled status
-	var proxies []map[string]any
 	selectedTagsSet := make(map[string]bool)
 	for _, tag := range req.SelectedTags {
 		selectedTagsSet[tag] = true
 	}
 
-	for _, node := range nodes {
-		if !node.Enabled {
-			continue
-		}
-		// If tags are specified, filter by tags
-		if len(req.SelectedTags) > 0 && !node.HasAnyTag(selectedTagsSet) {
-			continue
-		}
-		// Parse clash config
+	// buildPreviewProxy:预览路径(admin 直接用节点 ClashConfig,无套餐凭据/routed 逻辑)。
+	// name 取当前 NodeName;链式/中转组 dialer-proxy 按 ID 取当前名。
+	buildPreviewProxy := func(node storage.Node) (map[string]any, bool) {
 		var proxyConfig map[string]any
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
-			continue
+			return nil, false
 		}
-		// 链式代理：根据 chain_proxy_node_id 注入 dialer-proxy
+		proxyConfig["name"] = node.NodeName
 		if node.ChainProxyNodeID != nil {
 			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
 				proxyConfig["dialer-proxy"] = targetName
 			}
 		}
-		proxies = append(proxies, proxyConfig)
+		if len(node.RelayGroupNodeIDs) > 0 && node.RelayGroupName != "" {
+			proxyConfig["dialer-proxy"] = node.RelayGroupName
+		}
+		return proxyConfig, true
 	}
+
+	// Filter nodes by selected tags and enabled status
+	var proxies []map[string]any
+	inRootProxies := make(map[string]bool)
+	for _, node := range nodes {
+		if !node.Enabled {
+			continue
+		}
+		if len(req.SelectedTags) > 0 && !node.HasAnyTag(selectedTagsSet) {
+			continue
+		}
+		proxyConfig, ok := buildPreviewProxy(node)
+		if !ok {
+			continue
+		}
+		proxies = append(proxies, proxyConfig)
+		inRootProxies[node.NodeName] = true
+	}
+
+	// 中转组:生成 url-test 组(成员按 ID 取当前名);补全被过滤但被组引用的成员。
+	relayGroupMap := make(map[string]map[string]any)
+	var extraProxies []map[string]any
+	for _, node := range nodes {
+		if !node.Enabled || len(node.RelayGroupNodeIDs) == 0 || node.RelayGroupName == "" {
+			continue
+		}
+		if len(req.SelectedTags) > 0 && !node.HasAnyTag(selectedTagsSet) {
+			continue
+		}
+		if _, exists := relayGroupMap[node.RelayGroupName]; exists {
+			continue
+		}
+		var groupProxies []string
+		for _, rid := range node.RelayGroupNodeIDs {
+			member, ok := nodeByID[rid]
+			if !ok || !member.Enabled {
+				continue
+			}
+			groupProxies = append(groupProxies, member.NodeName)
+			if !inRootProxies[member.NodeName] {
+				if pc, ok := buildPreviewProxy(member); ok {
+					extraProxies = append(extraProxies, pc)
+					inRootProxies[member.NodeName] = true
+				}
+			}
+		}
+		if len(groupProxies) > 0 {
+			relayGroupMap[node.RelayGroupName] = map[string]any{
+				"name": node.RelayGroupName, "type": "url-test", "proxies": groupProxies,
+				"url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50,
+			}
+		}
+	}
+	var relayGroups []map[string]any
+	for _, rg := range relayGroupMap {
+		relayGroups = append(relayGroups, rg)
+	}
+	proxies = append(proxies, extraProxies...)
 
 	if len(proxies) == 0 {
 		writeJSONError(w, http.StatusBadRequest, "没有符合条件的节点")
@@ -258,6 +313,11 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "处理模板失败: "+err.Error())
 		return
+	}
+	if len(relayGroups) > 0 {
+		if rg, rgErr := injectRelayGroupsIntoTemplate(result, relayGroups); rgErr == nil {
+			result = rg
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -357,6 +417,46 @@ func injectProxiesIntoTemplate(templateContent string, proxies []map[string]any)
 	return result, nil
 }
 
+// injectRelayGroupsIntoTemplate 把中转组(url-test 代理组)追加进模板的 proxy-groups 数组。
+// 组的成员引用节点当前名(生成时按 ID 解析,改名无影响);必须在孤儿裁剪前调用。
+func injectRelayGroupsIntoTemplate(templateContent string, relayGroups []map[string]any) (string, error) {
+	if len(relayGroups) == 0 {
+		return templateContent, nil
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(templateContent), &root); err != nil {
+		return templateContent, err
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return templateContent, nil
+	}
+	rootMap := root.Content[0]
+	if rootMap.Kind != yaml.MappingNode {
+		return templateContent, nil
+	}
+
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value == "proxy-groups" {
+			groupsNode := rootMap.Content[i+1]
+			if groupsNode.Kind == yaml.SequenceNode {
+				for _, rg := range relayGroups {
+					groupsNode.Content = append(groupsNode.Content, mapToYAMLNode(rg))
+				}
+			}
+			break
+		}
+	}
+
+	var buf strings.Builder
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&root); err != nil {
+		return templateContent, err
+	}
+	encoder.Close()
+	return RemoveUnicodeEscapeQuotes(buf.String()), nil
+}
+
 // mapToYAMLNode converts a map to a YAML mapping node
 func mapToYAMLNode(m map[string]any) *yaml.Node {
 	node := &yaml.Node{
@@ -440,6 +540,16 @@ func anyToYAMLNode(v any) *yaml.Node {
 			Value: boolToString(val),
 		}
 	case []any:
+		seqNode := &yaml.Node{
+			Kind: yaml.SequenceNode,
+			Tag:  "!!seq",
+		}
+		for _, item := range val {
+			seqNode.Content = append(seqNode.Content, anyToYAMLNode(item))
+		}
+		return seqNode
+	case []string:
+		// 中转组成员列表(groupProxies)是 []string;不处理会落到 default 变空字符串。
 		seqNode := &yaml.Node{
 			Kind: yaml.SequenceNode,
 			Tag:  "!!seq",

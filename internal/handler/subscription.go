@@ -971,7 +971,50 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 		credMap = buildUserCredMapForCreator(ctx, h.repo, creator)
 	}
 
+	nodeByID := make(map[int64]storage.Node, len(nodes))
+	for _, node := range nodes {
+		nodeByID[node.ID] = node
+	}
+
+	// buildProxy:把节点解析成 clash proxy。name 强制取数据库当前 NodeName;链式/中转组的 dialer-proxy
+	// 都按 ID 取目标的当前名(改名无影响)。抽成闭包,以便中转组底层成员被标签/ID 过滤掉时也能补建。
+	buildProxy := func(node storage.Node) (map[string]any, bool) {
+		var proxyConfig map[string]any
+		if restrictToPackage && node.NodeType == "routed" {
+			// routed:必须有 active 子账号才能给该用户;没的话整个节点过滤掉,
+			// 否则会泄露 admin 在父节点的 uuid。
+			built, ok := buildRoutedProxyForUser(ctx, h.repo, node, creator)
+			if !ok {
+				return nil, false
+			}
+			proxyConfig = built
+		} else {
+			if node.ClashConfig == "" {
+				return nil, false
+			}
+			if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
+				return nil, false
+			}
+			if credMap != nil {
+				applyUserCredentials(proxyConfig, node, credMap)
+			}
+		}
+		proxyConfig["name"] = node.NodeName
+		// 链式代理:按 chain_proxy_node_id 取目标的当前名
+		if node.ChainProxyNodeID != nil {
+			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
+				proxyConfig["dialer-proxy"] = targetName
+			}
+		}
+		// 中转组:dialer-proxy 指向中转代理组(与 chain 互斥,存储层已保证)
+		if len(node.RelayGroupNodeIDs) > 0 && node.RelayGroupName != "" {
+			proxyConfig["dialer-proxy"] = node.RelayGroupName
+		}
+		return proxyConfig, true
+	}
+
 	var proxies []map[string]any
+	inRootProxies := make(map[string]bool)
 	for _, node := range nodes {
 		if !node.Enabled {
 			continue
@@ -982,34 +1025,61 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
 			continue
 		}
-		var proxyConfig map[string]any
-		if restrictToPackage && node.NodeType == "routed" {
-			// routed:必须有 active 子账号才能给该用户;没的话整个节点过滤掉,
-			// 否则会泄露 admin 在父节点的 uuid。
-			built, ok := buildRoutedProxyForUser(ctx, h.repo, node, creator)
-			if !ok {
-				continue
-			}
-			proxyConfig = built
-		} else {
-			if node.ClashConfig == "" {
-				continue
-			}
-			if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
-				continue
-			}
-			if credMap != nil {
-				applyUserCredentials(proxyConfig, node, credMap)
-			}
-		}
-		proxyConfig["name"] = node.NodeName
-		if node.ChainProxyNodeID != nil {
-			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
-				proxyConfig["dialer-proxy"] = targetName
-			}
+		proxyConfig, ok := buildProxy(node)
+		if !ok {
+			continue
 		}
 		proxies = append(proxies, proxyConfig)
+		inRootProxies[node.NodeName] = true
 	}
+
+	// 中转组:按组名去重生成 url-test 代理组(成员按 ID 取当前名);被过滤(标签/ID)但被中转组
+	// 引用的底层成员补入根 proxies,避免组内悬空引用。成员删除/禁用则从组剔除。
+	relayGroupMap := make(map[string]map[string]any)
+	var extraProxies []map[string]any
+	for _, node := range nodes {
+		if !node.Enabled || len(node.RelayGroupNodeIDs) == 0 || node.RelayGroupName == "" {
+			continue
+		}
+		if hasNodeFilter && !selectedNodeIDsMap[node.ID] {
+			continue
+		}
+		if hasTagFilter && !node.HasAnyTag(selectedTagsMap) {
+			continue
+		}
+		if _, exists := relayGroupMap[node.RelayGroupName]; exists {
+			continue
+		}
+		var groupProxies []string
+		for _, rid := range node.RelayGroupNodeIDs {
+			member, ok := nodeByID[rid]
+			if !ok || !member.Enabled {
+				continue // 底层节点已删除/禁用:从中转组剔除,避免悬空引用
+			}
+			groupProxies = append(groupProxies, member.NodeName)
+			if !inRootProxies[member.NodeName] {
+				if pc, ok := buildProxy(member); ok {
+					extraProxies = append(extraProxies, pc)
+					inRootProxies[member.NodeName] = true
+				}
+			}
+		}
+		if len(groupProxies) > 0 {
+			relayGroupMap[node.RelayGroupName] = map[string]any{
+				"name":      node.RelayGroupName,
+				"type":      "url-test",
+				"proxies":   groupProxies,
+				"url":       "http://www.gstatic.com/generate_204",
+				"interval":  300,
+				"tolerance": 50,
+			}
+		}
+	}
+	var relayGroups []map[string]any
+	for _, rg := range relayGroupMap {
+		relayGroups = append(relayGroups, rg)
+	}
+	proxies = append(proxies, extraProxies...)
 	logger.Info("[模板生成] 节点筛选完成", "total", len(nodes), "filtered", len(proxies), "node_filter", hasNodeFilter, "tag_filter", hasTagFilter, "restricted_to_package", restrictToPackage)
 
 	if len(proxies) == 0 {
@@ -1036,6 +1106,16 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 	result, err = injectProxiesIntoTemplate(result, proxies)
 	if err != nil {
 		return nil, fmt.Errorf("注入代理节点失败: %w", err)
+	}
+
+	// 中转组:把 url-test 代理组追加进 proxy-groups —— 必须在孤儿裁剪前,
+	// 否则组成员没被任何 proxy-group 引用会被裁掉,导致 dialer-proxy 悬空。
+	if len(relayGroups) > 0 {
+		if rg, rgErr := injectRelayGroupsIntoTemplate(result, relayGroups); rgErr == nil {
+			result = rg
+		} else {
+			logger.Info("[模板生成] 中转组注入跳过", "error", rgErr.Error())
+		}
 	}
 
 	// 孤儿节点裁剪:顶层 proxies: 只保留被 proxy-groups 实际引用的节点,删掉没被引用的
@@ -2403,6 +2483,64 @@ func sortProxiesByNodeOrder(ctx context.Context, repo *storage.TrafficRepository
 	return nil
 }
 
+// clashConfigName 从节点 ClashConfig(JSON)里取 proxy 的 name 字段(可能与 NodeName 分叉)。
+func clashConfigName(clashConfig string) string {
+	if clashConfig == "" {
+		return ""
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(clashConfig), &m) != nil {
+		return ""
+	}
+	if nm, ok := m["name"].(string); ok {
+		return nm
+	}
+	return ""
+}
+
+// injectRelayGroupsIntoRootMap 把中转组(url-test 组)追加进已解析 YAML 根 map 的 proxy-groups;
+// 同名组已存在则跳过。返回是否有改动。
+func injectRelayGroupsIntoRootMap(rootMap *yaml.Node, relayGroups []map[string]any) bool {
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value != "proxy-groups" {
+			continue
+		}
+		groupsNode := rootMap.Content[i+1]
+		if groupsNode.Kind != yaml.SequenceNode {
+			return false
+		}
+		existing := make(map[string]bool)
+		for _, g := range groupsNode.Content {
+			if g.Kind != yaml.MappingNode {
+				continue
+			}
+			for j := 0; j < len(g.Content); j += 2 {
+				if g.Content[j].Value == "name" {
+					existing[g.Content[j+1].Value] = true
+					break
+				}
+			}
+		}
+		added := false
+		for _, rg := range relayGroups {
+			name, _ := rg["name"].(string)
+			if existing[name] {
+				continue
+			}
+			groupsNode.Content = append(groupsNode.Content, mapToYAMLNode(rg))
+			added = true
+		}
+		return added
+	}
+	return false
+}
+
+// injectChainProxy 是静态 YAML 订阅(不绑模板)的后处理兜底:按节点表把链式/中转组的 dialer-proxy
+// 注入到输出 proxies。生成型订阅(模板/套餐)已在生成阶段按 ID 注入,这里对已有 dialer-proxy 的节点跳过。
+//
+// 匹配用「NodeName + ClashConfig.name」双键:节点改名时只改 NodeName、不改 ClashConfig.name,
+// 静态文件里的 proxy 名仍是旧名(ClashConfig.name),双键让它也能命中。dialer-proxy 的值(目标名/组名)
+// 一律按 ID 取当前名 —— 存 ID、生成时取最新名,这是根治改名失配的核心。
 func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, username string, data []byte) []byte {
 	nodes, err := repo.ListNodes(ctx, username)
 	if err != nil {
@@ -2410,20 +2548,45 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 	}
 
 	nodeIDToName := make(map[int64]string, len(nodes))
-	nameToChainTarget := make(map[string]string)
-	hasChainProxy := false
 	for _, node := range nodes {
 		nodeIDToName[node.ID] = node.NodeName
+	}
+
+	// 源 proxy 名 → dialer-proxy 目标(链式=目标当前名;中转组=组名)。源名登记 NodeName 与 ClashConfig.name 双键。
+	nameToTarget := make(map[string]string)
+	relayGroupMap := make(map[string]map[string]any)
+	addSrc := func(node storage.Node, target string) {
+		nameToTarget[node.NodeName] = target
+		if cn := clashConfigName(node.ClashConfig); cn != "" && cn != node.NodeName {
+			nameToTarget[cn] = target
+		}
 	}
 	for _, node := range nodes {
 		if node.ChainProxyNodeID != nil {
 			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
-				nameToChainTarget[node.NodeName] = targetName
-				hasChainProxy = true
+				addSrc(node, targetName)
+			}
+			continue
+		}
+		if len(node.RelayGroupNodeIDs) > 0 && node.RelayGroupName != "" {
+			addSrc(node, node.RelayGroupName)
+			if _, exists := relayGroupMap[node.RelayGroupName]; !exists {
+				var members []string
+				for _, rid := range node.RelayGroupNodeIDs {
+					if nm, ok := nodeIDToName[rid]; ok {
+						members = append(members, nm)
+					}
+				}
+				if len(members) > 0 {
+					relayGroupMap[node.RelayGroupName] = map[string]any{
+						"name": node.RelayGroupName, "type": "url-test", "proxies": members,
+						"url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50,
+					}
+				}
 			}
 		}
 	}
-	if !hasChainProxy {
+	if len(nameToTarget) == 0 {
 		return data
 	}
 
@@ -2450,13 +2613,19 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 				continue
 			}
 			var proxyName string
+			hasDialer := false
 			for j := 0; j < len(proxyNode.Content); j += 2 {
-				if proxyNode.Content[j].Value == "name" {
+				switch proxyNode.Content[j].Value {
+				case "name":
 					proxyName = proxyNode.Content[j+1].Value
-					break
+				case "dialer-proxy":
+					hasDialer = true
 				}
 			}
-			if targetName, ok := nameToChainTarget[proxyName]; ok {
+			if hasDialer {
+				continue // 生成阶段已注入,不重复
+			}
+			if targetName, ok := nameToTarget[proxyName]; ok {
 				proxyNode.Content = append(proxyNode.Content,
 					&yaml.Node{Kind: yaml.ScalarNode, Value: "dialer-proxy"},
 					&yaml.Node{Kind: yaml.ScalarNode, Value: targetName},
@@ -2465,6 +2634,17 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 			}
 		}
 		break
+	}
+
+	// 中转组静态兜底:把 url-test 组追加进 proxy-groups
+	if len(relayGroupMap) > 0 {
+		relayGroups := make([]map[string]any, 0, len(relayGroupMap))
+		for _, rg := range relayGroupMap {
+			relayGroups = append(relayGroups, rg)
+		}
+		if injectRelayGroupsIntoRootMap(rootMap, relayGroups) {
+			modified = true
+		}
 	}
 
 	if !modified {
@@ -2476,7 +2656,7 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 		return data
 	}
 	fixed := RemoveUnicodeEscapeQuotes(string(out))
-	logger.Info("[Subscription] 链式代理注入完成", "user", username, "injected", len(nameToChainTarget))
+	logger.Info("[Subscription] 链式/中转组注入完成", "user", username, "srcNames", len(nameToTarget), "relayGroups", len(relayGroupMap))
 	return []byte(fixed)
 }
 

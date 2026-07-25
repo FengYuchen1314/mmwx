@@ -459,20 +459,25 @@ type AutoSpeedLimitRule struct {
 
 // Node代表存储在数据库中的代理节点。
 type Node struct {
-	ID                int64
-	Username          string
-	RawURL            string
-	NodeName          string
-	Protocol          string
-	ParsedConfig      string
-	ClashConfig       string
-	Enabled           bool
-	Tag               string
-	Tags              []string // 多标签支持（兼容旧版单Tag）
-	OriginalServer    string
-	OriginalDomain    string // IP 解析功能专用：解析为 IP 前的原始域名（用于"恢复域名"）。与 OriginalServer（服务器名/路由键）严格区分
-	InboundTag        string // 关联入站标签（用于将节点链接到入站）
-	ChainProxyNodeID  *int64 // 链式代理目标节点 ID
+	ID               int64
+	Username         string
+	RawURL           string
+	NodeName         string
+	Protocol         string
+	ParsedConfig     string
+	ClashConfig      string
+	Enabled          bool
+	Tag              string
+	Tags             []string // 多标签支持（兼容旧版单Tag）
+	OriginalServer   string
+	OriginalDomain   string // IP 解析功能专用：解析为 IP 前的原始域名（用于"恢复域名"）。与 OriginalServer（服务器名/路由键）严格区分
+	InboundTag       string // 关联入站标签（用于将节点链接到入站）
+	ChainProxyNodeID *int64 // 链式代理目标节点 ID
+	// 中转组:dialer-proxy 指向一个由多个落地节点组成的 url-test 代理组。RelayGroupName 是组名,
+	// RelayGroupNodeIDs 是成员节点 ID 列表(按 ID 存,生成订阅时按 ID 取当前名,改名无影响)。
+	// 与 ChainProxyNodeID 互斥(见 CreateNode/UpdateNode)。
+	RelayGroupName    string
+	RelayGroupNodeIDs []int64
 	NodeType          string // 'physical' (默认) 或 'routed' (路由出站虚拟节点)
 	ParentNodeID      *int64 // routed 节点指向其父物理节点
 	RoutedOutboundTag string // routed 节点专用:绑定的 outbound tag(空 = 非 routed 节点);常用查询展示
@@ -791,8 +796,15 @@ type RemoteServer struct {
 	XrayVersion          string     `json:"xray_version,omitempty"`
 	XrayScannedAt        *time.Time `json:"xray_scanned_at,omitempty"`
 	ListenPort           int        `json:"listen_port,omitempty"`
-	TrafficLimit         int64      `json:"traffic_limit"`
-	TrafficResetDay      int        `json:"traffic_reset_day"`
+	// LockEntryIP 锁定入口 IP:true 时,该服务器创建的节点忽略域名/DDNS/v6,只用「服务器地址」
+	// (PullAddress,否则 IPAddress)里填的 IP 当 clash server。解决 NAT 机场景:域名/DDNS 指向
+	// 动态出口 IP,只有用户填的静态入口 IP 能连。
+	LockEntryIP bool `json:"lock_entry_ip"`
+	// PortRangeMin/Max 随机端口范围:都 >0 且 min<=max 时,该服务器加节点自动分配的随机端口必须落在此区间。
+	PortRangeMin    int   `json:"port_range_min,omitempty"`
+	PortRangeMax    int   `json:"port_range_max,omitempty"`
+	TrafficLimit    int64 `json:"traffic_limit"`
+	TrafficResetDay int   `json:"traffic_reset_day"`
 	// 双令牌系统字段
 	AgentToken            string     `json:"agent_token,omitempty"` // 代理令牌（服务器持有，用于从代理拉取）
 	AgentTokenExpiresAt   *time.Time `json:"agent_token_expires_at,omitempty"`
@@ -1426,6 +1438,14 @@ CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled);
 		return err
 	}
 	if err := r.ensureNodeColumn("chain_proxy_node_id", "INTEGER"); err != nil {
+		return err
+	}
+
+	// 中转组:dialer-proxy 指向多个落地节点组成的 url-test 组。成员按节点 ID 存(改名无影响)。
+	if err := r.ensureNodeColumn("relay_group_name", "TEXT"); err != nil {
+		return err
+	}
+	if err := r.ensureNodeColumn("relay_group_node_ids", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
 
@@ -2239,6 +2259,17 @@ CREATE INDEX IF NOT EXISTS idx_remote_servers_status ON remote_servers(status);
 	//   'system'               → 服务器系统级网卡累计 RX/TX,跟 VPS 计费口径一致
 	// 节点视图 / 用户视图 / 套餐 enforcement 永远走 xray 维度,不受此字段影响。
 	if err := r.ensureRemoteServerColumn("traffic_source", "TEXT NOT NULL DEFAULT 'xray'"); err != nil {
+		return err
+	}
+	// 锁定入口 IP + 随机端口范围(节点 server 地址 / 端口分配用,解决 NAT 机上报 127.0.0.1 等问题)
+	// lock_entry_ip=1 时:节点忽略域名/DDNS/v6,只用「服务器地址」(pull_address)里填的 IP。
+	if err := r.ensureRemoteServerColumn("lock_entry_ip", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("port_range_min", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("port_range_max", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	// 系统流量 cycle 累计(reset_day 触发时归零)+ 上次 agent 上报快照(用于算 delta 与 reboot 检测)
@@ -9773,10 +9804,53 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 		return nil, fmt.Errorf("iterate remote servers: %w", err)
 	}
 
+	// 批量补充锁定入口 IP + 随机端口范围(避免改动上面的大 SELECT/Scan)。
+	if len(servers) > 0 {
+		type nodeSet struct {
+			lock     bool
+			min, max int
+		}
+		settings := make(map[int64]nodeSet)
+		if srows, serr := r.db.QueryContext(ctx, `SELECT id, COALESCE(lock_entry_ip,0), COALESCE(port_range_min,0), COALESCE(port_range_max,0) FROM remote_servers`); serr == nil {
+			for srows.Next() {
+				var id int64
+				var lockInt int
+				var ns nodeSet
+				if srows.Scan(&id, &lockInt, &ns.min, &ns.max) == nil {
+					ns.lock = lockInt != 0
+					settings[id] = ns
+				}
+			}
+			srows.Close()
+		}
+		for i := range servers {
+			if ns, ok := settings[servers[i].ID]; ok {
+				servers[i].LockEntryIP = ns.lock
+				servers[i].PortRangeMin = ns.min
+				servers[i].PortRangeMax = ns.max
+			}
+		}
+	}
+
 	return servers, nil
 }
 
 // 按 ID 返回远程服务器。
+// SetServerNodeSettings 更新某服务器的锁定入口 IP + 随机端口范围(节点 server 地址 / 端口分配用)。
+func (r *TrafficRepository) SetServerNodeSettings(ctx context.Context, serverID int64, lockEntryIP bool, portMin, portMax int) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	lock := 0
+	if lockEntryIP {
+		lock = 1
+	}
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE remote_servers SET lock_entry_ip = ?, port_range_min = ?, port_range_max = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		lock, portMin, portMax, serverID)
+	return err
+}
+
 func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*RemoteServer, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
@@ -9842,6 +9916,13 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		}
 		return nil, fmt.Errorf("get remote server: %w", err)
 	}
+
+	// 锁定入口 IP + 随机端口范围:从同表补查,避免改动上面的大 SELECT/Scan(列多、positional 易错)。
+	var lockEntryInt int
+	_ = r.db.QueryRowContext(ctx,
+		`SELECT COALESCE(lock_entry_ip,0), COALESCE(port_range_min,0), COALESCE(port_range_max,0) FROM remote_servers WHERE id = ?`, id).
+		Scan(&lockEntryInt, &server.PortRangeMin, &server.PortRangeMax)
+	server.LockEntryIP = lockEntryInt != 0
 
 	server.XrayRunning = xrayRunningInt != 0
 	server.WarpInstalled = warpInstalledInt != 0

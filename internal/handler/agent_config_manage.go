@@ -66,7 +66,6 @@ func (h *XrayServerHandler) SetLicenseManager(mgr *license.Manager) {
 	h.licenseManager = mgr
 }
 
-
 // 远程服务器管理API
 
 // RemoteServerCreateRequest代表创建远程服务器的请求
@@ -79,7 +78,7 @@ type RemoteServerCreateRequest struct {
 	ConnectionMode    string `json:"connection_mode"`     // push | pull | websocket
 	ListenPort        int    `json:"listen_port"`         // Agent HTTP 监听端口(0 = 用默认 23889);通过 install 脚本注入 MMWX_LISTEN_PORT
 	PullAddress       string `json:"pull_address"`        // 对于pull模式
-	PullAddressV6     string `json:"pull_address_v6"`      // DDNS 专用:v6 单独域名(空则 AAAA 也写 pull_address)
+	PullAddressV6     string `json:"pull_address_v6"`     // DDNS 专用:v6 单独域名(空则 AAAA 也写 pull_address)
 	PullPort          int    `json:"pull_port"`           // 对于pull模式
 	PullToken         string `json:"pull_token"`          // 对于pull模式
 	StealSelf         bool   `json:"steal_self"`          // 代理安装后自动安装xray+nginx
@@ -144,23 +143,27 @@ type RemoteServerDeleteRequest struct {
 
 // RemoteServerUpdateRequest 表示更新远程服务器的请求
 type RemoteServerUpdateRequest struct {
-	ID              int64  `json:"id"`
-	Name            string `json:"name"`
-	Domain          string `json:"domain"`
-	DomainV6        string `json:"domain_v6"`
-	TrafficLimit    int64  `json:"traffic_limit"`
-	TrafficResetDay int    `json:"traffic_reset_day"`
-	TrafficUsed     *int64 `json:"traffic_used"`
-	ConnectionMode  string `json:"connection_mode"`
-	ListenPort      int    `json:"listen_port"`     // Agent HTTP 监听端口;变更时主控会通知 agent 改配置+重启
-	PullAddress     string `json:"pull_address"`
-	PullAddressV6   string `json:"pull_address_v6"` // DDNS 专用:v6 单独域名
-	PullPort        int    `json:"pull_port"`
-	PullToken       string `json:"pull_token"`
+	ID               int64  `json:"id"`
+	Name             string `json:"name"`
+	Domain           string `json:"domain"`
+	DomainV6         string `json:"domain_v6"`
+	TrafficLimit     int64  `json:"traffic_limit"`
+	TrafficResetDay  int    `json:"traffic_reset_day"`
+	TrafficUsed      *int64 `json:"traffic_used"`
+	ConnectionMode   string `json:"connection_mode"`
+	ListenPort       int    `json:"listen_port"` // Agent HTTP 监听端口;变更时主控会通知 agent 改配置+重启
+	PullAddress      string `json:"pull_address"`
+	PullAddressV6    string `json:"pull_address_v6"` // DDNS 专用:v6 单独域名
+	PullPort         int    `json:"pull_port"`
+	PullToken        string `json:"pull_token"`
 	XrayMode         string `json:"xray_mode"`
 	TrafficStatsMode string `json:"traffic_stats_mode"` // both | upload | download
 	TrafficSource    string `json:"traffic_source"`     // xray | system
 	IPv6Enabled      *bool  `json:"ipv6_enabled"`       // 指针:nil=不改;false=关闭(服务管理不显示 v6、加节点不可选 v6)
+	// 锁定入口 IP + 随机端口范围(节点 server 地址 / 端口分配)。指针:nil=不改。
+	LockEntryIP  *bool `json:"lock_entry_ip"`
+	PortRangeMin *int  `json:"port_range_min"`
+	PortRangeMax *int  `json:"port_range_max"`
 	// DDNS 同 Create
 	DDNSEnabled    bool  `json:"ddns_enabled"`
 	DDNSProviderID int64 `json:"ddns_provider_id"`
@@ -853,6 +856,32 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			Message: msg,
 		})
 		return
+	}
+
+	// 锁定入口 IP + 随机端口范围:三者任一非 nil 即表示前端提交了这组设置,一起落库
+	// (未提交的项用当前值兜底,避免只改一项把另两项清零)。
+	if req.LockEntryIP != nil || req.PortRangeMin != nil || req.PortRangeMax != nil {
+		cur, _ := h.repo.GetRemoteServer(ctx, req.ID)
+		lockEntry, pmin, pmax := false, 0, 0
+		if cur != nil {
+			lockEntry, pmin, pmax = cur.LockEntryIP, cur.PortRangeMin, cur.PortRangeMax
+		}
+		if req.LockEntryIP != nil {
+			lockEntry = *req.LockEntryIP
+		}
+		if req.PortRangeMin != nil {
+			pmin = *req.PortRangeMin
+		}
+		if req.PortRangeMax != nil {
+			pmax = *req.PortRangeMax
+		}
+		// 范围非法(min>max 或越界)→ 归零表示不启用范围限制,避免存进坏配置。
+		if pmin < 0 || pmax < 0 || pmin > 65535 || pmax > 65535 || (pmin > 0 && pmax > 0 && pmin > pmax) {
+			pmin, pmax = 0, 0
+		}
+		if err := h.repo.SetServerNodeSettings(ctx, req.ID, lockEntry, pmin, pmax); err != nil {
+			log.Printf("[Remote Server] set node settings for %d failed: %v", req.ID, err)
+		}
 	}
 
 	// 切换 xray→system 时,把 xray 流量的当前累计 + daily snapshot 历史完整搬到 system 维度:

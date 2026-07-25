@@ -525,6 +525,7 @@ func (h *nodesHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.parseChainProxyNodeID()
+	req.parseRelayGroup()
 
 	// 校验节点名称不为空
 	if strings.TrimSpace(req.NodeName) == "" {
@@ -571,17 +572,19 @@ func (h *nodesHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	req.ParsedConfig = ensureUDPDefault(req.ParsedConfig)
 
 	node := storage.Node{
-		Username:         username,
-		RawURL:           req.RawURL,
-		NodeName:         req.NodeName,
-		Protocol:         req.Protocol,
-		ParsedConfig:     req.ParsedConfig,
-		ClashConfig:      req.ClashConfig,
-		Enabled:          req.Enabled,
-		Tag:              req.Tag,
-		Tags:             req.Tags,
-		InboundTag:       req.InboundTag,
-		ChainProxyNodeID: req.ChainProxyNodeID,
+		Username:          username,
+		RawURL:            req.RawURL,
+		NodeName:          req.NodeName,
+		Protocol:          req.Protocol,
+		ParsedConfig:      req.ParsedConfig,
+		ClashConfig:       req.ClashConfig,
+		Enabled:           req.Enabled,
+		Tag:               req.Tag,
+		Tags:              req.Tags,
+		InboundTag:        req.InboundTag,
+		ChainProxyNodeID:  req.ChainProxyNodeID,
+		RelayGroupName:    req.RelayGroupName,
+		RelayGroupNodeIDs: req.RelayGroupNodeIDs,
 	}
 
 	// 防绕过:节点 server 指向已注册的 remote_server → 计入 license 配额(按原始 server 判,故在挂中转前)
@@ -718,6 +721,7 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 		return
 	}
 	req.parseChainProxyNodeID()
+	req.parseRelayGroup()
 
 	// 普通用户:只能改自己节点的「名称」。归属已由 fetchNodeForAccess 限制为本人节点(套餐/admin
 	// 节点取不到 → 404)。强制只保留 NodeName、其余字段沿用原节点,防止越权改配置/协议/标签/启用状态。
@@ -797,6 +801,11 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 	existing.Enabled = req.Enabled
 	if req.hasChainProxyNodeID() {
 		existing.ChainProxyNodeID = req.ChainProxyNodeID
+	}
+	// 中转组:与单链式代理互斥(storage 层 UpdateNode 保证)。前端建组时同时发 chain_proxy_node_id=null。
+	if req.hasRelayGroup() {
+		existing.RelayGroupName = req.RelayGroupName
+		existing.RelayGroupNodeIDs = req.RelayGroupNodeIDs
 	}
 
 	updated, err := h.repo.UpdateNode(r.Context(), existing)
@@ -1972,6 +1981,10 @@ type nodeRequest struct {
 	InboundTag          string          `json:"inbound_tag"`
 	ChainProxyNodeID    *int64          `json:"-"`
 	RawChainProxyNodeID json.RawMessage `json:"chain_proxy_node_id"`
+	// 中转组(relay group):dialer-proxy 指向一个由多个落地节点组成的 url-test 组。成员按 ID 存,与单链式代理互斥。
+	RelayGroupName       string          `json:"relay_group_name"`
+	RelayGroupNodeIDs    []int64         `json:"-"`
+	RawRelayGroupNodeIDs json.RawMessage `json:"relay_group_node_ids"`
 	// 中转(relay):创建时若填写中转服务器,后端把 clash/parsed 的 server/port 换成中转地址,原值记到 relay_orig_*。
 	RelayServer string `json:"relay_server"`
 	RelayPort   int    `json:"relay_port"`
@@ -1992,6 +2005,18 @@ func (r *nodeRequest) parseChainProxyNodeID() {
 	}
 }
 
+func (r *nodeRequest) hasRelayGroup() bool {
+	return r.RawRelayGroupNodeIDs != nil
+}
+
+func (r *nodeRequest) parseRelayGroup() {
+	r.RelayGroupNodeIDs = nil
+	if r.RawRelayGroupNodeIDs == nil || string(r.RawRelayGroupNodeIDs) == "null" {
+		return
+	}
+	_ = json.Unmarshal(r.RawRelayGroupNodeIDs, &r.RelayGroupNodeIDs)
+}
+
 type nodeDTO struct {
 	ID           int64  `json:"id"`
 	RawURL       string `json:"raw_url"`
@@ -2009,6 +2034,8 @@ type nodeDTO struct {
 	OriginalDomain    string   `json:"original_domain"`
 	InboundTag        string   `json:"inbound_tag"`
 	ChainProxyNodeID  *int64   `json:"chain_proxy_node_id"`
+	RelayGroupName    string   `json:"relay_group_name"`
+	RelayGroupNodeIDs []int64  `json:"relay_group_node_ids"`
 	NodeType          string   `json:"node_type"`              // 'physical' | 'routed'
 	ParentNodeID      *int64   `json:"parent_node_id"`         // routed 节点指向其父物理节点
 	RoutedOutboundTag string   `json:"routed_outbound_tag"`    // routed 节点专用:绑定的出站 tag(便于 UI 直接展示)
@@ -2097,6 +2124,8 @@ func convertNode(node storage.Node) nodeDTO {
 		OriginalDomain:    node.OriginalDomain,
 		InboundTag:        node.InboundTag,
 		ChainProxyNodeID:  node.ChainProxyNodeID,
+		RelayGroupName:    node.RelayGroupName,
+		RelayGroupNodeIDs: node.RelayGroupNodeIDs,
 		NodeType:          node.NodeType,
 		ParentNodeID:      node.ParentNodeID,
 		RoutedOutboundTag: node.RoutedOutboundTag,

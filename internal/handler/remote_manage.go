@@ -3653,19 +3653,41 @@ func chooseClashServerHost(server *storage.RemoteServer) string {
 	if server == nil {
 		return ""
 	}
+	// 锁定入口 IP:忽略域名/DDNS/v6,只用「服务器地址」(PullAddress 优先,否则 IPAddress)里填的 IP。
+	// NAT 机:域名/DDNS 指向动态出口 IP,只有用户填的静态入口 IP 能连。
+	if server.LockEntryIP {
+		if p := strings.TrimSpace(server.PullAddress); p != "" {
+			return p
+		}
+		return strings.TrimSpace(server.IPAddress)
+	}
 	if d := strings.TrimSpace(server.Domain); d != "" {
 		return d
 	}
 	if p := strings.TrimSpace(server.PullAddress); p != "" && net.ParseIP(p) == nil {
 		return p
 	}
-	if ip := strings.TrimSpace(server.IPAddress); ip != "" {
+	// 跳过 127.0.0.1 / localhost:NAT 机没配入口 IP 时 agent 会上报回环地址,
+	// 直接拿它当 clash server 生成的节点根本连不上,不如往后退到 v6 / 留空提示用户配入口 IP。
+	if ip := strings.TrimSpace(server.IPAddress); ip != "" && !isLoopbackHost(ip) {
 		return ip
 	}
 	if d := strings.TrimSpace(server.DomainV6); d != "" {
 		return d
 	}
 	return strings.TrimSpace(server.IPAddressV6)
+}
+
+// isLoopbackHost 判断 host 是否为回环地址(127.0.0.1 / ::1 / localhost)。
+func isLoopbackHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if h == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // silentlyRemoveOrphanInbound 在后台静默删除 agent 上的"孤儿入站"(listInbounds 返回但 settings 缺失)。
