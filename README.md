@@ -49,6 +49,10 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.4.2 (2026-07-26)
+- 🌈 增加cdn更新
+- 🌈 支持mieru协议
+
 ### v0.4.1 (2026-07-23)
 - 🌈 支持内置icmping
 - 🌈 支持日志管理与删除
