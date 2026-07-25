@@ -4606,71 +4606,28 @@ func (h *ManageHandler) addRequiredOutbounds(config map[string]interface{}) {
 }
 
 func (h *ManageHandler) ensureRoutingRules(config map[string]interface{}) bool {
+	// 已初始化的 routing(存在 rules 数组,哪怕为空)完全交给主控/用户管理,不再强行补默认规则。
+	// 否则用户在面板删掉的默认规则(geoip:private / ban_geoip_cn / ban_bt)每次 agent 启动都被加回,
+	// 导致 agent 实配与主控 snapshot 不一致 → 误报"配置漂移"。默认规则改由主控模板
+	// (templates/default/config.json)在首次部署时下发,agent 只负责给「完全没有 routing.rules 的
+	// 遗留/空配置」兜底注入一次。
 	routing, ok := config["routing"].(map[string]interface{})
-	if !ok {
-		routing = map[string]interface{}{
-			"domainStrategy": "IPIfNonMatch",
-			"rules":          []interface{}{},
+	if ok {
+		if _, hasRules := routing["rules"].([]interface{}); hasRules {
+			return false
 		}
+	} else {
+		routing = map[string]interface{}{"domainStrategy": "IPIfNonMatch"}
 		config["routing"] = routing
 	}
 
-	rules, ok := routing["rules"].([]interface{})
-	if !ok {
-		rules = []interface{}{}
+	// 到这里说明 routing 没有 rules 数组(全新 / 遗留空配置)→ 注入一次默认规则(保留已有 domainStrategy)。
+	routing["rules"] = []interface{}{
+		map[string]interface{}{"type": "field", "protocol": []interface{}{"bittorrent"}, "marktag": "ban_bt", "outboundTag": "block"},
+		map[string]interface{}{"type": "field", "ip": []interface{}{"geoip:cn"}, "marktag": "ban_geoip_cn", "outboundTag": "block"},
+		map[string]interface{}{"type": "field", "ip": []interface{}{"geoip:private"}, "outboundTag": "block"},
 	}
-
-	existingMarktags := map[string]bool{}
-	for _, r := range rules {
-		if rule, ok := r.(map[string]interface{}); ok {
-			if mt, _ := rule["marktag"].(string); mt != "" {
-				existingMarktags[mt] = true
-			}
-		}
-	}
-
-	added := false
-	requiredRules := []map[string]interface{}{
-		{"type": "field", "protocol": []interface{}{"bittorrent"}, "marktag": "ban_bt", "outboundTag": "block"},
-		{"type": "field", "ip": []interface{}{"geoip:cn"}, "marktag": "ban_geoip_cn", "outboundTag": "block"},
-		{"type": "field", "ip": []interface{}{"geoip:private"}, "outboundTag": "block"},
-	}
-
-	for _, req := range requiredRules {
-		marktag, _ := req["marktag"].(string)
-		if marktag != "" && existingMarktags[marktag] {
-			continue
-		}
-		// geoip:private 没有 marktag，按 ip 内容判断
-		if marktag == "" {
-			found := false
-			for _, r := range rules {
-				if rule, ok := r.(map[string]interface{}); ok {
-					if ips, ok := rule["ip"].([]interface{}); ok {
-						for _, ip := range ips {
-							if ip == "geoip:private" {
-								found = true
-								break
-							}
-						}
-					}
-				}
-				if found {
-					break
-				}
-			}
-			if found {
-				continue
-			}
-		}
-		rules = append(rules, req)
-		added = true
-	}
-
-	if added {
-		routing["rules"] = rules
-	}
-	return added
+	return true
 }
 
 // removeDeprecatedRoutingRules 一次性清理已废弃的路由规则(按 marktag 白名单匹配)。
