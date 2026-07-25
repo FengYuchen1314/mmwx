@@ -170,6 +170,28 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.3.7 (2026-07-26)
+- 🌈 ss默认开启tcpfastopen,hy2支持自签
+- 🌈 增加cdn更新配置
+- 🌈 支持探测已存在的tunnel
+- 🌈 支持绑定tg用户
+- 🌈 支持自定义部分网站信息
+- 🌈 移植妙妙屋clash链式代理
+- 🌈tg公告增加日志
+- 🌈管理员模板支持分享用户
+- 🛠️ fix: clash过滤snellv6的节点
+- 🛠️ fix: http|socks5密码下发错误
+- 🛠️ fix: ssrf
+- 🛠️ fix: tg通知失败400
+- 🛠️ fix: v6节点在没有v6的探测点误报被墙
+- 🛠️ fix: 上报间隔修改导致sqlite busy
+- 🛠️ fix: 中转过的节点用户凭据未生效
+- 🛠️ fix: 修改节点的时候增加中转配置没有生效
+- 🛠️ fix: 用户禁用后没有踢出登录状态
+- 🛠️ fix: 纯 IPv6 服务器节点同步
+- 🛠️ fix: 自装旧版Nginx时提示不兼容
+- 🛠️ fix: 迁移过来的订阅无法删除
+- 🛠️ fix: 近期改动导致分享服务器的功能缺失异常
 ### v0.3.6 (2026-07-23)
 - 🌈 增加auto类型订阅客户端
 - 🌈 编辑订阅支持调整可用节点比例
