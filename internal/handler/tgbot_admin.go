@@ -16,6 +16,7 @@ import (
 
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/license"
+	"miaomiaowux/internal/logger"
 	"miaomiaowux/internal/storage"
 
 	"golang.org/x/crypto/bcrypt"
@@ -132,6 +133,7 @@ func (h *TGBotAPIHandler) announcementsPending(w http.ResponseWriter, r *http.Re
 	ctx := r.Context()
 	items, err := h.repo.ListPendingBotAnnouncements(ctx)
 	if err != nil {
+		logger.Error("[公告广播] 查询待推送 bot 公告失败", "error", err.Error())
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -144,6 +146,9 @@ func (h *TGBotAPIHandler) announcementsPending(w http.ResponseWriter, r *http.Re
 	out := make([]pendingAnn, 0, len(items))
 	if len(items) > 0 {
 		users, _ := h.repo.ListActivePackageTGUsers(ctx)
+		// 关键诊断:待推送公告数 + 合格收件人(绑定 TG 且有生效套餐)总数。
+		// 若 eligible_tg_users=0 → 没有任何用户满足「绑 TG + 有生效套餐」,公告发不出去(收不到的常见真因)。
+		logger.Info("[公告广播] bot 轮询到待推送公告", "pending_count", len(items), "eligible_tg_users", len(users))
 		// 套餐是否含某节点的缓存(同一批用户很多共用套餐,避免重复查库)
 		pkgHasNode := map[string]bool{} // key = "packageID:nodeID"
 		hasNode := func(pkgID, nodeID int64) bool {
@@ -171,6 +176,13 @@ func (h *TGBotAPIHandler) announcementsPending(w http.ResponseWriter, r *http.Re
 				}
 				recips = append(recips, u.TelegramID)
 			}
+			if len(recips) == 0 {
+				logger.Warn("[公告广播] 公告无收件人 → 无人收到",
+					"announcement_id", it.ID, "title", it.Title, "node_id", it.NodeID,
+					"reason", "无「绑定TG且有生效套餐」的用户;若为节点相关公告,可能套餐都不含该节点")
+			} else {
+				logger.Info("[公告广播] 公告收件人已解析", "announcement_id", it.ID, "title", it.Title, "recipients", len(recips))
+			}
 			out = append(out, pendingAnn{ID: it.ID, Title: it.Title, Body: it.Body, Recipients: recips})
 		}
 	}
@@ -187,9 +199,11 @@ func (h *TGBotAPIHandler) announcementDelivered(w http.ResponseWriter, r *http.R
 		return
 	}
 	if err := h.repo.MarkAnnouncementBotDelivered(r.Context(), req.ID); err != nil {
+		logger.Error("[公告广播] 标记 bot 已推送失败", "announcement_id", req.ID, "error", err.Error())
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	logger.Info("[公告广播] bot 回报公告已推送完成", "announcement_id", req.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
