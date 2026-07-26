@@ -3825,6 +3825,10 @@ func (r *TrafficRepository) RecordDaily(ctx context.Context, date time.Time, tot
 	// 且与 node/user 快照表对不上。三处必须同一个时区口径。
 	normalized := date.Format("2006-01-02")
 
+	// 存储层护栏:全 0 的写入**不覆盖**当天已有的非 0 记录 —— 防"DB 临时报错→全0→ON CONFLICT
+	// 覆盖正确历史"事故(2026-05-31 发生过)。只在「新值非 0」或「旧值本就是 0」时才更新;
+	// 新值全 0 且旧值非 0 → WHERE 不成立、整条 DO UPDATE 跳过,保留正确历史。
+	// 有了这道护栏,handler 层就不必再靠"全 0=异常"的启发式跳过 + 刷 WARN(合法的全 0 环境会误报刷屏)。
 	const stmt = `
 INSERT INTO traffic_records (date, total_limit, total_used, total_remaining)
 VALUES (?, ?, ?, ?)
@@ -3832,7 +3836,9 @@ ON CONFLICT(date) DO UPDATE SET
     total_limit = excluded.total_limit,
     total_used = excluded.total_used,
     total_remaining = excluded.total_remaining,
-    created_at = CURRENT_TIMESTAMP;
+    created_at = CURRENT_TIMESTAMP
+WHERE excluded.total_used <> 0 OR excluded.total_limit <> 0
+   OR (traffic_records.total_used = 0 AND traffic_records.total_limit = 0);
 `
 
 	if _, err := r.db.ExecContext(ctx, stmt, normalized, totalLimit, totalUsed, totalRemaining); err != nil {
