@@ -521,8 +521,6 @@ func main() {
 		}
 		log.Printf("[InboundCache] warmup done for %d servers", len(servers))
 	}()
-	// agent 重连后异步同步 xray config snapshot(双向兜底 — agent/master 跑路换机都能恢复)。
-	remoteWSHandler.SetXrayConfigSyncCallback(remoteManageHandler.SyncXrayConfigOnReconnect)
 	// agent 重连后校正 embedded→external 漂移(license 恢复后自动把卡在 external 的 agent 拉回 embedded)。
 	remoteWSHandler.SetXrayModeCorrectCallback(remoteManageHandler.CorrectXrayModeDrift)
 	xrayServerHandler.SetRemoteManager(remoteManageHandler)
@@ -1153,6 +1151,11 @@ func main() {
 	certHandler.SetOnMasterURLChanged(remoteManageHandler.BroadcastMasterURLUpdate)
 	certHandler.SetRemoteManage(remoteManageHandler) // 联邦服务器证书下发走拥有方主控
 	remoteManageHandler.SetCertificateHandler(certHandler)
+	// agent 重连先同步实际 Xray 配置快照，再按快照补发其中引用的主控托管证书。
+	remoteWSHandler.SetXrayConfigSyncCallback(func(ctx context.Context, serverID int64, prevStatus string) {
+		remoteManageHandler.SyncXrayConfigOnReconnect(ctx, serverID, prevStatus)
+		certHandler.SyncManagedXrayCertificatesOnReconnect(ctx, serverID)
+	})
 	remoteManageHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
 	remoteWSHandler.SetScanResultHandler(remoteManageHandler.HandleScanResult)
 	remoteWSHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
