@@ -9337,6 +9337,31 @@ func (r *TrafficRepository) GetUserBillableTraffic(ctx context.Context, username
 	return int64(billable), nil
 }
 
+// GetUserBillableTrafficByDirection 返回该用户本周期计费流量的**分方向**拆分(上行、下行 bytes)。
+//
+// 与 GetUserBillableTraffic 完全同源同口径 —— 同一张 user_email_traffic 表、同一条
+// weighted_* - cycle_base_weighted_* 计费公式(倍率已由 collector 折算进 weighted_*),
+// 唯一区别是不把上下行相加、而是分别返回。供 tgbot /user-summary 用:bot 卡片要分方向
+// 显示"本周期 ↑ ↓",且 up+down 恰好等于 GetUserBillableTraffic 的合计(与 Web 面板一致)。
+func (r *TrafficRepository) GetUserBillableTrafficByDirection(ctx context.Context, username string) (int64, int64, error) {
+	if r == nil || r.db == nil {
+		return 0, 0, errors.New("traffic repository not initialized")
+	}
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return 0, 0, errors.New("username is required")
+	}
+	var up, down float64
+	err := r.db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(MAX(weighted_uplink - cycle_base_weighted_uplink, 0)), 0),
+		        COALESCE(SUM(MAX(weighted_downlink - cycle_base_weighted_downlink, 0)), 0)
+		 FROM user_email_traffic WHERE attributed_username = ?`, username).Scan(&up, &down)
+	if err != nil {
+		return 0, 0, fmt.Errorf("query billable traffic by direction: %w", err)
+	}
+	return int64(up), int64(down), nil
+}
+
 // GetAllUserBillableTraffic 一次性返回所有用户的本周期计费流量(username → bytes)。
 // 给用户列表这类要展示 N 个用户的地方用,避免 N+1。语义同 GetUserBillableTraffic。
 func (r *TrafficRepository) GetAllUserBillableTraffic(ctx context.Context) (map[string]int64, error) {

@@ -762,18 +762,23 @@ func (h *TGBotAPIHandler) userSummary(w http.ResponseWriter, r *http.Request) {
 	if user.PackageEndDate != nil {
 		out["package_end_date"] = user.PackageEndDate.Format(time.RFC3339)
 	}
-	// 流量
+	// 流量:本周期已用走**计费口径**(倍率已折算进 weighted_*),与 Web 流量页面同源
+	// (GetUserBillableTraffic)。这里用分方向版,因为 bot 卡片要显示"本周期 ↑ ↓";
+	// cycle_uplink+cycle_downlink 恰好等于面板 billable。累计 total_* 仍为裸实际传输量,
+	// 语义是"历史真实流量",不参与限额,故不折算倍率。
 	rows, _ := h.repo.GetUserTrafficByUsername(r.Context(), username)
-	var sumUp, sumDown, totalUp, totalDown int64
+	var totalUp, totalDown int64
 	for _, t := range rows {
-		sumUp += t.Uplink
-		sumDown += t.Downlink
 		totalUp += t.TotalUplink
 		totalDown += t.TotalDownlink
 	}
+	cycleUp, cycleDown, berr := h.repo.GetUserBillableTrafficByDirection(r.Context(), username)
+	if berr != nil {
+		cycleUp, cycleDown = 0, 0
+	}
 	out["traffic"] = map[string]any{
-		"cycle_uplink":   sumUp,
-		"cycle_downlink": sumDown,
+		"cycle_uplink":   cycleUp,
+		"cycle_downlink": cycleDown,
 		"total_uplink":   totalUp,
 		"total_downlink": totalDown,
 	}
