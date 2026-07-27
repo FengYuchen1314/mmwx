@@ -712,7 +712,7 @@ func (h *XrayServerHandler) SyncNodeAddress(w stdhttp.ResponseWriter, r *stdhttp
 			total += n
 		}
 	}
-	if v6 := strings.TrimSpace(server.IPAddressV6); v6 != "" {
+	if v6 := v6RefreshTarget(server); v6 != "" {
 		if n, e := h.repo.RefreshNodesServerAddressV6(ctx, server.Name, v6); e != nil {
 			log.Printf("[Sync Node Address] v6 refresh failed for %s: %v", server.Name, e)
 		} else {
@@ -968,6 +968,29 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 				Message: fmt.Sprintf("更新拉取配置失败: %s", err.Error()),
 			})
 			return
+		}
+	}
+
+	// 锁定入口 IP 变更时,立即把已存在节点的 clash server 校正到锁定后的 effective host。
+	// 放在 pull_address 落库之后:确保 GetRemoteServer 读到的是本次刚写入的新地址,
+	// 否则"同时改服务器地址 + 勾锁定"会刷到旧地址。不触发时(req.LockEntryIP==nil)跳过,
+	// 保持与旧行为一致 —— 只有前端明确提交了锁定开关才动节点地址。
+	if req.LockEntryIP != nil {
+		if latest, gerr := h.repo.GetRemoteServer(ctx, req.ID); gerr == nil && latest != nil {
+			if host := chooseClashServerHost(latest); host != "" {
+				if n, e := h.repo.RefreshNodesServerAddress(ctx, latest.Name, host); e != nil {
+					log.Printf("[Remote Server] lock-entry v4 refresh for %s failed: %v", latest.Name, e)
+				} else if n > 0 {
+					log.Printf("[Remote Server] lock-entry: refreshed %d node(s) clash.server → %s for %s", n, host, latest.Name)
+				}
+			}
+			if v6 := v6RefreshTarget(latest); v6 != "" {
+				if n, e := h.repo.RefreshNodesServerAddressV6(ctx, latest.Name, v6); e != nil {
+					log.Printf("[Remote Server] lock-entry v6 refresh for %s failed: %v", latest.Name, e)
+				} else if n > 0 {
+					log.Printf("[Remote Server] lock-entry: refreshed %d v6 node(s) clash.server → %s for %s", n, v6, latest.Name)
+				}
+			}
 		}
 	}
 

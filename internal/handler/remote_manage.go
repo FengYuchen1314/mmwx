@@ -3119,8 +3119,9 @@ func (h *RemoteManageHandler) syncInboundsToNodes(ctx context.Context, serverID 
 	} else if refreshed > 0 {
 		log.Printf("[Remote Manage] Refreshed %d node(s) server address → %s for %s", refreshed, serverHost, server.Name)
 	}
-	// v6 节点单独校正到当前 IPv6 地址(RefreshNodesServerAddress 只动 v4/域名节点)
-	if v6 := strings.TrimSpace(server.IPAddressV6); v6 != "" {
+	// v6 节点单独校正(RefreshNodesServerAddress 只动 v4/域名节点)。
+	// 锁定入口 IP 时用手填地址(v6RefreshTarget),避免动态出口 IPv6 覆盖锁定值。
+	if v6 := v6RefreshTarget(server); v6 != "" {
 		if refreshed, err := h.repo.RefreshNodesServerAddressV6(ctx, server.Name, v6); err != nil {
 			log.Printf("[Remote Manage] Refresh v6 node server address failed for %s: %v", server.Name, err)
 		} else if refreshed > 0 {
@@ -3674,6 +3675,23 @@ func chooseClashServerHost(server *storage.RemoteServer) string {
 	}
 	if d := strings.TrimSpace(server.DomainV6); d != "" {
 		return d
+	}
+	return strings.TrimSpace(server.IPAddressV6)
+}
+
+// v6RefreshTarget 返回该服务器 v6 节点(ip_family='v6')的 clash server 应刷成的地址。
+// 锁定入口 IP 时:v6 节点同样只用手填的「服务器地址」(PullAddress→IPAddress),与 chooseClashServerHost
+// 的锁定分支保持一致 —— NAT 机的动态出口 IPv6 连不上,只有手填的静态入口 IP 能连。
+// 未锁定时:沿用 agent 心跳上报的动态 IPAddressV6(现状行为)。
+func v6RefreshTarget(server *storage.RemoteServer) string {
+	if server == nil {
+		return ""
+	}
+	if server.LockEntryIP {
+		if p := strings.TrimSpace(server.PullAddress); p != "" {
+			return p
+		}
+		return strings.TrimSpace(server.IPAddress)
 	}
 	return strings.TrimSpace(server.IPAddressV6)
 }
