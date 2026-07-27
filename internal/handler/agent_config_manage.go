@@ -217,7 +217,11 @@ func (h *XrayServerHandler) BuildRemoteServersList(ctx context.Context) RemoteSe
 			RemoteServer: server,
 			Inbounds:     []RemoteServerInboundInfo{},
 		}
-		if h.wsHandler != nil {
+		if server.IsFederated {
+			// 分享服务器:消费方不直连 agent(无 WS 会话,server.Token 是占位),原加密探测恒 false 会误报"不安全"。
+			// 实际消费方↔拥有方主控这一跳走 HTTPS + 令牌派生 ECDH,视为已加密。
+			extended.Encrypted = true
+		} else if h.wsHandler != nil {
 			extended.Encrypted = h.wsHandler.IsConnectionEncrypted(server.Token)
 			extended.WsConnected = h.wsHandler.IsConnected(server.Token)
 		}

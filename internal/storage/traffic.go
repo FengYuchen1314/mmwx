@@ -10287,6 +10287,26 @@ func (r *TrafficRepository) UpdateRemoteServerSameHost(ctx context.Context, toke
 	return err
 }
 
+// UpdateRemoteServerV6Info 按 serverID 更新 v6 相关网络信息(ip_address_v6 / domain / domain_v6 / ipv6_enabled)。
+// 供联邦(分享服务器)消费方把拥有方 server-info 透传的 v6 信息同步进本地行 —— 否则分享服务器无 v6、
+// 其节点无法走 IPv6。空字符串不覆盖旧值(COALESCE(NULLIF));ipv6_enabled 直接覆盖(拥有方是权威)。
+func (r *TrafficRepository) UpdateRemoteServerV6Info(ctx context.Context, serverID int64, ipv6, domain, domainV6 string, ipv6Enabled bool) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	_, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET
+		ip_address_v6 = COALESCE(NULLIF(?, ''), ip_address_v6),
+		domain = COALESCE(NULLIF(?, ''), domain),
+		domain_v6 = COALESCE(NULLIF(?, ''), domain_v6),
+		ipv6_enabled = ?,
+		updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`, ipv6, domain, domainV6, boolToInt(ipv6Enabled), serverID)
+	if err != nil {
+		return fmt.Errorf("update remote server v6 info: %w", err)
+	}
+	return nil
+}
+
 // 更新远程服务器的检测信号和状态。
 // ipAddressV6 为空时保留 db 现有值(老 agent 兼容)。
 // 返回 (ipChanged, latestServer, err):IP 漂移时 ipChanged=true + latestServer 是 UPDATE 后状态,
@@ -12180,6 +12200,42 @@ func (r *TrafficRepository) GetCertificateByDomain(ctx context.Context, domain s
 			return nil, ErrCertificateNotFound
 		}
 		return nil, fmt.Errorf("get certificate by domain: %w", err)
+	}
+
+	return &cert, nil
+}
+
+// FindDeployableCertByDomain 在「全部服务器」范围内找一张可部署(已签发、含 PEM)的证书,
+// 用于把证书下发/嵌入到某台服务器的配置里。证书是共享资源:不管当初是哪台服务器申请的,
+// 只要证书列表里有该域名的有效证书,任何服务器都能用。
+//
+// 与 GetCertificateByDomain(按 remote_server_id 精确匹配、供创建去重用)不同,这里只按 domain 匹配,
+// 排序偏好:① 优先 preferredServerID 自己申请的 → ② 其次 status=valid → ③ 再取最新(id DESC)。
+// 找不到任何含 PEM 的证书返回 ErrCertificateNotFound。
+func (r *TrafficRepository) FindDeployableCertByDomain(ctx context.Context, domain string, preferredServerID int64) (*Certificate, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+
+	row := r.db.QueryRowContext(ctx, `
+		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
+		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
+		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
+		       created_at, updated_at
+		FROM certificates
+		WHERE domain = ? AND cert_pem <> '' AND key_pem <> ''
+		ORDER BY CASE WHEN remote_server_id = ? THEN 0 ELSE 1 END,
+		         CASE WHEN status = 'valid' THEN 0 ELSE 1 END,
+		         id DESC
+		LIMIT 1
+	`, domain, preferredServerID)
+
+	cert, err := scanCertificate(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrCertificateNotFound
+		}
+		return nil, fmt.Errorf("find deployable certificate by domain: %w", err)
 	}
 
 	return &cert, nil

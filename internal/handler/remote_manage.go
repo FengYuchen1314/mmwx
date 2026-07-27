@@ -4574,7 +4574,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 
 	certName := "_." + rootDomain
 	if h.certHandler != nil {
-		if cert, certErr := h.repo.GetCertificateByDomain(ctx, rootDomain, req.ServerID); certErr == nil && cert != nil {
+		if cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, req.ServerID); certErr == nil && cert != nil {
 			certName = certDeployFilename(cert.Domain)
 		}
 	}
@@ -4635,7 +4635,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 
 	// 5. 部署证书
 	if h.certHandler != nil {
-		cert, certErr := h.repo.GetCertificateByDomain(ctx, rootDomain, req.ServerID)
+		cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, req.ServerID)
 		if certErr == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
 			payload := WSCertDeployPayload{
 				Domain:   rootDomain,
