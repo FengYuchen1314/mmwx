@@ -170,6 +170,18 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.3.8 (2026-07-28)
+- 🌈 增加cdn更新配置
+- 🌈优化mcp
+- 🛠️ fix: mieru用户名错误，添加出站502
+- 🛠️ fix: tgminiapp流量增加倍率
+- 🛠️ fix: 偶发许可证失效无法自愈
+- 🛠️ fix: 先屏蔽修改节点按钮
+- 🛠️ fix: 分享服务器与证书加载bug
+- 🛠️ fix: 小火箭订阅有效期兼容
+- 🛠️ fix: 流量offset误报
+- 🛠️ fix: 锁定节点IPv6不生效
+- 🛠️ fix: 静默模式没有包含套餐短码
 ### v0.3.7 (2026-07-26)
 - 🌈 ss默认开启tcpfastopen,hy2支持自签
 - 🌈 增加cdn更新配置
