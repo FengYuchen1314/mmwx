@@ -4009,7 +4009,9 @@ func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, st
 	// 处理现实
 	if security == "reality" {
 		proxy["tls"] = true
-		proxy["skip-cert-verify"] = true
+		// reality 靠 X25519 公钥验证、不走 CA 校验,skip-cert-verify 对 reality 是 no-op;
+		// 输出 false 避免"默认跳过证书校验"的误导(mihomo 对 reality 忽略此字段,连通性不变)。
+		proxy["skip-cert-verify"] = false
 		if realitySettings, ok := streamSettings["realitySettings"].(map[string]interface{}); ok {
 			realityOpts := map[string]interface{}{}
 			if publicKey, ok := realitySettings["publicKey"].(string); ok {
