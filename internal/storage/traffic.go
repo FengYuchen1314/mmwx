@@ -79,6 +79,8 @@ type TrafficRepository struct {
 	attrCache attributorCache
 	// emailUserCache 缓存 email → username 解析结果,见 ResolveUsernameByEmailCached。
 	emailUserCache emailUserCache
+	// heartbeatCache 节流 UpdateRemoteServerLastActivity 的 DB 写放大,见该函数注释。
+	heartbeatCache heartbeatThrottle
 }
 
 // emailUserCache 是 email → username 的解析缓存。
@@ -98,6 +100,21 @@ type emailUserCache struct {
 // 60 秒的滞后意味着这类变更最迟 1 分钟后才影响流量归属,下一轮自愈;
 // 换来的是把每轮数万次全表扫描降到接近 0。
 const emailUserCacheTTL = 60 * time.Second
+
+// heartbeatThrottle 节流 UpdateRemoteServerLastActivity 的高频 UPDATE 写放大。
+// WS 速度上报间隔 3s,但离线判定阈值 60s → 稳态下每服务器 3s 写一次 last_heartbeat 是 20 倍写放大。
+// 节流窗口内(10s)命中缓存 → 直接返回 (Connected, "", "", false, nil),连 SELECT 都省掉 → 稳态零 DB I/O。
+// 只有距上次写 ≥10s 或状态非 CONNECTED 时才真正 UPDATE。状态翻转(OFFLINE→CONNECTED)必穿透并返回真 prev,
+// 保证 traffic.go / federation_poller.go 的离线→在线 TG 通知逻辑不受影响。
+type heartbeatThrottle struct {
+	mu         sync.RWMutex
+	lastWrites map[int64]time.Time // serverID → 最后一次成功 UPDATE 的时间
+}
+
+// heartbeatThrottleWindow:10 秒内不重复写同一 server 的 last_heartbeat。
+// 离线判定阈值 60s,10s 陈旧度远小于阈值 → 命中节流时服务器不可能被 MarkOfflineRemoteServers 标为离线。
+const heartbeatThrottleWindow = 10 * time.Second
+
 
 // SubscriptionLink 表示向客户端公开的可配置订阅条目。
 type SubscriptionLink struct {
@@ -7338,7 +7355,14 @@ func (r *TrafficRepository) GetRemoteServerTrafficTotals(ctx context.Context, se
 			continue
 		}
 		aggregated, _ := r.GetServerTrafficUsed(ctx, id)
-		used += aggregated + server.TrafficUsedOffset
+		serverUsed := aggregated + server.TrafficUsedOffset
+		// 按服务器 clamp 到 0,避免负 offset 的服务器抵消其他服务器的正常用量。
+		// 反例:A 用 1GB offset -500MB → 500MB;B 用 2GB offset -3GB → -1GB;
+		// 不 clamp 直接求和 = -500MB(错误);clamp 后求和 = 500MB + 0 = 500MB(正确)。
+		if serverUsed < 0 {
+			serverUsed = 0
+		}
+		used += serverUsed
 		limit += server.TrafficLimit
 	}
 	return limit, used, nil
@@ -7354,7 +7378,11 @@ func (r *TrafficRepository) GetAllRemoteServersTrafficTotals(ctx context.Context
 	}
 	for _, s := range servers {
 		aggregated, _ := r.GetServerTrafficUsed(ctx, s.ID)
-		used += aggregated + s.TrafficUsedOffset
+		serverUsed := aggregated + s.TrafficUsedOffset
+		if serverUsed < 0 {
+			serverUsed = 0
+		}
+		used += serverUsed
 		limit += s.TrafficLimit
 	}
 	return limit, used, nil
@@ -10428,6 +10456,17 @@ func (r *TrafficRepository) UpdateRemoteServerLastActivity(ctx context.Context, 
 		return "", "", "", false, errors.New("traffic repository not initialized")
 	}
 
+	// 节流:距上次成功写入 < heartbeatThrottleWindow(10s)→ 跳过 SELECT + UPDATE。
+	// 此时 last_heartbeat 至多 10s 陈旧,远小于 60s 离线阈值 → 服务器必然仍是 CONNECTED,
+	// 直接返回 (Connected, "", "", false, nil) 恒正确:调用方的上线通知仅在 prev==OFFLINE 时触发,
+	// 而这里根本不可能处于 OFFLINE,不会漏发也不会误发。
+	r.heartbeatCache.mu.RLock()
+	last, ok := r.heartbeatCache.lastWrites[serverID]
+	r.heartbeatCache.mu.RUnlock()
+	if ok && time.Since(last) < heartbeatThrottleWindow {
+		return RemoteServerStatusConnected, "", "", false, nil
+	}
+
 	// 首先检查当前状态以记录状态更改
 	var currentStatus, serverName, ipAddress string
 	var prevOfflineNotified bool
@@ -10445,6 +10484,14 @@ func (r *TrafficRepository) UpdateRemoteServerLastActivity(ctx context.Context, 
 	if err != nil {
 		return currentStatus, serverName, ipAddress, prevOfflineNotified, fmt.Errorf("update remote server last activity: %w", err)
 	}
+
+	// 记录本次成功写入时间,供下一轮节流判定。
+	r.heartbeatCache.mu.Lock()
+	if r.heartbeatCache.lastWrites == nil {
+		r.heartbeatCache.lastWrites = make(map[int64]time.Time)
+	}
+	r.heartbeatCache.lastWrites[serverID] = time.Now()
+	r.heartbeatCache.mu.Unlock()
 
 	return currentStatus, serverName, ipAddress, prevOfflineNotified, nil
 }

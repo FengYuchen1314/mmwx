@@ -588,11 +588,11 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 	}
 
 	if len(usedExternalURLs) == 0 {
-		logger.Info("[流量] 未找到使用中的外部订阅")
+		logger.Debug("[流量] 未找到使用中的外部订阅")
 		return 0, 0
 	}
 
-	logger.Info("[流量] 找到使用中的外部订阅", "count", len(usedExternalURLs))
+	logger.Debug("[流量] 找到使用中的外部订阅", "count", len(usedExternalURLs))
 
 	// 获取所有外部订阅
 	subs, err := h.repo.ListExternalSubscriptions(ctx, username)
@@ -623,9 +623,9 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 		totalUsed += sub.Upload + sub.Download
 
 		if sub.Expire == nil {
-			logger.Info("[流量] 添加长期订阅流量", "name", sub.Name, "limit", sub.Total, "used", sub.Upload+sub.Download)
+			logger.Debug("[流量] 添加长期订阅流量", "name", sub.Name, "limit", sub.Total, "used", sub.Upload+sub.Download)
 		} else {
-			logger.Info("[流量] 添加订阅流量",
+			logger.Debug("[流量] 添加订阅流量",
 				"name", sub.Name,
 				"limit", sub.Total,
 				"used", sub.Upload+sub.Download,
@@ -633,7 +633,7 @@ func (h *TrafficSummaryHandler) fetchExternalSubscriptionTraffic(ctx context.Con
 		}
 	}
 
-	logger.Info("[流量] 外部订阅流量总计", "limit", totalLimit, "used", totalUsed)
+	logger.Debug("[流量] 外部订阅流量总计", "limit", totalLimit, "used", totalUsed)
 	return totalLimit, totalUsed
 }
 
