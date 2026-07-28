@@ -338,6 +338,7 @@ func main() {
 	// admin 路由保留兼容旧前端。
 	mux.Handle("/api/user/sync-external-subscriptions", auth.RequireToken(tokenStore, userRepo, handler.NewSyncExternalSubscriptionsHandler(repo, subscribeDir)))
 	mux.Handle("/api/user/sync-external-subscription", auth.RequireToken(tokenStore, userRepo, handler.NewSyncSingleExternalSubscriptionHandler(repo, subscribeDir)))
+	mux.Handle("/api/user/sync-external-subscriptions/confirm", auth.RequireToken(tokenStore, userRepo, handler.NewConfirmExternalSyncHandler(repo)))
 	mux.Handle("/api/admin/rules/latest", auth.RequireAdmin(tokenStore, userRepo, handler.NewRuleMetadataHandler(subscribeDir, repo)))
 	mux.Handle("/api/admin/custom-rules", auth.RequireToken(tokenStore, userRepo, handler.NewCustomRulesHandler(repo)))
 	mux.Handle("/api/admin/custom-rules/", auth.RequireToken(tokenStore, userRepo, handler.NewCustomRuleHandler(repo)))
