@@ -703,12 +703,39 @@ func (h *TemplateV3Handler) handleAnalyzeSubscription(w http.ResponseWriter, r *
 
 	// Generate V3 template
 	templateContent := substore.GenerateV3TemplateFromAnalysis(result)
+	templateContent, err = appendRuleProvidersToTemplate(templateContent, result.RuleProviders)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "生成模板失败: "+err.Error())
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"analysis":         result,
 		"template_content": templateContent,
 	})
+}
+
+// appendRuleProvidersToTemplate 补齐订阅分析器已识别、但模板生成器未输出的 rule-providers。
+// rules 中的 RULE-SET 依赖这些顶层定义，必须保留 provider 的全部原始字段。
+func appendRuleProvidersToTemplate(templateContent string, providers map[string]any) (string, error) {
+	if len(providers) == 0 {
+		return templateContent, nil
+	}
+
+	var generated map[string]any
+	if err := yaml.Unmarshal([]byte(templateContent), &generated); err != nil {
+		return "", fmt.Errorf("parse generated template: %w", err)
+	}
+	if _, exists := generated["rule-providers"]; exists {
+		return templateContent, nil
+	}
+
+	providerYAML, err := yaml.Marshal(map[string]any{"rule-providers": providers})
+	if err != nil {
+		return "", fmt.Errorf("marshal rule-providers: %w", err)
+	}
+	return strings.TrimRight(templateContent, "\n") + "\n\n" + string(providerYAML), nil
 }
 
 // handleGetRegionFilters returns the available region filters
