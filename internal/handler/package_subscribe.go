@@ -33,6 +33,9 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusMethodNotAllowed, errors.New("only GET is supported"))
 		return
 	}
+	if rejectBlockedSubscriptionUA(w, r) {
+		return
+	}
 
 	username := auth.UsernameFromContext(r.Context())
 	if username == "" {

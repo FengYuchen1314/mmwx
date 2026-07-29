@@ -206,6 +206,9 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusMethodNotAllowed, errors.New("only GET is supported"))
 		return
 	}
+	if rejectBlockedSubscriptionUA(w, r) {
+		return
+	}
 
 	// 检查是否是token失效场景
 	if tokenInvalid, ok := r.Context().Value(TokenInvalidKey).(bool); ok && tokenInvalid {

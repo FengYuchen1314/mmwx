@@ -34,6 +34,8 @@ type securitySettingsResponse struct {
 	SubRateEnabled          bool `json:"sub_rate_enabled"`
 	SubRateLimit            int  `json:"sub_rate_limit"`
 	SubRateWindowMinutes    int  `json:"sub_rate_window_minutes"`
+	// 开启后只允许能识别的代理客户端 UA 获取订阅，阻止浏览器、聊天软件预览和未知爬虫。
+	BlockUnknownSubUA bool `json:"block_unknown_subscription_ua"`
 	// SkipLocalIP 命中本地/私有/loopback IP 时,跳过封禁与频率限制,
 	// 防反代/docker 未传 XFF 时一次封禁打死所有真实用户。
 	SkipLocalIP bool `json:"skip_local_ip"`
@@ -56,6 +58,7 @@ var securityDefaults = securitySettingsResponse{
 	SubRateEnabled:          true,
 	SubRateLimit:            60,
 	SubRateWindowMinutes:    1,
+	BlockUnknownSubUA:       false,
 	SkipLocalIP:             true,
 	TurnstileSiteKey:        "",
 	TurnstileSecretKey:      "",
@@ -112,6 +115,7 @@ func (h *SecuritySettingsHandler) handlePut(w http.ResponseWriter, r *http.Reque
 	if srl := GetSubscriptionRateLimiter(); srl != nil {
 		srl.UpdateConfig(payload.SubRateEnabled, payload.SubRateLimit, payload.SubRateWindowMinutes)
 	}
+	SetBlockUnknownSubscriptionUA(payload.BlockUnknownSubUA)
 	// skip_local_ip 单独走 Set 接口,避免 3 个 UpdateConfig 签名扩散
 	if rl := GetLoginRateLimiter(); rl != nil {
 		rl.SetSkipLocalIP(payload.SkipLocalIP)
@@ -174,6 +178,7 @@ func LoadSecuritySettings(ctx context.Context, repo *storage.TrafficRepository) 
 	resp.SubRateEnabled = readBoolSetting(ctx, repo, "sub_rate_enabled", resp.SubRateEnabled)
 	resp.SubRateLimit = readIntSetting(ctx, repo, "sub_rate_limit", resp.SubRateLimit)
 	resp.SubRateWindowMinutes = readIntSetting(ctx, repo, "sub_rate_window_minutes", resp.SubRateWindowMinutes)
+	resp.BlockUnknownSubUA = readBoolSetting(ctx, repo, "block_unknown_subscription_ua", resp.BlockUnknownSubUA)
 	resp.SkipLocalIP = readBoolSetting(ctx, repo, "skip_local_ip", resp.SkipLocalIP)
 	resp.TurnstileSiteKey = readStringSetting(ctx, repo, "turnstile_site_key", "")
 	// secret_key 输出 mask,不直接吐明文给前端(虽然是 admin auth,但避免 devtools/日志泄露)
@@ -207,18 +212,19 @@ func isMaskedSecret(s string) bool {
 
 func writeSecurityKVs(ctx context.Context, repo *storage.TrafficRepository, p *securitySettingsResponse) error {
 	pairs := map[string]string{
-		"login_rate_max_attempts":    strconv.Itoa(p.LoginRateMaxAttempts),
-		"login_rate_window_minutes":  strconv.Itoa(p.LoginRateWindowMinutes),
-		"login_rate_lock_minutes":    strconv.Itoa(p.LoginRateLockMinutes),
-		"brute_force_enabled":        strconv.FormatBool(p.BruteForceEnabled),
-		"brute_force_max_failures":   strconv.Itoa(p.BruteForceMaxFailures),
-		"brute_force_window_minutes": strconv.Itoa(p.BruteForceWindowMinutes),
-		"brute_force_block_minutes":  strconv.Itoa(p.BruteForceBlockMinutes),
-		"sub_rate_enabled":           strconv.FormatBool(p.SubRateEnabled),
-		"sub_rate_limit":             strconv.Itoa(p.SubRateLimit),
-		"sub_rate_window_minutes":    strconv.Itoa(p.SubRateWindowMinutes),
-		"skip_local_ip":              strconv.FormatBool(p.SkipLocalIP),
-		"turnstile_site_key":         strings.TrimSpace(p.TurnstileSiteKey),
+		"login_rate_max_attempts":       strconv.Itoa(p.LoginRateMaxAttempts),
+		"login_rate_window_minutes":     strconv.Itoa(p.LoginRateWindowMinutes),
+		"login_rate_lock_minutes":       strconv.Itoa(p.LoginRateLockMinutes),
+		"brute_force_enabled":           strconv.FormatBool(p.BruteForceEnabled),
+		"brute_force_max_failures":      strconv.Itoa(p.BruteForceMaxFailures),
+		"brute_force_window_minutes":    strconv.Itoa(p.BruteForceWindowMinutes),
+		"brute_force_block_minutes":     strconv.Itoa(p.BruteForceBlockMinutes),
+		"sub_rate_enabled":              strconv.FormatBool(p.SubRateEnabled),
+		"sub_rate_limit":                strconv.Itoa(p.SubRateLimit),
+		"sub_rate_window_minutes":       strconv.Itoa(p.SubRateWindowMinutes),
+		"block_unknown_subscription_ua": strconv.FormatBool(p.BlockUnknownSubUA),
+		"skip_local_ip":                 strconv.FormatBool(p.SkipLocalIP),
+		"turnstile_site_key":            strings.TrimSpace(p.TurnstileSiteKey),
 	}
 	for k, v := range pairs {
 		if err := repo.SetSystemSetting(ctx, k, v); err != nil {

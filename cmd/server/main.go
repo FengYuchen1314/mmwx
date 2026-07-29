@@ -279,6 +279,7 @@ func main() {
 	// 从 system_settings 读 3 个安全限流器的自定义阈值(KV 缺失 → fallback hardcoded 默认值)。
 	// 同一份配置后面给 brute_force + subscription_rate 构造时复用。
 	secCfg := handler.LoadSecuritySettings(context.Background(), repo)
+	handler.SetBlockUnknownSubscriptionUA(secCfg.BlockUnknownSubUA)
 	loginRateLimiter := handler.NewLoginRateLimiterWithConfig(
 		secCfg.LoginRateMaxAttempts, secCfg.LoginRateWindowMinutes, secCfg.LoginRateLockMinutes,
 	)
