@@ -209,6 +209,11 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleSetRelay(w, r, strings.TrimSuffix(path, "/relay"))
+	case strings.HasSuffix(path, "/relay-copy") && r.Method == http.MethodPost:
+		if denyNonAdmin() {
+			return
+		}
+		h.handleCopyWithRelay(w, r, strings.TrimSuffix(path, "/relay-copy"))
 	case strings.HasSuffix(path, "/relay") && r.Method == http.MethodDelete:
 		if denyNonAdmin() {
 			return
@@ -1065,6 +1070,105 @@ func applyRelayToNode(n *storage.Node, relayServer string, relayPort int) {
 	}
 	n.ClashConfig = setClashConfigServerPort(n.ClashConfig, relayServer, relayPort)
 	n.ParsedConfig = setClashConfigServerPort(n.ParsedConfig, relayServer, relayPort)
+}
+
+func setNodeConfigName(cfgJSON, name string) string {
+	var m map[string]any
+	if json.Unmarshal([]byte(cfgJSON), &m) != nil {
+		return cfgJSON
+	}
+	m["name"] = name
+	b, err := json.Marshal(m)
+	if err != nil {
+		return cfgJSON
+	}
+	return string(b)
+}
+
+// handleCopyWithRelay 复制已有节点并给副本挂中转。原节点保持不变。
+// POST /api/admin/nodes/{id}/relay-copy {relay_server, relay_port, name_suffix}
+func (h *nodesHandler) handleCopyWithRelay(w http.ResponseWriter, r *http.Request, idSegment string) {
+	username := auth.UsernameFromContext(r.Context())
+	if username == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("用户未认证"))
+		return
+	}
+	id, err := strconv.ParseInt(idSegment, 10, 64)
+	if err != nil || id <= 0 {
+		writeBadRequest(w, "无效的节点标识")
+		return
+	}
+	source, err := h.fetchNodeForAccess(r.Context(), id, username, userIsAdmin(r.Context(), h.repo, username))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, storage.ErrNodeNotFound) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err)
+		return
+	}
+	var req struct {
+		RelayServer string `json:"relay_server"`
+		RelayPort   int    `json:"relay_port"`
+		NameSuffix  string `json:"name_suffix"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBadRequest(w, "请求格式不正确")
+		return
+	}
+	req.RelayServer = strings.TrimSpace(req.RelayServer)
+	req.NameSuffix = strings.Trim(strings.TrimSpace(req.NameSuffix), "- ")
+	if req.RelayServer == "" {
+		writeBadRequest(w, "中转服务器地址不能为空")
+		return
+	}
+	if req.RelayPort < 0 || req.RelayPort > 65535 {
+		writeBadRequest(w, "中转端口不合法")
+		return
+	}
+	if req.NameSuffix == "" {
+		req.NameSuffix = "tunnel"
+	}
+
+	copyNode := source
+	if strings.TrimSpace(copyNode.RelayOrigServer) != "" {
+		cancelRelayOnNode(&copyNode)
+	}
+	copyNode.ID = 0
+	copyNode.RawURL = "" // 隧道副本不再由外部订阅同步覆盖。
+	copyNode.OriginalServer = ""
+	copyNode.InboundTag = ""
+	copyNode.ChainProxyNodeID = nil
+	copyNode.RelayGroupName = ""
+	copyNode.RelayGroupNodeIDs = nil
+	copyNode.NodeType = "physical"
+	copyNode.ParentNodeID = nil
+	copyNode.RoutedOutboundTag = ""
+	copyNode.RoutedOwner = "shared"
+
+	baseName := strings.TrimSpace(source.NodeName) + "-" + req.NameSuffix
+	copyNode.NodeName = baseName
+	for suffix := 2; ; suffix++ {
+		exists, checkErr := h.repo.CheckNodeNameExists(r.Context(), copyNode.NodeName, source.Username, 0)
+		if checkErr != nil {
+			writeError(w, http.StatusInternalServerError, checkErr)
+			return
+		}
+		if !exists {
+			break
+		}
+		copyNode.NodeName = fmt.Sprintf("%s-%d", baseName, suffix)
+	}
+	copyNode.ClashConfig = setNodeConfigName(copyNode.ClashConfig, copyNode.NodeName)
+	copyNode.ParsedConfig = setNodeConfigName(copyNode.ParsedConfig, copyNode.NodeName)
+	applyRelayToNode(&copyNode, req.RelayServer, req.RelayPort)
+
+	created, err := h.repo.CreateNode(r.Context(), copyNode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	respondJSON(w, http.StatusCreated, map[string]any{"node": convertNode(created)})
 }
 
 // cancelRelayOnNode 取消中转:把 clash + parsed 的 server/port 还原为 relay_orig_*,再清空这两列。
