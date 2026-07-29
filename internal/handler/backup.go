@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,17 +16,7 @@ import (
 	"miaomiaowux/internal/storage"
 )
 
-// backupPassphraseFromRequest 从请求头或表单取备份口令。下载用 header(不进访问日志),
-// 恢复用 multipart 表单字段(与上传文件同一请求)。
-func backupPassphraseFromRequest(r *http.Request) string {
-	if p := r.Header.Get("X-Backup-Passphrase"); p != "" {
-		return p
-	}
-	return r.FormValue("passphrase")
-}
-
-// NewBackupDownloadHandler 返回一个创建并下载【加密】备份的处理程序。
-// 备份用管理员现场输入的口令(X-Backup-Passphrase 头)整包加密,口令不落盘。
+// NewBackupDownloadHandler 返回一个创建并下载 ZIP 备份的处理程序。
 // 该处理程序需要管理员身份验证。
 func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
@@ -37,12 +26,6 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodPost {
 			writeBackupError(w, http.StatusMethodNotAllowed, errors.New("only GET or POST is supported"))
-			return
-		}
-
-		passphrase := backupPassphraseFromRequest(r)
-		if len(passphrase) < backupMinPassphraseLen {
-			writeBackupError(w, http.StatusBadRequest, fmt.Errorf("需要备份口令(至少 %d 位);备份含敏感凭据,必须加密下载", backupMinPassphraseLen))
 			return
 		}
 
@@ -69,20 +52,15 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
-		filename := fmt.Sprintf("miaomiaowux-backup-%s.zip.enc", time.Now().Format("20060102-150405"))
-		w.Header().Set("Content-Type", "application/octet-stream")
+		filename := fmt.Sprintf("miaomiaowux-backup-%s.zip", time.Now().Format("20060102-150405"))
+		w.Header().Set("Content-Type", "application/zip")
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
-
-		if err := encryptBackup(w, zipBuf.Bytes(), passphrase); err != nil {
-			// 此时响应头已发出,无法再回 JSON 错误,只能记录。
-			log.Printf("[Backup] 加密输出失败: %v", err)
-			return
-		}
+		_, _ = w.Write(zipBuf.Bytes())
 	})
 }
 
 // NewBackupRestoreHandler 返回一个从备份恢复的处理程序。
-// 加密备份需在 multipart 表单里带 passphrase 字段;旧的明文 zip 备份仍可直接恢复(向后兼容)。
+// 备份以普通 ZIP 格式上传，不需要密码。
 // 该处理程序需要管理员身份验证。
 func NewBackupRestoreHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
@@ -162,18 +140,10 @@ func restoreFromRequest(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	if isEncryptedBackup(data) {
-		passphrase := backupPassphraseFromRequest(r)
-		if passphrase == "" {
-			writeBackupError(w, http.StatusBadRequest, errors.New("该备份已加密，需要提供备份口令"))
-			return errors.New("passphrase required")
-		}
-		plain, derr := decryptBackup(data, passphrase)
-		if derr != nil {
-			writeBackupError(w, http.StatusBadRequest, derr)
-			return derr
-		}
-		data = plain
+	if bytes.HasPrefix(data, []byte("MMWXBKP1")) {
+		err := errors.New("当前版本不再支持密码备份，请上传普通 ZIP 备份")
+		writeBackupError(w, http.StatusBadRequest, err)
+		return err
 	}
 
 	if err := extractBackupFromBytes(data); err != nil {
