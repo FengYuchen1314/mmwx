@@ -140,10 +140,19 @@ func restoreFromRequest(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 
-	if bytes.HasPrefix(data, []byte("MMWXBKP1")) {
-		err := errors.New("当前版本不再支持密码备份，请上传普通 ZIP 备份")
-		writeBackupError(w, http.StatusBadRequest, err)
-		return err
+	if isLegacyEncryptedBackup(data) {
+		passphrase := r.FormValue("passphrase")
+		if passphrase == "" {
+			err := errors.New("这是旧版加密备份，请填写原备份密码")
+			writeBackupError(w, http.StatusBadRequest, err)
+			return err
+		}
+		plain, decryptErr := decryptLegacyBackup(data, passphrase)
+		if decryptErr != nil {
+			writeBackupError(w, http.StatusBadRequest, decryptErr)
+			return decryptErr
+		}
+		data = plain
 	}
 
 	if err := extractBackupFromBytes(data); err != nil {
