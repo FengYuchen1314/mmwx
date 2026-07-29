@@ -38,25 +38,6 @@ proxy-groups:
     url: https://cp.cloudflare.com/generate_204
     interval: 300
     tolerance: 50
-  - name: 🌠 中转节点
-    type: select
-    include-all: true
-    include-all-proxies: true
-    include-all-providers: true
-    filter: 中转|CO|co
-    proxies:
-      - __PROXY_PROVIDERS__
-      - __PROXY_NODES__
-  - name: 🌄 落地节点
-    type: select
-    include-all: true
-    include-all-proxies: true
-    include-all-providers: true
-    filter: LD|落地|Bage|bage|jinx|ctc|Jinx|JINX|CTC|Luodi|luodi|LUODI|zouter|legend|Alice|alice
-    proxies:
-      - __PROXY_PROVIDERS__
-      - __PROXY_NODES__
-    dialer-proxy-group: 🌠 中转节点
   - name: 🚀 GitHub
     type: select
     include-all: true
