@@ -530,13 +530,14 @@ type SubscribeFile struct {
 	FileShortCode             string // 用于短链接的 3 字符代码（自动生成）
 	CustomShortCode           string // 用户自定义短码（唯一，优先）
 	AutoSyncCustomRules       bool
-	TemplateFilename          string   // 绑定的 V3 模板文件名
-	SelectedTags              []string // 选中的节点标签（DB 中 JSON 数组）— legacy,与 SelectedNodeIDs 二选一
-	SelectedNodeIDs           []int64  // 选中的节点 ID（DB 中 JSON 数组）— 优先于 SelectedTags;空 → 回退 tag 过滤
-	SelectedCustomRuleIDs     []int64  // 该订阅生效的覆写规则 ID（空=全部启用的生效）
-	SelectedOverrideScriptIDs []int64  // 该订阅生效的覆写脚本 ID（空=全部启用的生效）
-	StatsServerIDs            string   // 流量统计服务器 ID（逗号分隔 remote_servers.id）
-	TrafficLimit              *float64 // 手动流量上限(GB)，nil=跟随服务器
+	TemplateFilename          string     // 绑定的 V3 模板文件名
+	SelectedTags              []string   // 选中的节点标签（DB 中 JSON 数组）— legacy,与 SelectedNodeIDs 二选一
+	SelectedNodeIDs           []int64    // 选中的节点 ID（DB 中 JSON 数组）— 优先于 SelectedTags;空 → 回退 tag 过滤
+	SelectedCustomRuleIDs     []int64    // 该订阅生效的覆写规则 ID（空=全部启用的生效）
+	SelectedOverrideScriptIDs []int64    // 该订阅生效的覆写脚本 ID（空=全部启用的生效）
+	StatsServerIDs            string     // 流量统计服务器 ID（逗号分隔 remote_servers.id）
+	TrafficLimit              *float64   // 手动流量上限(GB)，nil=跟随服务器
+	ExpireAt                  *time.Time // 订阅自身到期时间；nil 表示未单独限制
 	SortOrder                 int
 	RawOutput                 bool
 	CreatedBy                 string // 创建者用户名
@@ -6019,9 +6020,13 @@ func (r *TrafficRepository) DeleteExternalSubscription(ctx context.Context, id i
 		return errors.New("username is required")
 	}
 
-	// 先删除关联的代理集合配置
-	const deleteProvidersStmt = `DELETE FROM proxy_provider_configs WHERE external_subscription_id = ?`
-	if _, err := r.db.ExecContext(ctx, deleteProvidersStmt, id); err != nil {
+	// 关联配置删除也必须带 owner 约束；否则普通用户猜到他人的订阅 ID 后，虽然
+	// 最终删除订阅会返回 404，却能提前删掉对方的 proxy-provider 配置。
+	const deleteProvidersStmt = `DELETE FROM proxy_provider_configs
+		WHERE external_subscription_id IN (
+			SELECT id FROM external_subscriptions WHERE id = ? AND username = ?
+		)`
+	if _, err := r.db.ExecContext(ctx, deleteProvidersStmt, id, username); err != nil {
 		return fmt.Errorf("delete related proxy provider configs: %w", err)
 	}
 

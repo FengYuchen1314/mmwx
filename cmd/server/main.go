@@ -393,6 +393,7 @@ func main() {
 	mux.Handle("/api/user/api-tokens", auth.RequireToken(tokenStore, userRepo, handler.NewUserAPITokensHandler(repo)))
 	mux.Handle("/api/user/api-tokens/", auth.RequireToken(tokenStore, userRepo, handler.NewUserAPITokensHandler(repo)))
 	mux.Handle("/api/user/external-subscriptions", auth.RequireToken(tokenStore, userRepo, handler.NewExternalSubscriptionsHandler(repo)))
+	mux.Handle("/api/user/external-subscriptions/delete", auth.RequireToken(tokenStore, userRepo, handler.NewDeleteExternalSubscriptionHandler(repo)))
 	mux.Handle("/api/user/external-subscriptions/nodes", auth.RequireToken(tokenStore, userRepo, handler.NewExternalSubscriptionNodesHandler(repo)))
 	mux.Handle("/api/user/external-subscriptions/check-filter", auth.RequireToken(tokenStore, userRepo, handler.NewExternalSubscriptionCheckFilterHandler(repo)))
 	// Debug日志相关endpoint

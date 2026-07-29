@@ -66,6 +66,26 @@ func NewExternalSubscriptionsHandler(repo *storage.TrafficRepository) http.Handl
 	})
 }
 
+// NewDeleteExternalSubscriptionHandler 提供 POST 删除入口。部分反向代理/WAF 会拦截
+// DELETE 方法并直接返回 404；该入口复用原有所有权校验，普通用户仍只能删除自己的订阅。
+func NewDeleteExternalSubscriptionHandler(repo *storage.TrafficRepository) http.Handler {
+	if repo == nil {
+		panic("delete external subscription handler requires repository")
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
+			return
+		}
+		username := auth.UsernameFromContext(r.Context())
+		if strings.TrimSpace(username) == "" {
+			writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
+			return
+		}
+		handleDeleteExternalSubscription(w, r, repo, username, userIsAdmin(r.Context(), repo, username))
+	})
+}
+
 // fetchExternalSubForAccess 管理员按 ID 取任意订阅,普通用户按 (id, 自己) 取。
 func fetchExternalSubForAccess(r *http.Request, repo *storage.TrafficRepository, id int64, username string, isAdmin bool) (storage.ExternalSubscription, error) {
 	if isAdmin {

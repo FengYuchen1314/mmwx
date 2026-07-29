@@ -38,6 +38,7 @@ func subscribeFileSelectClause(alias string) string {
 		"COALESCE(" + pfx + "selected_override_script_ids, '[]')",
 		"COALESCE(" + pfx + "stats_server_ids, '')",
 		pfx + "traffic_limit",
+		pfx + "expire_at",
 		"COALESCE(" + pfx + "sort_order, 0)",
 		"COALESCE(" + pfx + "raw_output, 0)",
 		"COALESCE(" + pfx + "created_by, '')",
@@ -66,13 +67,14 @@ func scanSubscribeFile(scanner interface{ Scan(dest ...any) error }) (SubscribeF
 	var autoSync, rawOutput int
 	var tagsJSON, nodeIDsJSON, customRuleIDsJSON, overrideScriptIDsJSON string
 	var trafficLimit sql.NullFloat64
+	var expireAt sql.NullTime
 	if err := scanner.Scan(
 		&file.ID, &file.Name, &file.Description, &file.URL, &file.Type, &file.Filename,
 		&file.FileShortCode, &file.CustomShortCode,
 		&autoSync,
 		&file.TemplateFilename, &tagsJSON, &nodeIDsJSON,
 		&customRuleIDsJSON, &overrideScriptIDsJSON,
-		&file.StatsServerIDs, &trafficLimit,
+		&file.StatsServerIDs, &trafficLimit, &expireAt,
 		&file.SortOrder, &rawOutput, &file.CreatedBy,
 		&file.CreatedAt, &file.UpdatedAt,
 	); err != nil {
@@ -82,6 +84,9 @@ func scanSubscribeFile(scanner interface{ Scan(dest ...any) error }) (SubscribeF
 	file.RawOutput = rawOutput != 0
 	if trafficLimit.Valid {
 		file.TrafficLimit = &trafficLimit.Float64
+	}
+	if expireAt.Valid {
+		file.ExpireAt = &expireAt.Time
 	}
 	if tagsJSON != "" && tagsJSON != "[]" {
 		_ = json.Unmarshal([]byte(tagsJSON), &file.SelectedTags)
@@ -422,4 +427,3 @@ func (r *TrafficRepository) GetUserPackageSubscription(ctx context.Context, user
 	}
 	return file, nil
 }
-

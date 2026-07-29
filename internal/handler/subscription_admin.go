@@ -415,6 +415,7 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 						Type:          "package",
 						Filename:      "__package__",
 						FileShortCode: pkg.ShortCode,
+						ExpireAt:      user.PackageEndDate,
 						UpdatedAt:     pkg.UpdatedAt,
 					}}
 				}
@@ -430,6 +431,17 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 					if f.CreatedBy == username && !seen[f.ID] {
 						files = append(files, f)
 						seen[f.ID] = true
+					}
+				}
+			}
+
+			// 普通用户实际可用期限同时受订阅自身和套餐期限约束。页面展示两者中
+			// 更早的一项，避免套餐有期限时因订阅文件未单独设置 expire_at 而显示“永久”。
+			if user.PackageEndDate != nil {
+				for i := range files {
+					if files[i].ExpireAt == nil || user.PackageEndDate.Before(*files[i].ExpireAt) {
+						expireAt := *user.PackageEndDate
+						files[i].ExpireAt = &expireAt
 					}
 				}
 			}
@@ -457,15 +469,16 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 		_ = user // role 字段不再用于此处的短码逻辑(保留 user 变量供其他地方使用)
 
 		type item struct {
-			ID              int64     `json:"id"`
-			Name            string    `json:"name"`
-			Description     string    `json:"description"`
-			Filename        string    `json:"filename"`
-			Type            string    `json:"type"`
-			FileShortCode   string    `json:"file_short_code,omitempty"`
-			CustomShortCode string    `json:"custom_short_code,omitempty"`
-			UpdatedAt       time.Time `json:"updated_at"`
-			LatestVersion   int64     `json:"latest_version,omitempty"`
+			ID              int64      `json:"id"`
+			Name            string     `json:"name"`
+			Description     string     `json:"description"`
+			Filename        string     `json:"filename"`
+			Type            string     `json:"type"`
+			FileShortCode   string     `json:"file_short_code,omitempty"`
+			CustomShortCode string     `json:"custom_short_code,omitempty"`
+			ExpireAt        *time.Time `json:"expire_at"`
+			UpdatedAt       time.Time  `json:"updated_at"`
+			LatestVersion   int64      `json:"latest_version,omitempty"`
 		}
 
 		payload := make([]item, 0, len(files))
@@ -490,6 +503,7 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 				Type:            file.Type,
 				FileShortCode:   fileShortCode,
 				CustomShortCode: customShortCode,
+				ExpireAt:        file.ExpireAt,
 				UpdatedAt:       file.UpdatedAt,
 				LatestVersion:   latestVersion,
 			})
