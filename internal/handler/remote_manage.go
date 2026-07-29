@@ -2006,6 +2006,8 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 
 	var body []byte
 	var inboundReq map[string]interface{}
+	var selectedWSSDomain string
+	var selectedWSSCertID int64
 	if r.Method == http.MethodPost {
 		body, err = io.ReadAll(r.Body)
 		if err != nil {
@@ -2095,6 +2097,20 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	// 避免「agent 上没有该证书 → xray 加载失败 → 502」。失败明确报错(已透传,不被 CF 吞)。
 	if r.Method == http.MethodPost && inboundReq != nil {
 		if action, _ := inboundReq["action"].(string); action == "" || strings.ToLower(action) == "add" {
+			// WSS 的 cert_id 是带外字段，resolveInboundCert 会在转发前删除它。
+			// 提前保留用户在专家模式选的证书和 SNI，供 nginx 同步精确使用。
+			if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok && isVlessWSInboundReq(inboundReq) {
+				if certID, ok := inbound["cert_id"].(float64); ok {
+					selectedWSSCertID = int64(certID)
+				}
+				if ss, _ := inbound["streamSettings"].(map[string]interface{}); ss != nil {
+					if tls, _ := ss["tlsSettings"].(map[string]interface{}); tls != nil {
+						if domain, _ := tls["serverName"].(string); strings.TrimSpace(domain) != "" {
+							selectedWSSDomain = strings.TrimSpace(domain)
+						}
+					}
+				}
+			}
 			if newBody, certErr := h.resolveInboundCert(r.Context(), id, inboundReq); certErr != nil {
 				remoteWriteError(w, http.StatusBadGateway, "证书处理失败: "+certErr.Error())
 				return
@@ -2207,11 +2223,40 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		if err := json.Unmarshal(result, &resp); err == nil {
 			if success, ok := resp["success"].(bool); ok && success {
 				if actionLower == "" || actionLower == "add" {
+					// WSS 必须把证书 + nginx 配置下发作为创建事务的一部分。
+					// 旧逻辑放到 goroutine 后立即返回成功，导致下发失败只写日志，界面却创建出不通的节点。
+					if isVlessWSInboundReq(inboundReq) {
+						if syncErr := h.syncWSSNginx(r.Context(), id, selectedWSSDomain, selectedWSSCertID); syncErr != nil {
+							// 回滚刚创建的入站，避免用户重试时产生重复 tag / 残留节点。
+							if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
+								if tag, _ := inbound["tag"].(string); tag != "" {
+									rollbackBody, _ := json.Marshal(map[string]interface{}{
+										"action": "remove",
+										"tag":    tag,
+									})
+									if _, rollbackErr := h.forwardToRemoteServer(context.Background(), id, http.MethodPost, "/api/child/inbounds", rollbackBody); rollbackErr != nil {
+										log.Printf("[WSS-Nginx] rollback inbound server=%d tag=%s failed: %v", id, tag, rollbackErr)
+									}
+								}
+							}
+							remoteWriteError(w, http.StatusBadGateway, "WSS Nginx 配置下发失败，已回滚入站: "+syncErr.Error())
+							return
+						}
+					}
+
 					// 添加入站：先处理 reality 相关配置（更新 tunnel-in port + 清理域名路由）
 					if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok {
 						tag, _ := inbound["tag"].(string)
 						protocol, _ := inbound["protocol"].(string)
 						port, _ := inbound["port"].(float64)
+						// WSS 对外由 Nginx 443 接入，inbound.port 只是本机 proxy_pass 目标。
+						// 把实际 SNI 留给节点转换，并统一事件的客户端端口为 443。
+						if isVlessWSInboundReq(inboundReq) {
+							port = 443
+							if selectedWSSDomain != "" {
+								inbound["wss_domain"] = selectedWSSDomain
+							}
+						}
 						customNodeName, _ := inboundReq["node_name"].(string)
 						forwardNodeID, _ := inboundReq["forward_node_id"].(float64) // tunnel「转发已有节点」时携带源节点 ID
 						// ip_version: ""/v4(默认) | v6 | both —— 决定生成节点 clash server 用 v4/v6/双节点
@@ -2248,14 +2293,6 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 							RelayPort:     relayPort,
 							Insecure:      inboundInsecure,
 						})
-					}
-					// VLESS+WS 入站添加成功 → 异步聚合渲染该 server 全部 WSS location 下发 nginx
-					if isVlessWSInboundReq(inboundReq) {
-						go func() {
-							if err := h.SyncWSSNginx(context.Background(), id); err != nil {
-								log.Printf("[WSS-Nginx] sync after add server=%d failed: %v", id, err)
-							}
-						}()
 					}
 				} else if actionLower == "remove" {
 					// 删除入站：发布事件
@@ -4209,9 +4246,10 @@ func (h *RemoteManageHandler) InboundToClashProxyByServerID(serverID int64, inbo
 //
 // 否则不修改 inboundMap,返回 (0, "")。调用方据此判断是否覆盖默认 tunnelPort/serverHost。
 //
-// 设计上 server.Domain 必须有 — 没域名 nginx + TLS 链路根本起不来,所以 WSS 入站本来就要求 domain 存在。
+// 域名优先取创建时已解析的 wss_domain，其次取 tlsSettings.serverName，最后才回退 server.Domain。
+// 这样服务器只配 DDNS 域名或专家模式手动选 SNI 时，节点仍使用正确的对外地址。
 func applyWSSClientRewrite(inboundMap map[string]interface{}, server *storage.RemoteServer) (port int, host string) {
-	if server == nil || server.Domain == "" {
+	if server == nil {
 		return 0, ""
 	}
 	if proto, _ := inboundMap["protocol"].(string); !strings.EqualFold(proto, "vless") {
@@ -4227,6 +4265,20 @@ func applyWSSClientRewrite(inboundMap map[string]interface{}, server *storage.Re
 	if network != "ws" || !(security == "" || security == "none") || !(listen == "127.0.0.1" || listen == "localhost") {
 		return 0, ""
 	}
+	domain, _ := inboundMap["wss_domain"].(string)
+	domain = normalizeWSSDomain(domain)
+	if domain == "" {
+		if tls, _ := ss["tlsSettings"].(map[string]interface{}); tls != nil {
+			domain, _ = tls["serverName"].(string)
+			domain = normalizeWSSDomain(domain)
+		}
+	}
+	if domain == "" {
+		domain = normalizeWSSDomain(server.Domain)
+	}
+	if domain == "" {
+		return 0, ""
+	}
 
 	// 不污染外面持有的 streamSettings,做浅拷贝
 	ssCopy := make(map[string]interface{}, len(ss)+1)
@@ -4234,7 +4286,7 @@ func applyWSSClientRewrite(inboundMap map[string]interface{}, server *storage.Re
 		ssCopy[k] = v
 	}
 	ssCopy["security"] = "tls"
-	ssCopy["tlsSettings"] = map[string]interface{}{"serverName": server.Domain}
+	ssCopy["tlsSettings"] = map[string]interface{}{"serverName": domain}
 
 	ws, _ := ssCopy["wsSettings"].(map[string]interface{})
 	wsCopy := make(map[string]interface{}, len(ws)+1)
@@ -4246,12 +4298,13 @@ func applyWSSClientRewrite(inboundMap map[string]interface{}, server *storage.Re
 		headers = map[string]interface{}{}
 	}
 	if _, ok := headers["Host"]; !ok {
-		headers["Host"] = server.Domain
+		headers["Host"] = domain
 	}
 	wsCopy["headers"] = headers
 	ssCopy["wsSettings"] = wsCopy
 	inboundMap["streamSettings"] = ssCopy
-	return 443, server.Domain
+	delete(inboundMap, "wss_domain")
+	return 443, domain
 }
 
 // 重置服务器令牌（代理用于推送到服务器）

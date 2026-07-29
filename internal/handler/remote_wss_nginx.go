@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	texttemplate "text/template"
 
+	"miaomiaowux/internal/storage"
 	"miaomiaowux/templates"
 )
 
@@ -155,32 +158,69 @@ type wssInboundInfo struct {
 //
 // 大写导出:nodes.go 的 deleteRemoteInbound 也要调,删节点路径不走 HandleInbounds remove。
 func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) error {
+	return h.syncWSSNginx(ctx, serverID, "", 0)
+}
+
+// syncWSSNginx 在创建时优先使用用户选择的 SNI/证书；其他同步场景则从服务器地址自动探测。
+func (h *RemoteManageHandler) syncWSSNginx(ctx context.Context, serverID int64, selectedDomain string, selectedCertID int64) error {
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
 	if err != nil {
 		return fmt.Errorf("server not found: %v", err)
 	}
-	domain := strings.ToLower(strings.TrimSpace(server.Domain))
-	if domain == "" {
-		log.Printf("[WSS-Nginx] server %d 无域名,跳过 nginx 下发", serverID)
-		return nil
-	}
-	rootDomain := extractRootDomain(domain)
+	domain := normalizeWSSDomain(selectedDomain)
+	candidates := wssServerDomainCandidates(server)
 
-	// 证书查找优先级 (跟 reality 流程一致,见 remote_reality_domains.go HandleSetupSSL):
-	//   1. 共享池按 rootDomain 找 (优先本机自己申请的,再回退到其他机器/主控申请的)
-	//   2. 回退到通配证书 "*."+rootDomain (同样共享,优先本机)
-	//   3. 都找不到 → 跳过
-	var certDomain string
-	if c, err := h.repo.FindDeployableCertByDomain(ctx, rootDomain, serverID); err == nil && c != nil {
-		certDomain = c.Domain
-	} else if c2, err2 := h.repo.FindDeployableCertByDomain(ctx, "*."+rootDomain, serverID); err2 == nil && c2 != nil {
-		certDomain = c2.Domain
+	var cert *storage.Certificate
+	if selectedCertID > 0 {
+		cert, err = h.repo.GetCertificate(ctx, selectedCertID)
+		if err != nil || cert == nil || cert.CertPEM == "" || cert.KeyPEM == "" {
+			return fmt.Errorf("所选证书不存在或缺少 PEM(id=%d)", selectedCertID)
+		}
+		if domain == "" {
+			for _, candidate := range candidates {
+				if wssCertificateCovers(candidate, cert.Domain) {
+					domain = candidate
+					break
+				}
+			}
+			if domain == "" && !strings.HasPrefix(cert.Domain, "*.") {
+				domain = normalizeWSSDomain(cert.Domain)
+			}
+		}
+		if domain == "" || !wssCertificateCovers(domain, cert.Domain) {
+			return fmt.Errorf("所选证书 %s 不能覆盖 WSS 域名 %s", cert.Domain, domain)
+		}
+	} else {
+		lookupDomains := candidates
+		if domain != "" {
+			lookupDomains = append([]string{domain}, candidates...)
+		}
+		for _, candidate := range lookupDomains {
+			if c, findErr := h.repo.FindCertificateForDomain(ctx, candidate); findErr == nil && c != nil && c.CertPEM != "" && c.KeyPEM != "" {
+				cert = c
+				domain = candidate
+				break
+			}
+		}
 	}
-	if certDomain == "" {
-		log.Printf("[WSS-Nginx] server %d domain=%s 根域=%s 无可用证书,跳过 nginx 下发", serverID, domain, rootDomain)
-		return nil
+	if cert == nil {
+		return fmt.Errorf("server %d 的服务器地址/DDNS 域名未匹配到可用证书，候选: %s", serverID, strings.Join(candidates, ", "))
 	}
-	certName := certDeployFilename(certDomain)
+	certName := certDeployFilename(cert.Domain)
+
+	// Nginx 刚安装完时，自动证书部署可能仍在后台执行。在写入 WSS 配置前再同步部署一次，
+	// 并等 agent 确认文件已落盘，避免 nginx -t 因证书文件不存在而失败。
+	certPayload, _ := json.Marshal(WSCertDeployPayload{
+		Domain:   cert.Domain,
+		CertPEM:  cert.CertPEM,
+		KeyPEM:   cert.KeyPEM,
+		CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certName),
+		KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certName),
+		Reload:   "none",
+	})
+	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/cert/deploy", certPayload); err != nil {
+		return fmt.Errorf("同步部署 nginx 证书失败: %v", err)
+	}
 
 	// 拉全部 inbounds,过滤 vless+ws
 	result, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
@@ -225,6 +265,13 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 		log.Printf("[WSS-Nginx] server %d domain=%s 已无 vless+ws 入站,下发空 location 兜底(覆盖残留)", serverID, domain)
 	}
 
+	// 新安装的 Nginx 仍是安装脚本默认主配置，未必包含 servers/*.conf。
+	// 纯 WSS 必须先用 single_nginx.conf 接管主配置，再把域名配置写入 servers/ 目录。
+	nginxConf, err := templates.ReadFile("single_nginx.conf")
+	if err != nil {
+		return fmt.Errorf("读取 single_nginx.conf 模板失败: %v", err)
+	}
+
 	tplBytes, err := templates.ReadFile("wss_domain.conf.tpl")
 	if err != nil {
 		return fmt.Errorf("读取 wss 模板失败: %v", err)
@@ -245,7 +292,7 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 
 	payload, _ := json.Marshal(map[string]interface{}{
 		"domain":        domain,
-		"nginx_config":  "", // 留空 → agent 跳过主 nginx.conf 写入(reality 已下过的不动)
+		"nginx_config":  string(nginxConf),
 		"domain_config": buf.String(),
 	})
 	if _, err := h.forwardNginxSetupSSL(ctx, serverID, payload); err != nil {
@@ -253,6 +300,49 @@ func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) 
 	}
 	log.Printf("[WSS-Nginx] server %d domain=%s 已下发 %d 条 WSS location", serverID, domain, len(infos))
 	return nil
+}
+
+func normalizeWSSDomain(raw string) string {
+	host := strings.TrimSpace(strings.ToLower(raw))
+	if host == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(host); err == nil && parsed.Hostname() != "" {
+		host = parsed.Hostname()
+	} else if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	return strings.Trim(host, "[] .")
+}
+
+func wssServerDomainCandidates(server *storage.RemoteServer) []string {
+	seen := make(map[string]struct{})
+	result := make([]string, 0, 6)
+	for _, raw := range []string{server.Domain, server.DomainV6, server.PullAddress, server.PullAddressV6, server.IPAddress, server.IPAddressV6} {
+		host := normalizeWSSDomain(raw)
+		if host == "" {
+			continue
+		}
+		if _, exists := seen[host]; exists {
+			continue
+		}
+		seen[host] = struct{}{}
+		result = append(result, host)
+	}
+	return result
+}
+
+func wssCertificateCovers(domain, certDomain string) bool {
+	domain = normalizeWSSDomain(domain)
+	certDomain = normalizeWSSDomain(certDomain)
+	if domain == certDomain {
+		return true
+	}
+	if !strings.HasPrefix(certDomain, "*.") {
+		return false
+	}
+	suffix := strings.TrimPrefix(certDomain, "*.")
+	return strings.HasSuffix(domain, "."+suffix) && strings.Count(domain, ".") == strings.Count(suffix, ".")+1
 }
 
 // extractWSSInbounds 从 agent inbounds 列表过滤出 vless+ws 入站的 {path, port}。
