@@ -155,8 +155,9 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/admin/nodes")
 	path = strings.Trim(path, "/")
 
-	// 普通用户开放:列表 / 标签 / 解析订阅 / 批量导入(自己的外部节点) / 查看关联入站。
-	// 仅管理员:手动单个新增、改名/改标签/改服务器/改配置、删除/清空/批量删改
+	// 普通用户开放:列表 / 标签 / 解析订阅 / 批量导入(自己的外部节点) / 查看关联入站 /
+	// 删除自己创建的节点。
+	// 仅管理员:手动单个新增、改标签/改服务器/改配置、清空/批量删改
 	//（这些写操作会同步到共享 YAML 订阅文件,影响管理员)。
 	isAdmin := userIsAdmin(r.Context(), h.repo, auth.UsernameFromContext(r.Context()))
 	denyNonAdmin := func() bool {
@@ -224,9 +225,7 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// 节点取不到 → 404),且普通用户被强制为"只能改名称"。归属自己的节点(含自建路由出站)可改名。
 		h.handleUpdate(w, r, path)
 	case path != "" && path != "batch" && path != "fetch-subscription" && !strings.HasSuffix(path, "/relay") && !strings.HasSuffix(path, "/related-inbounds") && r.Method == http.MethodDelete:
-		if denyNonAdmin() {
-			return
-		}
+		// handleDelete 内部通过 (id, username) 校验归属，普通用户只能删除自己的节点。
 		h.handleDelete(w, r, path)
 	case path == "clear" && r.Method == http.MethodPost:
 		if denyNonAdmin() {

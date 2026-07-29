@@ -34,6 +34,7 @@ import (
 	"miaomiaowux/internal/securechan"
 	"miaomiaowux/internal/storage"
 	"miaomiaowux/internal/taskrun"
+	inttgbot "miaomiaowux/internal/tgbot"
 	"miaomiaowux/internal/traffic"
 	"miaomiaowux/internal/version"
 	"miaomiaowux/internal/web"
@@ -376,6 +377,7 @@ func main() {
 	mux.Handle("/api/user/2fa/disable", auth.RequireToken(tokenStore, userRepo, handler.NewTwoFactorDisableHandler(authManager, repo)))
 	mux.Handle("/api/user/password", auth.RequireToken(tokenStore, userRepo, handler.NewPasswordHandler(authManager)))
 	mux.Handle("/api/user/profile", auth.RequireToken(tokenStore, userRepo, handler.NewProfileHandler(repo)))
+	mux.Handle("/api/user/telegram-binding", auth.RequireToken(tokenStore, userRepo, handler.NewTelegramBindingHandler(repo)))
 	mux.Handle("/api/user/settings", auth.RequireToken(tokenStore, userRepo, handler.NewUserSettingsHandler(repo, tokenStore)))
 	mux.Handle("/api/user/config", auth.RequireToken(tokenStore, userRepo, handler.NewUserConfigHandler(repo)))
 	mux.Handle("/api/user/default-template", auth.RequireToken(tokenStore, userRepo, handler.NewUserDefaultTemplateHandler(repo)))
@@ -864,6 +866,10 @@ func main() {
 	mux.Handle("/api/admin/logs/agent/files", auth.RequireAdmin(tokenStore, userRepo, handler.NewAgentLogFilesHandler(remoteManageHandler)))
 	// 自定义安全阈值(登录/暴力防护/订阅频率)— 写入后 handler 内部热更新 3 个 limiter 单例,无需重启
 	mux.Handle("/api/admin/security-settings", auth.RequireAdmin(tokenStore, userRepo, handler.NewSecuritySettingsHandler(repo)))
+	tgBotManager := inttgbot.NewManager(repo, tokenStore, mux)
+	mux.Handle("/api/admin/system-settings/tgbot", auth.RequireAdmin(tokenStore, userRepo, handler.NewTGBotSettingsHandler(tgBotManager)))
+	mux.HandleFunc("/tg-app", tgBotManager.ServeWebApp)
+	mux.HandleFunc("/api/tg-webapp/", tgBotManager.ServeWebApp)
 	// Turnstile 配置自测:前端 widget 验完拿 token,后端用 DB 已存 secret 调 cloudflare siteverify,
 	// 返回详细 error_codes 供前端诊断"两 key 配错 / 域名没白名单 / 网络不通"等场景。
 	mux.Handle("/api/admin/security-settings/turnstile/test", auth.RequireAdmin(tokenStore, userRepo, handler.NewTurnstileTestHandler(turnstileVerifier)))
@@ -875,6 +881,12 @@ func main() {
 			systemSettingsHandler.GetMasterURL(w, r)
 		case http.MethodPut:
 			systemSettingsHandler.SetMasterURL(w, r)
+			// Mini App 地址由主控公网地址派生；地址修改后刷新 Telegram 菜单按钮。
+			go func() {
+				if err := tgBotManager.Restart(context.Background()); err != nil {
+					logger.Error("主控地址变更后重启 TGBot 失败", "error", err.Error())
+				}
+			}()
 		default:
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
@@ -1309,6 +1321,10 @@ func main() {
 	}
 
 	collectorCtx, stopCollector := context.WithCancel(context.Background())
+	if err := tgBotManager.Restart(collectorCtx); err != nil {
+		logger.Error("内置 TGBot 启动失败", "error", err.Error())
+	}
+	defer tgBotManager.Stop()
 
 	trafficCollector.OnServerOffline = handler.SendServerOfflineNotification
 	// 启动 Xray 流量收集器（每 1 分钟）

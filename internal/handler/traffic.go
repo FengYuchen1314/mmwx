@@ -68,15 +68,8 @@ func (h *TrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 数据来源: user_email_traffic + user_subaccounts 反查 routed_node_id + user_inbound_configs 反查
 // 该用户在某 server 上的 inbound 节点。
 //
-// 返回**按当前倍率折算的展示口径**:裸流量 × 该节点套餐倍率 × 套餐流量倍率(oneway×1/twoway×2)。
-//
-// ⚠️ 与计费口径(GetUserBillableTraffic)的差异:计费走"采集时计价"(weighted_* 列,按各时期的
-// 倍率累积,改倍率不追溯);本端点仍是"读时按当前倍率折算",所以**改倍率后的一段时间内,
-// 这里的明细之和会与用户列表的已用量对不上**(旧流量在这里被按新倍率重算了),下次周期重置后重合。
-//
-// 没有直接用 weighted_* 列的原因:本端点的 date 过滤(今日/本周/本月)靠 user_email_traffic_snapshots
-// 做减法,而那张快照表只存裸量。要彻底同源,得先给快照表加 weighted 列(计划中的 P2)。
-// 断流不看这里,所以这个差异不影响计费正确性。
+// 整个套餐周期(date 为空)直接返回采集时计价并写入 weighted_* 的计费流量,与用户总用量同源,
+// 修改倍率不会追溯重算历史。带 date 的历史筛选仍依赖只保存裸量的快照表,因此暂按当前倍率折算。
 //
 // GET /api/admin/traffic/user-nodes?username=share
 //
@@ -96,12 +89,13 @@ func (h *TrafficHandler) handleUserNodes(w http.ResponseWriter, r *http.Request)
 	date := strings.TrimSpace(r.URL.Query().Get("date"))
 	baseUp, baseDown := h.emailBaseline(ctx, date)
 
-	// 计费倍率取自用户当前套餐。无套餐 / 查不到 → pkg 为 nil,
-	// MultiplierForNode 与 TrafficMultiplier 都有 nil receiver 保护,倍率退化为 1(裸流量)。
+	// 仅日期筛选需要读时倍率；整周期直接使用入库时已折算的 weighted_*。
 	var pkg *storage.Package
-	if user, uerr := h.repo.GetUser(ctx, username); uerr == nil && user.PackageID > 0 {
-		if p, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
-			pkg = p
+	if date != "" {
+		if user, uerr := h.repo.GetUser(ctx, username); uerr == nil && user.PackageID > 0 {
+			if p, perr := h.repo.GetPackage(ctx, user.PackageID); perr == nil {
+				pkg = p
+			}
 		}
 	}
 
@@ -156,20 +150,25 @@ func (h *TrafficHandler) handleUserNodes(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		uet = subEmailBaseline(uet, baseUp, baseDown)
+		if date == "" {
+			uet.Uplink = int64(uet.WeightedUplink)
+			uet.Downlink = int64(uet.WeightedDownlink)
+		}
 		for _, ns := range at.Shares {
 			addToNode(ns, storage.ScaledEmailTraffic(uet, ns.Scale))
 		}
 	}
 
-	// 倍率在这里统一乘,而不是在 addToNode 里逐条 email 乘:
-	// 同一节点的倍率固定,先累加裸量再乘只截断一次,逐条乘会累积多次取整误差。
 	out := make([]item, 0, len(byNode))
 	for _, it := range byNode {
-		if mult := pkg.MultiplierForNode(it.NodeID) * float64(pkg.TrafficMultiplier()); mult != 1 {
-			it.Uplink = int64(float64(it.Uplink) * mult)
-			it.Downlink = int64(float64(it.Downlink) * mult)
-			it.LastUplink = int64(float64(it.LastUplink) * mult)
-			it.LastDownlink = int64(float64(it.LastDownlink) * mult)
+		// 日期快照没有 weighted_*，仅该兼容路径按当前倍率折算。
+		if date != "" {
+			if mult := pkg.MultiplierForNode(it.NodeID) * float64(pkg.TrafficMultiplier()); mult != 1 {
+				it.Uplink = int64(float64(it.Uplink) * mult)
+				it.Downlink = int64(float64(it.Downlink) * mult)
+				it.LastUplink = int64(float64(it.LastUplink) * mult)
+				it.LastDownlink = int64(float64(it.LastDownlink) * mult)
+			}
 		}
 		out = append(out, *it)
 	}

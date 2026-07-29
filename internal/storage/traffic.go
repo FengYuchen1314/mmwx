@@ -115,7 +115,6 @@ type heartbeatThrottle struct {
 // 离线判定阈值 60s,10s 陈旧度远小于阈值 → 命中节流时服务器不可能被 MarkOfflineRemoteServers 标为离线。
 const heartbeatThrottleWindow = 10 * time.Second
 
-
 // SubscriptionLink 表示向客户端公开的可配置订阅条目。
 type SubscriptionLink struct {
 	ID           int64
@@ -11636,17 +11635,19 @@ func upsertUserTrafficOn(ctx context.Context, ex sqlExecutor, serverID int64, us
 
 // UserEmailTraffic 跟 UserTraffic 字段对齐,只是 key 换 email。
 type UserEmailTraffic struct {
-	ID            int64
-	ServerID      int64
-	Email         string
-	Uplink        int64
-	Downlink      int64
-	TotalUplink   int64
-	TotalDownlink int64
-	LastUplink    int64
-	LastDownlink  int64
-	CycleStart    time.Time
-	UpdatedAt     time.Time
+	ID               int64
+	ServerID         int64
+	Email            string
+	Uplink           int64
+	Downlink         int64
+	TotalUplink      int64
+	TotalDownlink    int64
+	LastUplink       int64
+	LastDownlink     int64
+	WeightedUplink   float64
+	WeightedDownlink float64
+	CycleStart       time.Time
+	UpdatedAt        time.Time
 }
 
 // UpsertUserEmailTraffic 跟 UpsertUserTraffic 完全一样的 delta/restart 检测逻辑,key 换成 email。
@@ -11738,7 +11739,12 @@ func (r *TrafficRepository) ListUserEmailTraffic(ctx context.Context) ([]UserEma
 	}
 	// Uplink/Downlink 返回本周期增量(减去月度重置抬起的基线),与 user_traffic 的口径一致;
 	// TotalUplink/TotalDownlink 仍是不受重置影响的历史累计。
-	rows, err := r.db.QueryContext(ctx, `SELECT id, server_id, email, uplink - cycle_base_uplink, downlink - cycle_base_downlink, total_uplink, total_downlink, last_uplink, last_downlink, cycle_start, updated_at FROM user_email_traffic`)
+	rows, err := r.db.QueryContext(ctx, `SELECT id, server_id, email,
+		uplink - cycle_base_uplink, downlink - cycle_base_downlink,
+		total_uplink, total_downlink, last_uplink, last_downlink,
+		MAX(weighted_uplink - cycle_base_weighted_uplink, 0),
+		MAX(weighted_downlink - cycle_base_weighted_downlink, 0),
+		cycle_start, updated_at FROM user_email_traffic`)
 	if err != nil {
 		return nil, fmt.Errorf("query user email traffic: %w", err)
 	}
@@ -11746,7 +11752,7 @@ func (r *TrafficRepository) ListUserEmailTraffic(ctx context.Context) ([]UserEma
 	var out []UserEmailTraffic
 	for rows.Next() {
 		var t UserEmailTraffic
-		if err := rows.Scan(&t.ID, &t.ServerID, &t.Email, &t.Uplink, &t.Downlink, &t.TotalUplink, &t.TotalDownlink, &t.LastUplink, &t.LastDownlink, &t.CycleStart, &t.UpdatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.ServerID, &t.Email, &t.Uplink, &t.Downlink, &t.TotalUplink, &t.TotalDownlink, &t.LastUplink, &t.LastDownlink, &t.WeightedUplink, &t.WeightedDownlink, &t.CycleStart, &t.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan user email traffic: %w", err)
 		}
 		t.Uplink = max(t.Uplink, 0)

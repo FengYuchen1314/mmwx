@@ -487,6 +487,7 @@ func (h *TGBotAPIHandler) bindExisting(ctx context.Context, w http.ResponseWrite
 			"绑定失败: "+err.Error()+" (邀请码已消耗,请联系管理员)")
 		return
 	}
+	_ = h.repo.RevokeActiveBindInvitesForUser(ctx, user.Username)
 	_ = h.repo.WriteTGAudit(ctx, storage.TGAudit{
 		TGID: tgID, Username: user.Username,
 		Action: "bind", Detail: "invite_code=" + ic.Code,

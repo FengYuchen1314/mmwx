@@ -10,12 +10,14 @@ import (
 )
 
 type profileResponse struct {
-	Username string `json:"username"`
-	Email    string `json:"email"`
-	Nickname string `json:"nickname"`
-	Avatar   string `json:"avatar_url"`
-	Role     string `json:"role"`
-	IsAdmin  bool   `json:"is_admin"`
+	Username         string `json:"username"`
+	Email            string `json:"email"`
+	Nickname         string `json:"nickname"`
+	Avatar           string `json:"avatar_url"`
+	Role             string `json:"role"`
+	IsAdmin          bool   `json:"is_admin"`
+	TelegramID       int64  `json:"telegram_id,omitempty"`
+	TelegramUsername string `json:"telegram_username,omitempty"`
 }
 
 var errUnauthorized = errors.New("unauthorized")
@@ -45,6 +47,10 @@ func NewProfileHandler(repo *storage.TrafficRepository) http.Handler {
 			Avatar:   user.AvatarURL,
 			Role:     user.Role,
 			IsAdmin:  user.Role == storage.RoleAdmin,
+		}
+		if binding, exists := repo.GetUserTelegramBinding(r.Context(), user.Username); exists {
+			resp.TelegramID = binding.TelegramID
+			resp.TelegramUsername = binding.TelegramUsername
 		}
 
 		w.Header().Set("Content-Type", "application/json")

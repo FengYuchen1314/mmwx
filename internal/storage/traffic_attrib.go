@@ -322,6 +322,8 @@ func ScaledEmailTraffic(uet UserEmailTraffic, scale int) UserEmailTraffic {
 	uet.Downlink /= int64(scale)
 	uet.LastUplink /= int64(scale)
 	uet.LastDownlink /= int64(scale)
+	uet.WeightedUplink /= float64(scale)
+	uet.WeightedDownlink /= float64(scale)
 	return uet
 }
 

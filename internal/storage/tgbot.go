@@ -107,6 +107,17 @@ type TelegramBinding struct {
 	TelegramUsername string
 }
 
+// GetUserTelegramBinding returns one user's binding without loading the whole
+// binding table. The bool is false when the user is unbound or does not exist.
+func (r *TrafficRepository) GetUserTelegramBinding(ctx context.Context, username string) (TelegramBinding, bool) {
+	var binding TelegramBinding
+	err := r.db.QueryRowContext(ctx,
+		`SELECT telegram_id, COALESCE(telegram_username, '') FROM users
+		  WHERE username = ? AND telegram_id IS NOT NULL AND telegram_id != 0`, username).
+		Scan(&binding.TelegramID, &binding.TelegramUsername)
+	return binding, err == nil
+}
+
 // ListUserTelegramBindings 批量取所有已绑 TG 的用户(username → 绑定信息),
 // 供用户管理列表一次性展示(避免逐个 query)。让直接添加、事后绑 TG 的用户也能看出对应哪个 Telegram 账号。
 func (r *TrafficRepository) ListUserTelegramBindings(ctx context.Context) (map[string]TelegramBinding, error) {
@@ -400,6 +411,16 @@ func (r *TrafficRepository) RevokeInviteCode(ctx context.Context, code string) e
 		return errors.New("邀请码不存在")
 	}
 	return nil
+}
+
+// RevokeActiveBindInvitesForUser invalidates previously issued web/admin bind
+// codes so an older copied code cannot be used after a later unbind.
+func (r *TrafficRepository) RevokeActiveBindInvitesForUser(ctx context.Context, username string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE invite_codes SET revoked = 1
+		  WHERE kind = 'bind' AND bind_username = ? AND revoked = 0
+		    AND used_count < max_uses`, username)
+	return err
 }
 
 // DeleteInviteCode 硬删除邀请码(连同使用记录)。从列表彻底移除。
