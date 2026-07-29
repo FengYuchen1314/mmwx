@@ -573,6 +573,9 @@ type SystemConfig struct {
 	ProxyGroupsSourceURL    string // 代理组配置的远程 URL
 	ClientCompatibilityMode bool   // 自动过滤客户端不兼容的节点
 	EnableShortLink         bool   // 全局启用订阅短链接
+	EnableSubInfoNodes      bool   // 在 Clash 订阅顶部添加过期时间和剩余流量信息节点
+	SubInfoExpirePrefix     string // 过期时间信息节点前缀
+	SubInfoTrafficPrefix    string // 剩余流量信息节点前缀
 	SpeedCollectInterval    int    // 网速采集间隔（秒），默认 3
 	TrafficCollectInterval  int    // 流量采集间隔（秒），默认 60
 	TrafficCheckInterval    int    // 流量限额检查间隔（秒），默认 120
@@ -1787,6 +1790,15 @@ WHERE NOT EXISTS (SELECT 1 FROM system_config WHERE id = 1);
 	}
 
 	if err := r.ensureSystemConfigColumn("enable_short_link", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
+	if err := r.ensureSystemConfigColumn("enable_sub_info_nodes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureSystemConfigColumn("sub_info_expire_prefix", "TEXT NOT NULL DEFAULT '📅过期时间'"); err != nil {
+		return err
+	}
+	if err := r.ensureSystemConfigColumn("sub_info_traffic_prefix", "TEXT NOT NULL DEFAULT '⌛剩余流量'"); err != nil {
 		return err
 	}
 
@@ -6889,6 +6901,8 @@ func (r *TrafficRepository) DeleteProxyProviderConfig(ctx context.Context, id in
 func (r *TrafficRepository) GetSystemConfig(ctx context.Context) (SystemConfig, error) {
 	const query = `
 SELECT proxy_groups_source_url, client_compatibility_mode, COALESCE(enable_short_link, 1),
+       COALESCE(enable_sub_info_nodes, 0), COALESCE(sub_info_expire_prefix, '📅过期时间'),
+       COALESCE(sub_info_traffic_prefix, '⌛剩余流量'),
        COALESCE(speed_collect_interval, 3), COALESCE(traffic_collect_interval, 60),
        COALESCE(traffic_check_interval, 120), COALESCE(heartbeat_interval, 30),
        COALESCE(agent_log_enabled, 0),
@@ -6922,7 +6936,7 @@ WHERE id = 1
 `
 
 	var cfg SystemConfig
-	var compatibilityMode, enableShortLink, agentLogEnabled int
+	var compatibilityMode, enableShortLink, enableSubInfoNodes, agentLogEnabled int
 	var notifyServerRenewal int
 	var notifyEnabled, notifyLogin, notifySubFetch, notifyDailyTraffic int
 	var notifyServerOffline, notifyServerOnline, notifyTrafficThreshold int
@@ -6933,6 +6947,7 @@ WHERE id = 1
 	var notifyUserReg, notifyTGBound, notifyCert, notifyAgentLO, notifyDeviceLimit, notifyIPBan int
 	err := r.db.QueryRowContext(ctx, query).Scan(
 		&cfg.ProxyGroupsSourceURL, &compatibilityMode, &enableShortLink,
+		&enableSubInfoNodes, &cfg.SubInfoExpirePrefix, &cfg.SubInfoTrafficPrefix,
 		&cfg.SpeedCollectInterval, &cfg.TrafficCollectInterval,
 		&cfg.TrafficCheckInterval, &cfg.HeartbeatInterval,
 		&agentLogEnabled,
@@ -6953,13 +6968,20 @@ WHERE id = 1
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return SystemConfig{EnableShortLink: true, SpeedCollectInterval: 3, TrafficCollectInterval: 60, TrafficCheckInterval: 120, HeartbeatInterval: 30, NotifyDailyTrafficTime: "08:00", NotifyTrafficThresholdPercent: 80, SubscriptionOutputFormat: "yaml", SilentModeTimeout: 15, EnableMiaomiaowuFeatures: true}, nil
+			return SystemConfig{EnableShortLink: true, SubInfoExpirePrefix: "📅过期时间", SubInfoTrafficPrefix: "⌛剩余流量", SpeedCollectInterval: 3, TrafficCollectInterval: 60, TrafficCheckInterval: 120, HeartbeatInterval: 30, NotifyDailyTrafficTime: "08:00", NotifyTrafficThresholdPercent: 80, SubscriptionOutputFormat: "yaml", SilentModeTimeout: 15, EnableMiaomiaowuFeatures: true}, nil
 		}
 		return SystemConfig{}, fmt.Errorf("query system config: %w", err)
 	}
 
 	cfg.ClientCompatibilityMode = compatibilityMode != 0
 	cfg.EnableShortLink = enableShortLink != 0
+	cfg.EnableSubInfoNodes = enableSubInfoNodes != 0
+	if cfg.SubInfoExpirePrefix == "" {
+		cfg.SubInfoExpirePrefix = "📅过期时间"
+	}
+	if cfg.SubInfoTrafficPrefix == "" {
+		cfg.SubInfoTrafficPrefix = "⌛剩余流量"
+	}
 	cfg.AgentLogEnabled = agentLogEnabled != 0
 	cfg.NotifyEnabled = notifyEnabled != 0
 	cfg.NotifyLogin = notifyLogin != 0
@@ -7007,6 +7029,9 @@ UPDATE system_config
 SET proxy_groups_source_url = ?,
     client_compatibility_mode = ?,
     enable_short_link = ?,
+    enable_sub_info_nodes = ?,
+    sub_info_expire_prefix = ?,
+    sub_info_traffic_prefix = ?,
     speed_collect_interval = ?,
     traffic_collect_interval = ?,
     traffic_check_interval = ?,
@@ -7090,6 +7115,14 @@ WHERE id = 1
 	if nnmRight == "" {
 		nnmRight = "」"
 	}
+	subInfoExpirePrefix := strings.TrimSpace(cfg.SubInfoExpirePrefix)
+	if subInfoExpirePrefix == "" {
+		subInfoExpirePrefix = "📅过期时间"
+	}
+	subInfoTrafficPrefix := strings.TrimSpace(cfg.SubInfoTrafficPrefix)
+	if subInfoTrafficPrefix == "" {
+		subInfoTrafficPrefix = "⌛剩余流量"
+	}
 
 	// Phase 2 默认值兜底:0 表示用户从未设过,落库时给个合理初值
 	pkgExpiringDays := cfg.NotifyPackageExpiringDays
@@ -7102,6 +7135,7 @@ WHERE id = 1
 	}
 
 	result, err := r.db.ExecContext(ctx, updateStmt, cfg.ProxyGroupsSourceURL, compatibilityMode, enableShortLink,
+		boolToInt(cfg.EnableSubInfoNodes), subInfoExpirePrefix, subInfoTrafficPrefix,
 		cfg.SpeedCollectInterval, cfg.TrafficCollectInterval, cfg.TrafficCheckInterval, cfg.HeartbeatInterval,
 		agentLogEnabled,
 		boolToInt(cfg.NotifyEnabled), cfg.TelegramBotToken, cfg.TelegramChatID,
@@ -7133,6 +7167,7 @@ WHERE id = 1
 	if rowsAffected == 0 {
 		const insertStmt = `
 INSERT INTO system_config (id, proxy_groups_source_url, client_compatibility_mode, enable_short_link,
+	 enable_sub_info_nodes, sub_info_expire_prefix, sub_info_traffic_prefix,
     speed_collect_interval, traffic_collect_interval, traffic_check_interval, heartbeat_interval, agent_log_enabled,
     notify_enabled, telegram_bot_token, telegram_chat_id, notify_login, notify_subscribe_fetch,
     notify_daily_traffic, notify_server_offline, notify_server_online, notify_traffic_threshold,
@@ -7145,9 +7180,10 @@ INSERT INTO system_config (id, proxy_groups_source_url, client_compatibility_mod
     notify_package_expired, notify_user_registered, notify_telegram_bound, notify_cert_result,
     notify_agent_long_offline, notify_agent_long_offline_minutes, notify_device_limit_exceeded, notify_ip_ban,
     notify_server_renewal)
-VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 		if _, err := r.db.ExecContext(ctx, insertStmt, cfg.ProxyGroupsSourceURL, compatibilityMode, enableShortLink,
+			boolToInt(cfg.EnableSubInfoNodes), subInfoExpirePrefix, subInfoTrafficPrefix,
 			cfg.SpeedCollectInterval, cfg.TrafficCollectInterval, cfg.TrafficCheckInterval, cfg.HeartbeatInterval, agentLogEnabled,
 			boolToInt(cfg.NotifyEnabled), cfg.TelegramBotToken, cfg.TelegramChatID,
 			boolToInt(cfg.NotifyLogin), boolToInt(cfg.NotifySubscribeFetch), boolToInt(cfg.NotifyDailyTraffic),

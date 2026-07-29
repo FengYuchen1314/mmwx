@@ -696,6 +696,9 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	// 使用订阅名称
 	attachmentName := url.PathEscape(displayName)
+	totalTrafficLimit, totalTrafficUsed, subExpire := h.resolveSubscriptionTraffic(
+		r.Context(), hasSubscribeFile, subscribeFile, externalTrafficLimit, externalTrafficUsed,
+	)
 
 	// YAML 重排序
 	stepStart = time.Now()
@@ -721,6 +724,15 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 							// 先修复 WireGuard 节点的 allowed-ips 字段
 							fixWireGuardAllowedIPs(proxiesNode)
 							reorderProxies(proxiesNode)
+							if h.repo != nil {
+								if sysCfg, cfgErr := h.repo.GetSystemConfig(r.Context()); cfgErr == nil && sysCfg.EnableSubInfoNodes {
+									remainingTraffic := totalTrafficLimit - totalTrafficUsed
+									if remainingTraffic < 0 {
+										remainingTraffic = 0
+									}
+									proxiesNode.Content = append(createSubInfoNodes(sysCfg, subExpire, remainingTraffic), proxiesNode.Content...)
+								}
+							}
 						}
 						break
 					}
@@ -792,60 +804,6 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Content-Type", contentType)
 
-	// 远程服务器流量统计:
-	//   - 订阅创建者是普通用户且绑了套餐 → 用套餐口径(pkg.TrafficLimitBytes + 用户已用 × multiplier),
-	//     跟"流量信息"页一致,避免把全平台所有服务器流量塞进 subscription-userinfo。
-	//   - admin / 无套餐 / 找不到用户 → 沿用 stats_server_ids 那套老逻辑。
-	remoteTrafficLimit, remoteTrafficUsed := int64(0), int64(0)
-	// subExpire:订阅创建者的套餐到期日,用于 subscription-userinfo 的 expire。
-	// 普通用户绑套餐时取其 PackageEndDate(可能为 nil=永久);admin/无套餐/找不到用户时
-	// 保持 nil → buildSubscriptionHeader 输出长期占位(2099-12-31)。
-	var subExpire *time.Time
-	if hasSubscribeFile && h.repo != nil {
-		creator := strings.TrimSpace(subscribeFile.CreatedBy)
-		usedPackageScope := false
-		if creator != "" {
-			if user, uerr := h.repo.GetUser(r.Context(), creator); uerr == nil && user.Role != storage.RoleAdmin && user.PackageID > 0 {
-				if pkg, perr := h.repo.GetPackage(r.Context(), user.PackageID); perr == nil && pkg != nil {
-					// 有效上限 = 用户级覆写 ?? 套餐流量,与 enforcer 断流口径一致。
-					remoteTrafficLimit = resolveTrafficLimitBytes(&user, pkg)
-					// 计费流量:倍率已在采集时折算,拿到即最终值。
-					if billable, terr := h.repo.GetUserBillableTraffic(r.Context(), creator); terr == nil {
-						remoteTrafficUsed = billable
-					}
-					subExpire = user.PackageEndDate
-					usedPackageScope = true
-				}
-			}
-		}
-		if !usedPackageScope {
-			var serverIDs []int64
-			if subscribeFile.StatsServerIDs != "" {
-				for _, idStr := range strings.Split(subscribeFile.StatsServerIDs, ",") {
-					idStr = strings.TrimSpace(idStr)
-					if id, err := strconv.ParseInt(idStr, 10, 64); err == nil && id > 0 {
-						serverIDs = append(serverIDs, id)
-					}
-				}
-			}
-			if len(serverIDs) > 0 {
-				remoteTrafficLimit, remoteTrafficUsed, _ = h.repo.GetRemoteServerTrafficTotals(r.Context(), serverIDs)
-			} else {
-				remoteTrafficLimit, remoteTrafficUsed, _ = h.repo.GetAllRemoteServersTrafficTotals(r.Context())
-			}
-			// 同流量列表口径:仅当订阅自带 traffic_limit > 0 才作"显式覆盖",
-			// nil / 0 都视作"跟随服务器"。
-			if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
-				remoteTrafficLimit = int64(*subscribeFile.TrafficLimit * 1024 * 1024 * 1024)
-			}
-		} else if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
-			// 套餐口径下,如果订阅自带 traffic_limit 覆盖,以覆盖为准
-			remoteTrafficLimit = int64(*subscribeFile.TrafficLimit * 1024 * 1024 * 1024)
-		}
-	}
-
-	totalTrafficLimit := externalTrafficLimit + remoteTrafficLimit
-	totalTrafficUsed := externalTrafficUsed + remoteTrafficUsed
 	if totalTrafficLimit > 0 {
 		headerValue := buildSubscriptionHeader(totalTrafficLimit, totalTrafficUsed, subExpire)
 		w.Header().Set("subscription-userinfo", headerValue)
@@ -1154,6 +1112,83 @@ func appendExpire(info string, endDate *time.Time) string {
 		exp = endDate.Unix()
 	}
 	return info + fmt.Sprintf("; expire=%d", exp)
+}
+
+func (h *SubscriptionHandler) resolveSubscriptionTraffic(ctx context.Context, hasSubscribeFile bool, subscribeFile storage.SubscribeFile, externalLimit, externalUsed int64) (int64, int64, *time.Time) {
+	remoteLimit, remoteUsed := int64(0), int64(0)
+	var expireAt *time.Time
+	if !hasSubscribeFile || h.repo == nil {
+		return externalLimit, externalUsed, nil
+	}
+
+	creator := strings.TrimSpace(subscribeFile.CreatedBy)
+	usedPackageScope := false
+	if creator != "" {
+		if user, err := h.repo.GetUser(ctx, creator); err == nil && user.Role != storage.RoleAdmin && user.PackageID > 0 {
+			if pkg, err := h.repo.GetPackage(ctx, user.PackageID); err == nil && pkg != nil {
+				remoteLimit = resolveTrafficLimitBytes(&user, pkg)
+				if billable, err := h.repo.GetUserBillableTraffic(ctx, creator); err == nil {
+					remoteUsed = billable
+				}
+				expireAt = user.PackageEndDate
+				usedPackageScope = true
+			}
+		}
+	}
+
+	if !usedPackageScope {
+		var serverIDs []int64
+		for _, idStr := range strings.Split(subscribeFile.StatsServerIDs, ",") {
+			if id, err := strconv.ParseInt(strings.TrimSpace(idStr), 10, 64); err == nil && id > 0 {
+				serverIDs = append(serverIDs, id)
+			}
+		}
+		if len(serverIDs) > 0 {
+			remoteLimit, remoteUsed, _ = h.repo.GetRemoteServerTrafficTotals(ctx, serverIDs)
+		} else {
+			remoteLimit, remoteUsed, _ = h.repo.GetAllRemoteServersTrafficTotals(ctx)
+		}
+	}
+	if subscribeFile.TrafficLimit != nil && *subscribeFile.TrafficLimit > 0 {
+		remoteLimit = int64(*subscribeFile.TrafficLimit * 1024 * 1024 * 1024)
+	}
+	return externalLimit + remoteLimit, externalUsed + remoteUsed, expireAt
+}
+
+// createSubInfoNodes 创建不会真实连通的 SS 信息节点，供客户端在节点列表顶部展示订阅状态。
+func createSubInfoNodes(config storage.SystemConfig, expireAt *time.Time, remainingTraffic int64) []*yaml.Node {
+	expireText := config.SubInfoExpirePrefix + " "
+	if expireAt == nil {
+		expireText += "永久"
+	} else {
+		expireText += expireAt.Format("2006-01-02")
+	}
+	trafficText := config.SubInfoTrafficPrefix + " " + formatSubInfoTraffic(remainingTraffic)
+
+	createNode := func(name string) *yaml.Node {
+		return &yaml.Node{Kind: yaml.MappingNode, Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Value: "name"}, {Kind: yaml.ScalarNode, Value: name},
+			{Kind: yaml.ScalarNode, Value: "type"}, {Kind: yaml.ScalarNode, Value: "ss"},
+			{Kind: yaml.ScalarNode, Value: "server"}, {Kind: yaml.ScalarNode, Value: "sub.info.node"},
+			{Kind: yaml.ScalarNode, Value: "port"}, {Kind: yaml.ScalarNode, Value: "443", Tag: "!!int"},
+			{Kind: yaml.ScalarNode, Value: "password"}, {Kind: yaml.ScalarNode, Value: "SubInfoNode"},
+			{Kind: yaml.ScalarNode, Value: "cipher"}, {Kind: yaml.ScalarNode, Value: "aes-128-gcm"},
+		}}
+	}
+	return []*yaml.Node{createNode(expireText), createNode(trafficText)}
+}
+
+func formatSubInfoTraffic(value int64) string {
+	if value <= 0 {
+		return "0B"
+	}
+	if gb := float64(value) / (1024 * 1024 * 1024); gb >= 1 {
+		return fmt.Sprintf("%.2fGB", gb)
+	}
+	if mb := float64(value) / (1024 * 1024); mb >= 1 {
+		return fmt.Sprintf("%.2fMB", mb)
+	}
+	return fmt.Sprintf("%.2fKB", float64(value)/1024)
 }
 
 func buildSubscriptionHeader(totalLimit, totalUsed int64, endDate *time.Time) string {

@@ -14,21 +14,24 @@ import (
 )
 
 type userConfigRequest struct {
-	ForceSyncExternal       bool    `json:"force_sync_external"`
-	MatchRule               string  `json:"match_rule"`
-	SyncScope               string  `json:"sync_scope"`
-	KeepNodeName            bool    `json:"keep_node_name"`
-	CacheExpireMinutes      int     `json:"cache_expire_minutes"`
-	SyncTraffic             bool    `json:"sync_traffic"`
-	NodeNameFilter          string  `json:"node_name_filter"`
-	AppendSubInfo           bool    `json:"append_sub_info"`
-	CustomRulesEnabled      bool    `json:"custom_rules_enabled"`
-	EnableShortLink         bool    `json:"enable_short_link"`
+	ForceSyncExternal       bool     `json:"force_sync_external"`
+	MatchRule               string   `json:"match_rule"`
+	SyncScope               string   `json:"sync_scope"`
+	KeepNodeName            bool     `json:"keep_node_name"`
+	CacheExpireMinutes      int      `json:"cache_expire_minutes"`
+	SyncTraffic             bool     `json:"sync_traffic"`
+	NodeNameFilter          string   `json:"node_name_filter"`
+	AppendSubInfo           bool     `json:"append_sub_info"`
+	CustomRulesEnabled      bool     `json:"custom_rules_enabled"`
+	EnableShortLink         bool     `json:"enable_short_link"`
 	UseNewTemplateSystem    *bool    `json:"use_new_template_system"` // nil表示不提供，默认true
 	EnableProxyProvider     bool     `json:"enable_proxy_provider"`
 	NodeOrder               *[]int64 `json:"node_order"` // 指针:nil=未提供(如系统设置页)→保留原值,非nil=覆盖。防止其它设置页误清节点顺序
 	ProxyGroupsSourceURL    string   `json:"proxy_groups_source_url"`
-	ClientCompatibilityMode bool    `json:"client_compatibility_mode"` // 自动过滤客户端不兼容的节点
+	ClientCompatibilityMode bool     `json:"client_compatibility_mode"` // 自动过滤客户端不兼容的节点
+	EnableSubInfoNodes      bool     `json:"enable_sub_info_nodes"`
+	SubInfoExpirePrefix     string   `json:"sub_info_expire_prefix"`
+	SubInfoTrafficPrefix    string   `json:"sub_info_traffic_prefix"`
 }
 
 type userConfigResponse struct {
@@ -47,6 +50,9 @@ type userConfigResponse struct {
 	NodeOrder               []int64 `json:"node_order"` // 节点显示顺序（节点 ID 数组）
 	ProxyGroupsSourceURL    string  `json:"proxy_groups_source_url"`
 	ClientCompatibilityMode bool    `json:"client_compatibility_mode"` // 自动过滤客户端不兼容的节点
+	EnableSubInfoNodes      bool    `json:"enable_sub_info_nodes"`
+	SubInfoExpirePrefix     string  `json:"sub_info_expire_prefix"`
+	SubInfoTrafficPrefix    string  `json:"sub_info_traffic_prefix"`
 }
 
 func NewUserConfigHandler(repo *storage.TrafficRepository) http.Handler {
@@ -100,6 +106,9 @@ func handleGetUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.T
 				NodeOrder:               computeFallbackNodeOrder(r.Context(), repo, username),
 				ProxyGroupsSourceURL:    systemConfig.ProxyGroupsSourceURL,
 				ClientCompatibilityMode: systemConfig.ClientCompatibilityMode,
+				EnableSubInfoNodes:      systemConfig.EnableSubInfoNodes,
+				SubInfoExpirePrefix:     systemConfig.SubInfoExpirePrefix,
+				SubInfoTrafficPrefix:    systemConfig.SubInfoTrafficPrefix,
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
@@ -133,6 +142,9 @@ func handleGetUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.T
 		NodeOrder:               nodeOrder,
 		ProxyGroupsSourceURL:    systemConfig.ProxyGroupsSourceURL,
 		ClientCompatibilityMode: systemConfig.ClientCompatibilityMode,
+		EnableSubInfoNodes:      systemConfig.EnableSubInfoNodes,
+		SubInfoExpirePrefix:     systemConfig.SubInfoExpirePrefix,
+		SubInfoTrafficPrefix:    systemConfig.SubInfoTrafficPrefix,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -296,6 +308,9 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 	}
 	systemConfig.ProxyGroupsSourceURL = proxyGroupsSourceURL
 	systemConfig.ClientCompatibilityMode = payload.ClientCompatibilityMode
+	systemConfig.EnableSubInfoNodes = payload.EnableSubInfoNodes
+	systemConfig.SubInfoExpirePrefix = payload.SubInfoExpirePrefix
+	systemConfig.SubInfoTrafficPrefix = payload.SubInfoTrafficPrefix
 	if err := repo.UpdateSystemConfig(r.Context(), systemConfig); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("update system config: %w", err))
 		return
@@ -317,6 +332,9 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		NodeOrder:               settings.NodeOrder,
 		ProxyGroupsSourceURL:    proxyGroupsSourceURL,
 		ClientCompatibilityMode: payload.ClientCompatibilityMode,
+		EnableSubInfoNodes:      systemConfig.EnableSubInfoNodes,
+		SubInfoExpirePrefix:     systemConfig.SubInfoExpirePrefix,
+		SubInfoTrafficPrefix:    systemConfig.SubInfoTrafficPrefix,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

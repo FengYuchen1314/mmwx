@@ -359,6 +359,8 @@ func getUsedExternalSubscriptionURLs(ctx context.Context, repo *storage.TrafficR
 	return usedURLs, nil
 }
 
+var subInfoSuffixPattern = regexp.MustCompile(`(?: \d+(?:\.\d+)?(?:GB|MB)📊(?: \d+Days⏳)?| \d+Days⏳)$`)
+
 // syncSingleExternalSubscription 从单个外部订阅获取并同步节点
 // 返回：节点数、更新的订阅信息、错误
 func syncSingleExternalSubscription(ctx context.Context, client *http.Client, repo *storage.TrafficRepository, subscribeDir, username string, sub storage.ExternalSubscription, settings storage.UserSettings) (int, storage.ExternalSubscription, error) {
@@ -403,8 +405,9 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 		return 0, sub, nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	// 如果启用了sync_traffic，则解析订阅用户信息标头
-	if settings.SyncTraffic {
+	// 同步流量和节点名后缀都依赖 subscription-userinfo。即使用户只开启
+	// append_sub_info，也要刷新响应头，避免节点名使用陈旧的流量或到期信息。
+	if settings.SyncTraffic || settings.AppendSubInfo {
 		userInfo := resp.Header.Get("subscription-userinfo")
 		if userInfo != "" {
 			logger.Info("[外部订阅同步] 发现流量信息头，开始解析...")
@@ -650,7 +653,13 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 		default:
 			// 默认：按节点名称匹配
 			for i := range existingNodes {
-				if existingNodes[i].NodeName == node.NodeName {
+				nameMatches := existingNodes[i].NodeName == node.NodeName
+				// 订阅信息会随流量和日期变化。对同一订阅比较去除自动后缀后的
+				// 原始名称，避免每次变化都被误判为新增节点。
+				if !nameMatches && existingNodes[i].RawURL == sub.URL {
+					nameMatches = stripSubInfoSuffix(existingNodes[i].NodeName) == stripSubInfoSuffix(node.NodeName)
+				}
+				if nameMatches {
 					existingNode = &existingNodes[i]
 					logger.Info("[外部订阅同步] 节点 按名称匹配成功", "node_name", node.NodeName)
 					break
@@ -664,6 +673,7 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 		if existingNode != nil {
 			// 更新现有节点
 			oldNodeName := existingNode.NodeName
+			oldRawURL := existingNode.RawURL
 
 			// 如果节点做过 IP 解析（OriginalDomain 非空），保留解析后的 IP
 			var preservedIP string
@@ -710,7 +720,11 @@ func syncSingleExternalSubscriptionWithSelection(ctx context.Context, client *ht
 			}
 
 			// 根据 keepNodeName 设置处理节点名称
-			if !keepNodeName {
+			oldBaseName := stripSubInfoSuffix(oldNodeName)
+			newBaseName := stripSubInfoSuffix(node.NodeName)
+			refreshGeneratedSuffix := oldRawURL == sub.URL && oldBaseName == newBaseName &&
+				(oldBaseName != oldNodeName || subInfoSuffix != "")
+			if !keepNodeName || refreshGeneratedSuffix {
 				existingNode.NodeName = node.NodeName // 从外部订阅更新为新名称
 				if oldNodeName != node.NodeName {
 					logger.Info("[外部订阅同步] 更新节点名称 ->", "value", oldNodeName, "node_name", node.NodeName)
@@ -1199,6 +1213,12 @@ func buildSubInfoSuffix(sub storage.ExternalSubscription) string {
 		return ""
 	}
 	return " " + strings.Join(parts, " ")
+}
+
+// stripSubInfoSuffix 返回订阅源中的原始节点名，用于在动态流量/天数变化后
+// 仍能匹配到上一次同步创建的节点。它只识别本功能生成的尾部格式。
+func stripSubInfoSuffix(name string) string {
+	return subInfoSuffixPattern.ReplaceAllString(name, "")
 }
 
 func formatTrafficShort(bytes int64) string {
