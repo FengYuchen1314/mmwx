@@ -989,6 +989,13 @@ func NewTrafficRepository(path string) (*TrafficRepository, error) {
 	}
 
 	repo := &TrafficRepository{db: db}
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	checkErr := repo.QuickCheck(checkCtx)
+	checkCancel()
+	if checkErr != nil {
+		_ = db.Close()
+		return nil, checkErr
+	}
 	if err := repo.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err

@@ -118,10 +118,15 @@ func main() {
 		log.Printf("Loaded configuration from %s", *configPath)
 	}
 
-	repo, err := storage.NewTrafficRepository(filepath.Join("data", "mmwx.db"))
+	databasePath := filepath.Join("data", "mmwx.db")
+	databaseBackupPath := filepath.Join("data", "mmwx.db.backup")
+	repo, recoveredFromBackup, err := storage.OpenTrafficRepositoryWithRecovery(databasePath, databaseBackupPath)
 	if err != nil {
 		logger.Error("流量数据库初始化失败", "error", err)
 		os.Exit(1)
+	}
+	if recoveredFromBackup {
+		logger.Warn("主数据库损坏或无法启动，已使用最近的每小时备份恢复；故障数据库及 WAL/SHM 已归档到 data/database-recovery-*，请检查磁盘和文件系统")
 	}
 	defer repo.Close()
 
@@ -1335,6 +1340,10 @@ func main() {
 	go startDailySnapshotTask(collectorCtx, trafficHandler, trafficCollector)
 	// WAL 巡检:每 5 分钟 wal_checkpoint(TRUNCATE),把 -wal 抽干并截断,防止长跑容器里 mmwx.db-wal 无界膨胀。
 	go startWALCheckpointTask(collectorCtx, repo)
+	// 每小时创建一个经 quick_check 验证的一致性数据库快照，只保留最新副本。
+	go startDatabaseBackupTask(collectorCtx, repo, databaseBackupPath)
+	// 每分钟检查数据库健康；一旦损坏或底层 I/O 失败，停止所有后台采集/写入任务并只告警一次。
+	go startDatabaseHealthTask(collectorCtx, repo, stopCollector)
 	// 一次性补:上一轮已切到 traffic_source='system' 但 daily snapshot baseline 缺失的 server。
 	// 行数 < 7 视为"切换时漏迁移"(覆盖本周维度);ON CONFLICT 覆盖,重启重跑也安全。
 	// 新装的 system server 跑 7 天后自然有 ≥7 行,不会被误触发。
@@ -1603,6 +1612,50 @@ func startWALCheckpointTask(ctx context.Context, repo *storage.TrafficRepository
 			} else if !truncated {
 				// TRUNCATE 抢不到窗口(有长读/写事务持 WAL mark)已降级 PASSIVE 尽力抽干,-wal 不会无界
 				log.Printf("[WAL] checkpoint 未能截断(WAL 仍剩 %d 帧,已降级 PASSIVE 尽力抽干,不影响可用)", remaining)
+			}
+		}
+	}
+}
+
+func startDatabaseBackupTask(ctx context.Context, repo *storage.TrafficRepository, backupPath string) {
+	backup := func() {
+		backupCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+		if err := repo.BackupDatabase(backupCtx, backupPath); err != nil {
+			logger.Error("数据库定时备份失败，已保留上一次有效备份", "error", err)
+			return
+		}
+		logger.Info("数据库定时备份完成", "path", backupPath)
+	}
+	// 启动后立即建立首份备份，随后每小时覆盖更新。
+	backup()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			backup()
+		}
+	}
+}
+
+func startDatabaseHealthTask(ctx context.Context, repo *storage.TrafficRepository, stopBackgroundTasks context.CancelFunc) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := repo.QuickCheck(checkCtx)
+			cancel()
+			if err != nil {
+				logger.Error("数据库完整性检查失败，已停止流量采集及后台数据库写入任务，防止继续损坏；请检查磁盘并重启以触发备份恢复", "error", err)
+				stopBackgroundTasks()
+				return
 			}
 		}
 	}
