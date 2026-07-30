@@ -177,6 +177,9 @@ connection_mode: "auto"   # auto | websocket | http | pull
 - 🌈 支持xray pcs参数
 - 🛠️ fix: 删除服务器前先卸载agent
 ### v0.3.9 (2026-07-30)
+- 🌈 支持xray pcs参数
+- 🛠️ fix: 删除服务器前先卸载agent
+### v0.3.9 (2026-07-30)
 - 🌈 同步订阅显示流量节点功能
 - 🌈 增加备份数据库与自动恢复
 - 🌈 外部订阅导入支持选择节点
