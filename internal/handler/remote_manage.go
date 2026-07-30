@@ -359,6 +359,33 @@ func (h *RemoteManageHandler) forwardNginxSetupSSL(ctx context.Context, serverID
 	return h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/nginx/setup-ssl", payload)
 }
 
+// deployNginxCertificateBeforeConfig 在写入引用证书的 nginx 配置前，同步等待 Agent
+// 将证书落盘。不能依赖后台 auto-deploy：nginx -t 会在证书文件不存在时立即失败，
+// 使配置流程提前返回，后续异步证书部署永远没有机会执行。
+func (h *RemoteManageHandler) deployNginxCertificateBeforeConfig(ctx context.Context, server *storage.RemoteServer, domain string) (*storage.Certificate, error) {
+	cert, err := h.repo.FindCertificateForDomain(ctx, strings.ToLower(strings.TrimSpace(domain)))
+	if err != nil || cert == nil || cert.CertPEM == "" || cert.KeyPEM == "" {
+		if h.certHandler != nil {
+			go h.certHandler.DeployAutoDeployCertificates(server.ID)
+		}
+		return nil, fmt.Errorf("域名 %s 没有可用证书；已触发自动部署，请确认证书状态为有效后重试", domain)
+	}
+
+	certName := certDeployFilename(cert.Domain)
+	payload, _ := json.Marshal(WSCertDeployPayload{
+		Domain:   cert.Domain,
+		CertPEM:  cert.CertPEM,
+		KeyPEM:   cert.KeyPEM,
+		CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certName),
+		KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certName),
+		Reload:   "none",
+	})
+	if _, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/cert/deploy", payload); err != nil {
+		return nil, fmt.Errorf("同步下发域名 %s 的 Nginx 证书失败: %w", domain, err)
+	}
+	return cert, nil
+}
+
 func parseNginxVersion(output string) string {
 	const marker = "nginx/"
 	start := strings.Index(output, marker)
@@ -4740,7 +4767,7 @@ func (h *RemoteManageHandler) addWebsiteTunnelConfig(config map[string]any, doma
 	}
 	rules, _ := routing["rules"].([]any)
 
-	for _, rule := range rules {
+	for i, rule := range rules {
 		r, _ := rule.(map[string]any)
 		if r == nil {
 			continue
@@ -4761,12 +4788,25 @@ func (h *RemoteManageHandler) addWebsiteTunnelConfig(config map[string]any, doma
 			continue
 		}
 		domains, _ := r["domain"].([]any)
+		found := false
 		for _, d := range domains {
 			if s, _ := d.(string); s == domain {
-				return
+				found = true
+				break
 			}
 		}
-		r["domain"] = append(domains, domain)
+		if !found {
+			r["domain"] = append(domains, domain)
+		}
+		// tunnel-in → nginx 必须始终拥有最高优先级。已有规则即使来自手动编辑且
+		// 位于末尾，同步配置时也要移动到 rules[0]，避免先命中 tunnel-in → direct。
+		if i > 0 {
+			reordered := make([]any, 0, len(rules))
+			reordered = append(reordered, rule)
+			reordered = append(reordered, rules[:i]...)
+			reordered = append(reordered, rules[i+1:]...)
+			routing["rules"] = reordered
+		}
 		return
 	}
 

@@ -14,7 +14,6 @@ import (
 
 func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *storage.RemoteServer) error {
 	domain := strings.ToLower(strings.TrimSpace(server.Domain))
-	rootDomain := extractRootDomain(domain)
 	proxyDomain := strings.ToLower(strings.TrimSpace(server.PullAddress))
 
 	nginxConf, err := templates.ReadFile("tunnel/nginx.conf")
@@ -22,10 +21,11 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 		return fmt.Errorf("读取 tunnel/nginx.conf 模板失败: %w", err)
 	}
 
-	certName := "_." + rootDomain
-	if cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, server.ID); certErr == nil && cert != nil {
-		certName = certDeployFilename(cert.Domain)
+	cert, err := h.deployNginxCertificateBeforeConfig(ctx, server, domain)
+	if err != nil {
+		return err
 	}
+	certName := certDeployFilename(cert.Domain)
 	// 统一渲染:伪装站 location / + 该 server 现有 ws 入站的 location
 	// (reality偷自己 + WSS 共存 —— 下发伪装站时把已有 ws location 一并渲染,避免冲掉)
 	domainConf, err := renderStealSelfDomainConf(server.StealMode, server.SiteType, server.SiteValue, domain, certName, h.fetchWSSInbounds(ctx, server.ID))
@@ -57,6 +57,8 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 		return fmt.Errorf("读取 %s 模板失败: %w", configFile, err)
 	}
 	configJSON := strings.ReplaceAll(string(configTpl), "{proxy_domain}", proxyDomain)
+	// tunnel-in → direct 是兜底规则，域名到 nginx 的特例必须位于它之前。
+	configJSON = strings.ReplaceAll(configJSON, "{tunnel_domain}", domain)
 
 	var xrayConfig map[string]any
 	if err := json.Unmarshal([]byte(configJSON), &xrayConfig); err != nil {
@@ -82,25 +84,6 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 		return fmt.Errorf("下发 Xray 配置失败: %w", err)
 	}
 	log.Printf("[DeployTunnel] Deployed xray config to server %d (%s)", server.ID, server.Name)
-
-	if h.certHandler != nil {
-		cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, server.ID)
-		if certErr == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
-			payload := WSCertDeployPayload{
-				Domain:   rootDomain,
-				CertPEM:  cert.CertPEM,
-				KeyPEM:   cert.KeyPEM,
-				CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain)),
-				KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain)),
-				Reload:   "nginx",
-			}
-			h.certHandler.deployToRemoteServer(server, payload)
-			log.Printf("[DeployTunnel] Deployed certificate for %s to server %d", rootDomain, server.ID)
-		} else {
-			h.certHandler.DeployAutoDeployCertificates(server.ID)
-			log.Printf("[DeployTunnel] Triggered auto-deploy certificates for server %d", server.ID)
-		}
-	}
 
 	if err := h.restartXrayWithRecovery(ctx, server.ID, "DeployTunnel"); err != nil {
 		log.Printf("[DeployTunnel] %v", err)

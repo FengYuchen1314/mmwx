@@ -35,6 +35,18 @@ func (h *RuleTemplatesHandler) canModifyRuleTemplate(r *http.Request, filename s
 	return owner != "" && owner == username
 }
 
+func (h *RuleTemplatesHandler) canViewRuleTemplate(r *http.Request, filename string) bool {
+	username := auth.UsernameFromContext(r.Context())
+	if h.repo == nil || userIsAdmin(r.Context(), h.repo, username) {
+		return true
+	}
+	owner, err := h.repo.GetRuleTemplateOwner(r.Context(), filename)
+	if err != nil || owner == "" {
+		return !h.loadHiddenRuleTemplates(r)[filename]
+	}
+	return owner == username || h.loadVisibleOwnedRuleTemplates(r)[filename]
+}
+
 const (
 	ruleTemplateMaxCount    = 200     // rule_templates 目录最多文件数
 	ruleTemplateMaxFileSize = 2 << 20 // 单个模板文件最大 2MB
@@ -44,13 +56,25 @@ const (
 // 内置模板默认对所有用户可见;管理员把某个加入此列表后,普通用户列表里就不再显示它(不影响管理员)。
 const settingUserHiddenRuleTemplates = "user_hidden_rule_templates"
 
+// 有归属模板默认仅所有者可见；管理员显式开启后才对全部普通用户可见。
+// 与 hidden 分开存，避免升级时把已有用户私有模板意外公开。
+const settingUserVisibleOwnedRuleTemplates = "user_visible_owned_rule_templates"
+
 // loadHiddenRuleTemplates 读隐藏集(文件名 → true)。空 / 解析失败均返回空集(=全部内置可见)。
 func (h *RuleTemplatesHandler) loadHiddenRuleTemplates(r *http.Request) map[string]bool {
+	return h.loadRuleTemplateFilenameSet(r, settingUserHiddenRuleTemplates)
+}
+
+func (h *RuleTemplatesHandler) loadVisibleOwnedRuleTemplates(r *http.Request) map[string]bool {
+	return h.loadRuleTemplateFilenameSet(r, settingUserVisibleOwnedRuleTemplates)
+}
+
+func (h *RuleTemplatesHandler) loadRuleTemplateFilenameSet(r *http.Request, key string) map[string]bool {
 	set := map[string]bool{}
 	if h.repo == nil {
 		return set
 	}
-	raw, _ := h.repo.GetSystemSetting(r.Context(), settingUserHiddenRuleTemplates)
+	raw, _ := h.repo.GetSystemSetting(r.Context(), key)
 	if strings.TrimSpace(raw) == "" {
 		return set
 	}
@@ -119,6 +143,10 @@ func (h *RuleTemplatesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		switch r.Method {
 		case http.MethodGet:
 			// 获取具体模板内容(所有用户可读,用于使用模板)
+			if !h.canViewRuleTemplate(r, templateName) {
+				http.Error(w, "无权查看该模板", http.StatusForbidden)
+				return
+			}
 			h.handleGetTemplate(w, r, templateName)
 		case http.MethodPut:
 			// 更新模板内容:仅管理员或模板所有者
@@ -140,8 +168,8 @@ func (h *RuleTemplatesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// handleVisibility 管理员配置「哪些内置(无归属)模板对普通用户可见」。仅管理员可调。
-// GET  → { builtins: [...全部内置模板文件名], hidden: [...当前对用户隐藏的] }
+// handleVisibility 管理员配置所有模板对普通用户的可见性。仅管理员可调。
+// GET  → { templates: [...全部模板文件名], hidden: [...当前对用户隐藏的] }
 // PUT  → body { hidden: [...] } 覆盖隐藏集。
 func (h *RuleTemplatesHandler) handleVisibility(w http.ResponseWriter, r *http.Request) {
 	username := auth.UsernameFromContext(r.Context())
@@ -158,23 +186,22 @@ func (h *RuleTemplatesHandler) handleVisibility(w http.ResponseWriter, r *http.R
 			return
 		}
 		allOwners, _ := h.repo.ListRuleTemplateOwners(r.Context())
-		builtins := make([]string, 0)
+		templates := make([]string, 0)
+		hiddenBuiltins := h.loadHiddenRuleTemplates(r)
+		visibleOwned := h.loadVisibleOwnedRuleTemplates(r)
+		hiddenArr := make([]string, 0)
 		for _, e := range entries {
 			if e.IsDir() || !isRuleTemplateFile(e.Name()) {
 				continue
 			}
-			// 只列内置(无归属)模板 —— 用户私有模板本就只对其本人可见,不在此配置范围。
-			if _, owned := allOwners[e.Name()]; !owned {
-				builtins = append(builtins, e.Name())
+			templates = append(templates, e.Name())
+			_, owned := allOwners[e.Name()]
+			if (!owned && hiddenBuiltins[e.Name()]) || (owned && !visibleOwned[e.Name()]) {
+				hiddenArr = append(hiddenArr, e.Name())
 			}
 		}
-		hidden := h.loadHiddenRuleTemplates(r)
-		hiddenArr := make([]string, 0, len(hidden))
-		for fn := range hidden {
-			hiddenArr = append(hiddenArr, fn)
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"builtins": builtins, "hidden": hiddenArr})
+		_ = json.NewEncoder(w).Encode(map[string]any{"templates": templates, "builtins": templates, "hidden": hiddenArr})
 
 	case http.MethodPut:
 		var req struct {
@@ -187,8 +214,36 @@ func (h *RuleTemplatesHandler) handleVisibility(w http.ResponseWriter, r *http.R
 		if req.Hidden == nil {
 			req.Hidden = []string{}
 		}
-		val, _ := json.Marshal(req.Hidden)
-		if err := h.repo.SetSystemSetting(r.Context(), settingUserHiddenRuleTemplates, string(val)); err != nil {
+		entries, err := os.ReadDir("rule_templates")
+		if err != nil {
+			http.Error(w, "Failed to read templates directory", http.StatusInternalServerError)
+			return
+		}
+		allOwners, _ := h.repo.ListRuleTemplateOwners(r.Context())
+		hiddenRequested := make(map[string]bool, len(req.Hidden))
+		for _, fn := range req.Hidden {
+			hiddenRequested[fn] = true
+		}
+		hiddenBuiltins := make([]string, 0)
+		visibleOwned := make([]string, 0)
+		for _, entry := range entries {
+			if entry.IsDir() || !isRuleTemplateFile(entry.Name()) {
+				continue
+			}
+			_, owned := allOwners[entry.Name()]
+			if owned && !hiddenRequested[entry.Name()] {
+				visibleOwned = append(visibleOwned, entry.Name())
+			} else if !owned && hiddenRequested[entry.Name()] {
+				hiddenBuiltins = append(hiddenBuiltins, entry.Name())
+			}
+		}
+		hiddenJSON, _ := json.Marshal(hiddenBuiltins)
+		visibleJSON, _ := json.Marshal(visibleOwned)
+		if err := h.repo.SetSystemSetting(r.Context(), settingUserHiddenRuleTemplates, string(hiddenJSON)); err != nil {
+			http.Error(w, "save failed", http.StatusInternalServerError)
+			return
+		}
+		if err := h.repo.SetSystemSetting(r.Context(), settingUserVisibleOwnedRuleTemplates, string(visibleJSON)); err != nil {
 			http.Error(w, "save failed", http.StatusInternalServerError)
 			return
 		}
@@ -231,6 +286,7 @@ func (h *RuleTemplatesHandler) handleListTemplates(w http.ResponseWriter, r *htt
 	visibleOwners := allOwners
 	if !isAdmin {
 		hidden := h.loadHiddenRuleTemplates(r)
+		visibleOwned := h.loadVisibleOwnedRuleTemplates(r)
 		visibleOwners = make(map[string]string, 1)
 		filtered := make([]string, 0, len(templates))
 		for _, fn := range templates {
@@ -246,6 +302,10 @@ func (h *RuleTemplatesHandler) handleListTemplates(w http.ResponseWriter, r *htt
 				// 自己的私有模板:保留 + 暴露归属(给前端显示"可编辑/删除")
 				filtered = append(filtered, fn)
 				visibleOwners[fn] = owner
+			} else if visibleOwned[fn] {
+				// 管理员公开的有归属模板可供使用，但不暴露所有者用户名，也不可修改。
+				filtered = append(filtered, fn)
+				visibleOwners[fn] = "__shared__"
 			}
 			// 其它人的私有模板:对当前用户彻底隐藏
 		}

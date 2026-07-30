@@ -1176,6 +1176,7 @@ func main() {
 	remoteManageHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
 	remoteWSHandler.SetScanResultHandler(remoteManageHandler.HandleScanResult)
 	remoteWSHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
+	remoteWSHandler.SetMasterProxyDeployer(remoteManageHandler.DeployMasterProxyByID)
 	mux.Handle("/api/admin/certificates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListCertificates)))
 	mux.Handle("/api/admin/certificates/valid", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListValidCertificates)))
 	mux.Handle("/api/admin/certificates/self-signed", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.GenerateSelfSignedCert)))

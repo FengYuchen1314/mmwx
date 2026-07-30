@@ -493,6 +493,7 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 		return
 	}
 	stealSelf := r.URL.Query().Get("steal_self") == "1"
+	localMaster := r.URL.Query().Get("local_master") == "1"
 	xrayMode := r.URL.Query().Get("xray_mode")
 	if xrayMode != "embedded" {
 		xrayMode = "external"
@@ -565,6 +566,7 @@ TOKEN=` + shSingleQuote(token) + `
 SERVER=` + shSingleQuote(scriptServer) + `
 SCRIPT_PROTOCOL=` + shSingleQuote(scriptProtocol) + `
 EXPLICIT_MASTER="` + explicitMaster + `"
+FORCE_LOCAL_MASTER="` + map[bool]string{true: "1", false: "0"}[localMaster] + `"
 AUTO_STEAL_SELF="` + map[bool]string{true: "1", false: "0"}[stealSelf] + `"
 FRONT_SERVICE=` + shSingleQuote(frontService) + `
 XRAY_MODE=` + shSingleQuote(xrayMode) + `
@@ -589,9 +591,12 @@ fi
 
 MASTER_URL="${PROTOCOL}://${SERVER}"
 
-# 同机部署检测:只有在主控"没有显式配置 master_url"时才允许把 master_url 自动改成 127.0.0.1;
-# 用户配置了对外域名(EXPLICIT_MASTER=1)就必须用用户的域名,不让自动改写。
-if [ "$EXPLICIT_MASTER" != "1" ] && curl -sf "http://127.0.0.1:${MASTER_PORT}/api/setup/status" >/dev/null 2>&1; then
+# 创建服务器时已经确认地址与主控相同，就直接使用 loopback；这在主控配置了对外
+# master_url 时同样适用。旧安装链接没有该标记时，保留本机健康检查作为兼容兜底。
+if [ "$FORCE_LOCAL_MASTER" = "1" ]; then
+    MASTER_URL="http://127.0.0.1:${MASTER_PORT}"
+    echo "Same-machine deployment confirmed by master, using ${MASTER_URL}"
+elif [ "$EXPLICIT_MASTER" != "1" ] && curl -sf "http://127.0.0.1:${MASTER_PORT}/api/setup/status" >/dev/null 2>&1; then
     MASTER_URL="http://127.0.0.1:${MASTER_PORT}"
     echo "Detected same-machine deployment, using ${MASTER_URL}"
 fi

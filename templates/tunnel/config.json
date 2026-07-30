@@ -38,6 +38,15 @@
                 "inboundTag": [
                     "tunnel-in"
                 ],
+                "domain": [
+                    "{tunnel_domain}"
+                ],
+                "outboundTag": "nginx"
+            },
+            {
+                "inboundTag": [
+                    "tunnel-in"
+                ],
                 "outboundTag": "direct"
             },
             {
@@ -107,4 +116,4 @@
         "tag": "Metrics",
         "listen": "127.0.0.1:38889"
     }
-} 
+}

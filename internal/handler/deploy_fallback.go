@@ -14,17 +14,17 @@ import (
 
 func (h *RemoteManageHandler) deployFallbackConfig(ctx context.Context, server *storage.RemoteServer) error {
 	domain := strings.ToLower(strings.TrimSpace(server.Domain))
-	rootDomain := extractRootDomain(domain)
 
 	nginxConf, err := templates.ReadFile("fallback/nginx.conf")
 	if err != nil {
 		return fmt.Errorf("读取 fallback/nginx.conf 模板失败: %w", err)
 	}
 
-	certName := "_." + rootDomain
-	if cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, server.ID); certErr == nil && cert != nil {
-		certName = certDeployFilename(cert.Domain)
+	cert, err := h.deployNginxCertificateBeforeConfig(ctx, server, domain)
+	if err != nil {
+		return err
 	}
+	certName := certDeployFilename(cert.Domain)
 	// 统一渲染:伪装站 location / + 该 server 现有 ws 入站的 location
 	// (reality偷自己 + WSS 共存 —— 下发伪装站时把已有 ws location 一并渲染,避免冲掉)
 	domainConf, err := renderStealSelfDomainConf(server.StealMode, server.SiteType, server.SiteValue, domain, certName, h.fetchWSSInbounds(ctx, server.ID))
@@ -54,25 +54,6 @@ func (h *RemoteManageHandler) deployFallbackConfig(ctx context.Context, server *
 		return fmt.Errorf("下发 Xray 配置失败: %w", err)
 	}
 	log.Printf("[DeployFallback] Deployed xray config to server %d (%s)", server.ID, server.Name)
-
-	if h.certHandler != nil {
-		cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, server.ID)
-		if certErr == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
-			payload := WSCertDeployPayload{
-				Domain:   rootDomain,
-				CertPEM:  cert.CertPEM,
-				KeyPEM:   cert.KeyPEM,
-				CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain)),
-				KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain)),
-				Reload:   "nginx",
-			}
-			h.certHandler.deployToRemoteServer(server, payload)
-			log.Printf("[DeployFallback] Deployed certificate for %s to server %d", rootDomain, server.ID)
-		} else {
-			h.certHandler.DeployAutoDeployCertificates(server.ID)
-			log.Printf("[DeployFallback] Triggered auto-deploy certificates for server %d", server.ID)
-		}
-	}
 
 	if err := h.restartXrayWithRecovery(ctx, server.ID, "DeployFallback"); err != nil {
 		log.Printf("[DeployFallback] %v", err)

@@ -11,6 +11,7 @@ import (
 	"net"
 	stdhttp "net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -395,6 +396,9 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		mmwxIPSet[ip] = struct{}{}
 	}
 	checkAddrLocal := func(addr string) bool {
+		if normalizeAddressHost(addr) == normalizeAddressHost(mmwxDomain) && normalizeAddressHost(mmwxDomain) != "" {
+			return true
+		}
 		for _, ip := range resolveIPs(addr) {
 			if _, ok := mmwxIPSet[ip]; ok {
 				return true
@@ -618,6 +622,12 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	if req.StealSelf {
 		installQuery.Set("steal_self", "1")
 		installQuery.Set("front_service", frontService)
+	}
+	// 添加的服务器地址与主控解析到同一台机器时，安装脚本应让 Agent 直接通过
+	// loopback 连接主控。否则“偷自己”接管主控域名的 443 后，Agent 再绕公网域名
+	// 回连会进入自己刚部署的 Xray/Nginx 链路，容易形成回环或连接中断。
+	if isLocalByAddr {
+		installQuery.Set("local_master", "1")
 	}
 	if xrayMode == "embedded" {
 		installQuery.Set("xray_mode", "embedded")
@@ -1157,6 +1167,7 @@ func (h *XrayServerHandler) switchRemoteListenPort(serverID int64, newPort int) 
 }
 
 func resolveIPs(address string) []string {
+	address = normalizeAddressHost(address)
 	if ip := net.ParseIP(address); ip != nil {
 		return []string{ip.String()}
 	}
@@ -1165,6 +1176,23 @@ func resolveIPs(address string) []string {
 		return nil
 	}
 	return ips
+}
+
+// normalizeAddressHost 统一处理用户可能输入的域名、host:port 或完整 URL。
+func normalizeAddressHost(address string) string {
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return ""
+	}
+	parsed, err := url.Parse(address)
+	if err == nil && parsed.Hostname() != "" {
+		return strings.ToLower(parsed.Hostname())
+	}
+	parsed, err = url.Parse("//" + address)
+	if err == nil && parsed.Hostname() != "" {
+		return strings.ToLower(parsed.Hostname())
+	}
+	return strings.ToLower(strings.Trim(address, "[]"))
 }
 
 func (h *XrayServerHandler) CheckSameIP(w stdhttp.ResponseWriter, r *stdhttp.Request) {
@@ -1185,20 +1213,28 @@ func (h *XrayServerHandler) CheckSameIP(w stdhttp.ResponseWriter, r *stdhttp.Req
 	masterURL, _ := h.repo.GetSystemSetting(ctx, "master_url")
 	httpsEnabled := strings.HasPrefix(masterURL, "https://")
 
-	sameIP := false
+	// 地址与主控域名完全相同应直接判定；不能只依赖 DNS 查询，否则临时解析失败时
+	// 表单不会自动填充主控反代。域名带协议或端口时也按 hostname 比较。
+	sameIP := normalizeAddressHost(address) == normalizeAddressHost(mmwxDomain) && mmwxDomain != ""
 	if mmwxDomain != "" {
-		addrIPs := resolveIPs(address)
-		mmwxIPs := resolveIPs(mmwxDomain)
-		mmwxIPSet := make(map[string]struct{})
-		for _, ip := range mmwxIPs {
-			mmwxIPSet[ip] = struct{}{}
-		}
-		for _, ip := range addrIPs {
-			if _, ok := mmwxIPSet[ip]; ok {
-				sameIP = true
-				break
+		if !sameIP {
+			addrIPs := resolveIPs(address)
+			mmwxIPs := resolveIPs(mmwxDomain)
+			mmwxIPSet := make(map[string]struct{})
+			for _, ip := range mmwxIPs {
+				mmwxIPSet[ip] = struct{}{}
+			}
+			for _, ip := range addrIPs {
+				if _, ok := mmwxIPSet[ip]; ok {
+					sameIP = true
+					break
+				}
 			}
 		}
+	}
+	panelPort := os.Getenv("PORT")
+	if panelPort == "" {
+		panelPort = "12889"
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1207,5 +1243,6 @@ func (h *XrayServerHandler) CheckSameIP(w stdhttp.ResponseWriter, r *stdhttp.Req
 		"same_ip":       sameIP,
 		"master_domain": mmwxDomain,
 		"https_enabled": httpsEnabled,
+		"panel_backend": "http://127.0.0.1:" + panelPort,
 	})
 }

@@ -233,9 +233,8 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleClearAll(w, r)
 	case path == "batch-delete" && r.Method == http.MethodPost:
-		if denyNonAdmin() {
-			return
-		}
+		// 普通用户也可批量删除；handleBatchDelete 会逐个按 (id, username)
+		// 校验归属，套餐节点和其他用户节点会被跳过。
 		h.handleBatchDelete(w, r)
 	case path == "batch-rename" && r.Method == http.MethodPost:
 		if denyNonAdmin() {

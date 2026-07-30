@@ -329,19 +329,20 @@ func IsServerUpgrading(serverID int64) bool {
 
 // RemoteWSHandler 处理来自远程（子）服务器的 WebSocket 连接
 type RemoteWSHandler struct {
-	repo              *storage.TrafficRepository
-	collector         *traffic.Collector
-	upgrader          websocket.Upgrader
-	conns             sync.Map // 令牌 -> *RemoteWSConnection
-	stealSelfDeployer func(ctx context.Context, serverID int64) error
-	pendingProbes     sync.Map // 详见上下文
-	pendingRPC        sync.Map // map[requestID]chan WSRPCReplyPayload — WS RPC 反向调用响应路由,详见 ws_rpc.go
-	pendingStream     sync.Map // map[requestID]chan wsStreamFrame — 流式 RPC (SSE 替代)
-	limiterPusher     *LimiterConfigPusher
-	licenseManager    *license.Manager
-	crypto            *CryptoConfig
-	probeStore        *ProbeMetricsStore // 伪装探针真数据 ring(可选,SetProbeStore 注入)
-	userSpeedCache    sync.Map           // key: "serverID:email" -> int64 (Bytes/s)
+	repo                *storage.TrafficRepository
+	collector           *traffic.Collector
+	upgrader            websocket.Upgrader
+	conns               sync.Map // 令牌 -> *RemoteWSConnection
+	stealSelfDeployer   func(ctx context.Context, serverID int64) error
+	masterProxyDeployer func(ctx context.Context, serverID int64) error
+	pendingProbes       sync.Map // 详见上下文
+	pendingRPC          sync.Map // map[requestID]chan WSRPCReplyPayload — WS RPC 反向调用响应路由,详见 ws_rpc.go
+	pendingStream       sync.Map // map[requestID]chan wsStreamFrame — 流式 RPC (SSE 替代)
+	limiterPusher       *LimiterConfigPusher
+	licenseManager      *license.Manager
+	crypto              *CryptoConfig
+	probeStore          *ProbeMetricsStore // 伪装探针真数据 ring(可选,SetProbeStore 注入)
+	userSpeedCache      sync.Map           // key: "serverID:email" -> int64 (Bytes/s)
 	// xrayConfigSyncCallback 在 auth 成功后异步触发(args: serverID + 上次 server.status),
 	// 实现见 RemoteManageHandler.SyncXrayConfigOnReconnect — 跨 handler 用 callback 注入避免循环依赖。
 	xrayConfigSyncCallback func(ctx context.Context, serverID int64, prevStatus string)
@@ -1216,7 +1217,9 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 		go h.xrayModeCorrectCallback(context.Background(), server.ID, authPayload.XrayMode)
 	}
 
-	// 在第一次连接时自动部署窃取配置（服务器处于挂起状态）
+	// 在第一次连接时自动部署窃取配置（服务器处于挂起状态）。同机 Agent 使用的域名
+	// 就是主控域名时，再顺序部署主控反代。必须等偷自己配置完成后再做，二者都会写
+	// servers/{domain}.conf，并发下发会让最后完成的一方随机覆盖另一方。
 	if server.Use443 && server.Domain != "" && server.Status == "pending" && h.stealSelfDeployer != nil {
 		go func() {
 			// 等待代理完全初始化
@@ -1227,6 +1230,15 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 				log.Printf("[Remote WS] Failed to auto-deploy steal-self config for server %s (%d): %v", server.Name, server.ID, err)
 			} else {
 				log.Printf("[Remote WS] Auto-deployed steal-self config for server %s (%d)", server.Name, server.ID)
+			}
+
+			masterDomain := getDomainFromMasterURL(h.repo, deployCtx)
+			if shouldAutoProxyMaster(server, authPayload.SameHostAsMaster, masterDomain) && h.masterProxyDeployer != nil {
+				if err := h.masterProxyDeployer(deployCtx, server.ID); err != nil {
+					log.Printf("[Remote WS] Failed to auto-deploy master proxy for server %s (%d): %v", server.Name, server.ID, err)
+				} else {
+					log.Printf("[Remote WS] Auto-deployed master proxy for server %s (%d)", server.Name, server.ID)
+				}
 			}
 		}()
 	}
@@ -1748,6 +1760,17 @@ func (h *RemoteWSHandler) SetScanResultHandler(handler ScanResultHandler) {
 // 设置首次连接时自动部署steal-self 配置的回调
 func (h *RemoteWSHandler) SetStealSelfDeployer(deployer func(ctx context.Context, serverID int64) error) {
 	h.stealSelfDeployer = deployer
+}
+
+// SetMasterProxyDeployer 注入同机 Agent 的主控反代部署器。
+func (h *RemoteWSHandler) SetMasterProxyDeployer(deployer func(ctx context.Context, serverID int64) error) {
+	h.masterProxyDeployer = deployer
+}
+
+func shouldAutoProxyMaster(server *storage.RemoteServer, sameHostAsMaster bool, masterDomain string) bool {
+	return server != nil && sameHostAsMaster && server.Use443 &&
+		strings.EqualFold(strings.TrimSpace(server.Domain), strings.TrimSpace(masterDomain)) &&
+		strings.TrimSpace(masterDomain) != ""
 }
 
 // 处理来自远程服务器的扫描结果消息

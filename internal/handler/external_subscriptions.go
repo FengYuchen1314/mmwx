@@ -48,6 +48,11 @@ func NewExternalSubscriptionsHandler(repo *storage.TrafficRepository) http.Handl
 			writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
 			return
 		}
+		// 始终使用数据库中的规范用户名做 owner 查询。兼容旧会话、大小写不同的
+		// 登录名以及历史令牌，避免订阅实际属于该用户却因字符串不完全一致而列表为空。
+		if user, err := repo.GetUser(r.Context(), username); err == nil && user.Username != "" {
+			username = user.Username
+		}
 		// 管理员可查看/编辑/删除所有用户的外部订阅;普通用户仅限自己的(照 nodes.go 的 isAdmin 分支)。
 		isAdmin := userIsAdmin(r.Context(), repo, username)
 
@@ -416,7 +421,10 @@ func handleDeleteExternalSubscription(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"success": true,
+		"deleted": id,
+	})
 }
 
 // 返回一个处理程序，该处理程序列出来自外部订阅的节点名称

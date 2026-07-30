@@ -20,9 +20,9 @@ import (
 // 在主控宿主机上装一个 agent,用它的 nginx 对外 listen 443,反代到主控的 http 端口(127.0.0.1:<PORT>)。
 // 前提:该 agent 与主控同机(proxy_pass 127.0.0.1 才通),前端仅在「同机 && 主控为 Docker 部署」时显示入口。
 //
-// 复用:直接沿用主控本机反代面板用的模板 single_nginx.conf + mmwx_domain.conf(后者已是 listen 443 ssl
-// → proxy_pass 127.0.0.1:12889,且带 X-Forwarded-Proto https —— 主控据此自动认定已在 HTTPS 后,闭环),
-// 经现成的 setup-ssl 通道下发,证书用 WSCertDeployPayload 下发。整体是 deployTunnelConfig 去掉 xray 的简化版。
+// Agent 开启偷自己时，443 属于 Xray tunnel/fallback 入口，Nginx 只能监听
+// 127.0.0.1:8001 接收 Xray 回落流量。因此这里必须使用对应模式的 domain_proxy.conf，
+// 不能使用主控直装场景的 mmwx_domain.conf（它会让 Nginx 抢占 443）。
 
 // deployMasterProxy 在指定(同机)agent 上部署「反代主控」nginx 配置 + 证书。
 func (h *RemoteManageHandler) deployMasterProxy(ctx context.Context, server *storage.RemoteServer) error {
@@ -30,8 +30,6 @@ func (h *RemoteManageHandler) deployMasterProxy(ctx context.Context, server *sto
 	if masterDomain == "" {
 		return fmt.Errorf("主控 master_url 未配置域名,无法反代主控;请先在设置里把 master_url 配成 https://你的域名")
 	}
-	rootDomain := extractRootDomain(masterDomain)
-
 	// 主控面板端口(Docker 容器监听的宿主机端口),默认 12889,与模板里的 proxy_pass 端口一致。
 	panelPort := os.Getenv("PORT")
 	if panelPort == "" {
@@ -39,29 +37,31 @@ func (h *RemoteManageHandler) deployMasterProxy(ctx context.Context, server *sto
 	}
 
 	// 证书:主控该域名的证书;没有先触发自动签发,让用户稍后重试(签发是异步的)。
-	cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, server.ID)
-	if certErr != nil || cert == nil || cert.CertPEM == "" || cert.KeyPEM == "" {
-		if h.certHandler != nil {
-			go h.certHandler.DeployAutoDeployCertificates(server.ID)
-		}
-		return fmt.Errorf("主控域名 %s 尚无可用证书,已触发自动申请,请稍后重试", rootDomain)
+	cert, err := h.deployNginxCertificateBeforeConfig(ctx, server, masterDomain)
+	if err != nil {
+		return err
 	}
 	certName := certDeployFilename(cert.Domain)
 
-	// 渲染:主 nginx.conf(含 include servers/*.conf + 80→301)+ 反代 server 块。
-	nginxConf, err := templates.ReadFile("single_nginx.conf")
-	if err != nil {
-		return fmt.Errorf("读取 single_nginx.conf 模板失败: %w", err)
+	mode := server.StealMode
+	if mode != "fallback" {
+		mode = "tunnel"
 	}
-	domainTpl, err := templates.ReadFile("mmwx_domain.conf")
+	nginxConf, err := templates.ReadFile(mode + "/nginx.conf")
 	if err != nil {
-		return fmt.Errorf("读取 mmwx_domain.conf 模板失败: %w", err)
+		return fmt.Errorf("读取 %s/nginx.conf 模板失败: %w", mode, err)
 	}
-	domainConf := strings.ReplaceAll(string(domainTpl), "{domain}", masterDomain)
-	domainConf = strings.ReplaceAll(domainConf, "{cert_name}", certName)
-	// 模板默认反代 12889;若主控 PORT 改过则替换成实际端口。
-	if panelPort != "12889" {
-		domainConf = strings.ReplaceAll(domainConf, "127.0.0.1:12889", "127.0.0.1:"+panelPort)
+	panelBackend := "http://127.0.0.1:" + panelPort
+	domainConf, err := renderStealSelfDomainConf(
+		mode,
+		"proxy",
+		panelBackend,
+		masterDomain,
+		certName,
+		h.fetchWSSInbounds(ctx, server.ID),
+	)
+	if err != nil {
+		return fmt.Errorf("渲染主控反代配置失败: %w", err)
 	}
 
 	// 腾出 443(清掉可能占用的 stream 端口),再下发 nginx 配置。
@@ -79,21 +79,17 @@ func (h *RemoteManageHandler) deployMasterProxy(ctx context.Context, server *sto
 		return fmt.Errorf("下发 nginx 反代配置失败: %w", err)
 	}
 
-	// 下发证书(顺序同 deployTunnelConfig:setup-ssl 先建 cert 目录 + 首次 reload 可能因证书缺失失败但不阻断,
-	// 证书落地后 deployToRemoteServer 带 Reload:"nginx" 再 reload 一次即生效)。
-	if h.certHandler != nil {
-		h.certHandler.deployToRemoteServer(server, WSCertDeployPayload{
-			Domain:   rootDomain,
-			CertPEM:  cert.CertPEM,
-			KeyPEM:   cert.KeyPEM,
-			CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certName),
-			KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certName),
-			Reload:   "nginx",
-		})
-	}
-
-	log.Printf("[ProxyMaster] 已在 server %d (%s) 部署主控反代: %s → 127.0.0.1:%s", server.ID, server.Name, masterDomain, panelPort)
+	log.Printf("[ProxyMaster] 已在 server %d (%s) 部署主控反代: %s (127.0.0.1:8001) → %s", server.ID, server.Name, masterDomain, panelBackend)
 	return nil
+}
+
+// DeployMasterProxyByID 给首次连接自动部署等内部调用提供按 ID 的入口。
+func (h *RemoteManageHandler) DeployMasterProxyByID(ctx context.Context, serverID int64) error {
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return fmt.Errorf("获取服务器信息失败: %w", err)
+	}
+	return h.deployMasterProxy(ctx, server)
 }
 
 // HandleProxyMaster POST /api/admin/remote/proxy-master?server_id= —— 在同机 agent 上部署反代主控。
