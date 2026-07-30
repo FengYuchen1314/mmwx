@@ -116,6 +116,21 @@ func (h *proxyGroupsSyncHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// 显式传入地址表示管理员正在修改代理组来源。校验和下载成功后再持久化，
+	// 避免无效地址覆盖当前可用配置；留空同步则继续使用已保存地址/默认地址。
+	if strings.TrimSpace(payload.SourceURL) != "" {
+		systemConfig, configErr := h.repo.GetSystemConfig(r.Context())
+		if configErr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("get system config: %w", configErr))
+			return
+		}
+		systemConfig.ProxyGroupsSourceURL = sourceURL
+		if configErr := h.repo.UpdateSystemConfig(r.Context(), systemConfig); configErr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("save proxy groups source: %w", configErr))
+			return
+		}
+	}
+
 	// 更新内存中的配置
 	if err := h.store.Update(data, resolvedURL, time.Now()); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("update store: %w", err))
