@@ -354,9 +354,11 @@ main() {
     create_directories
     configure_nginx
     compile_nginx
-    create_systemd_service
+    # 必须先准备权限和最终配置，再 enable --now。旧顺序先启动、后覆盖配置，
+    # 后续证书自动部署立即 reload 时可能遇到服务未成功启动、nginx.pid 不存在。
     setup_port_permission
     copy_default_config
+    create_systemd_service
     cleanup
     show_info
 }

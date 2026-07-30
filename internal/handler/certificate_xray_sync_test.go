@@ -91,3 +91,32 @@ func TestCertReferencedByPaths(t *testing.T) {
 		t.Fatal("mismatched key path must not match")
 	}
 }
+
+func TestCertificateMaterialDeployTarget(t *testing.T) {
+	tests := []struct {
+		name string
+		cert *storage.Certificate
+		want string
+	}{
+		{name: "auto deploy uses nginx path only", cert: &storage.Certificate{AutoDeploy: true, DeployTarget: "both", DeployCertPath: "/usr/local/nginx/cert/a.pem", DeployKeyPath: "/usr/local/nginx/cert/a.key"}, want: "nginx"},
+		{name: "explicit target remains unchanged", cert: &storage.Certificate{DeployTarget: "both", DeployCertPath: "/tmp/a.pem", DeployKeyPath: "/tmp/a.key"}, want: "both"},
+		{name: "auto deploy without paths is disabled", cert: &storage.Certificate{AutoDeploy: true, DeployTarget: "both"}, want: "none"},
+		{name: "empty target is none", cert: &storage.Certificate{}, want: "none"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := certificateMaterialDeployTarget(tt.cert); got != tt.want {
+				t.Fatalf("certificateMaterialDeployTarget() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHasCertificateDeployPaths(t *testing.T) {
+	if hasCertificateDeployPaths(&storage.Certificate{DeployCertPath: "", DeployKeyPath: "/tmp/key"}) {
+		t.Fatal("empty certificate path must not be deployable")
+	}
+	if !hasCertificateDeployPaths(&storage.Certificate{DeployCertPath: "/tmp/cert", DeployKeyPath: "/tmp/key"}) {
+		t.Fatal("non-empty certificate and key paths must be deployable")
+	}
+}

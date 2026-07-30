@@ -1493,17 +1493,21 @@ func getAddr(config *ServerConfig, repo *storage.TrafficRepository) string {
 		port = envPort
 	}
 
-	// 默认绑 0.0.0.0,通用所有部署形态(裸机 / Docker / 跨机反代)。
-	// 以前在 https 启用时强绑 127.0.0.1 是为了"禁止 IP+端口直连",但这套物理层拦截
-	// 在 Docker 容器内会让 -p 端口映射失效(容器内 lo 跟 host 端口隔绝)。
-	// 改用应用层 host 中间件(internal/handler/host_enforcement.go)做"直连拦截",
-	// 跟 bind host 解耦。BIND_HOST env 留给高级场景显式覆盖。
+	// 默认绑 0.0.0.0,兼容裸机、Docker 与跨机反代。BIND_HOST 可显式覆盖默认值；
+	// 系统设置中的“关闭公网访问”具有更高优先级，开启后强制仅监听本机回环地址。
 	host := "0.0.0.0"
 	if v := strings.TrimSpace(os.Getenv("BIND_HOST")); v != "" {
 		host = v
 	}
+	if repo != nil {
+		localOnly, err := repo.GetSystemSetting(context.Background(), "master_local_only")
+		if err != nil {
+			log.Printf("[Main] Failed to read master access setting, using %s: %v", host, err)
+		} else if localOnly == "1" {
+			host = "127.0.0.1"
+		}
+	}
 	log.Printf("[Main] HTTP server binding to %s:%s", host, port)
-	_ = repo // 保留参数:其它 host enforcement 在 main.go 主流程里包裹
 	return host + ":" + port
 }
 

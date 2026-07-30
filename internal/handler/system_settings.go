@@ -106,7 +106,12 @@ func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Requ
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "master_url": value})
+	localOnly, _ := h.repo.GetSystemSetting(r.Context(), "master_local_only")
+	json.NewEncoder(w).Encode(map[string]any{
+		"success":    true,
+		"master_url": value,
+		"local_only": localOnly == "1",
+	})
 }
 
 // 设置主服务器地址
@@ -117,7 +122,8 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 	}
 
 	var req struct {
-		MasterURL string `json:"master_url"`
+		MasterURL *string `json:"master_url"`
+		LocalOnly *bool   `json:"local_only"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -126,15 +132,40 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if err := h.repo.SetSystemSetting(r.Context(), "master_url", req.MasterURL); err != nil {
+	if req.MasterURL == nil && req.LocalOnly == nil {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "未提供需要更新的设置"})
 		return
 	}
 
+	if req.MasterURL != nil {
+		if err := h.repo.SetSystemSetting(r.Context(), "master_url", *req.MasterURL); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})
+			return
+		}
+	}
+	if req.LocalOnly != nil {
+		value := "0"
+		if *req.LocalOnly {
+			value = "1"
+		}
+		if err := h.repo.SetSystemSetting(r.Context(), "master_local_only", value); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})
+			return
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "主服务器地址已更新"})
+	json.NewEncoder(w).Encode(map[string]any{
+		"success":          true,
+		"message":          "主服务器设置已更新",
+		"restart_required": req.LocalOnly != nil,
+	})
 }
 
 // 获取「外部已配 HTTPS/反代」开关(用户自建反代、外部终结 TLS 时置 1,证书页据此不再提示开启 HTTPS)

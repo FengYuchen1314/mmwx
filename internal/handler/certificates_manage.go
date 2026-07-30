@@ -407,13 +407,11 @@ func (h *CertificateHandler) requestLocalCertificate(cert *storage.Certificate) 
 		log.Printf("[Certificate] UpdateCertificateIssued failed for %s: %v", cert.Domain, err)
 		return
 	}
-	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
-
 	log.Printf("[Certificate] Successfully issued certificate for %s, expires %s", cert.Domain, result.ExpiryDate.Format("2006-01-02"))
 	SendCertResultNotification(ctx, cert.Domain, true, fmt.Sprintf("有效期至 %s", result.ExpiryDate.Format("2006-01-02")))
 
 	// 如果配置则本地部署
-	h.deployAfterIssue(cert, result)
+	h.deployAfterMaterialUpdate(cert, result)
 	h.checkMasterCertReady(cert)
 }
 
@@ -561,12 +559,10 @@ func (h *CertificateHandler) renewLocalCertificate(cert *storage.Certificate) {
 		log.Printf("[Certificate] UpdateCertificateIssued failed for %s: %v", cert.Domain, err)
 		return
 	}
-	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
-
 	log.Printf("[Certificate] Successfully renewed certificate for %s, expires %s", cert.Domain, result.ExpiryDate.Format("2006-01-02"))
 
 	// 如果配置则本地部署
-	h.deployAfterIssue(cert, result)
+	h.deployAfterMaterialUpdate(cert, result)
 	h.checkMasterCertReady(cert)
 }
 
@@ -825,16 +821,46 @@ func (h *CertificateHandler) buildCertRequest(ctx context.Context, cert *storage
 	return req, nil
 }
 
-// 处理颁发后的证书部署 - 部署到主服务器和所有远程服务器。
+// deployAfterMaterialUpdate 是签发、续期和覆盖上传后的统一部署入口。
+// Nginx 使用证书记录里的部署路径；Xray 托管证书则按配置快照中的实际引用路径单独更新。
+func (h *CertificateHandler) deployAfterMaterialUpdate(cert *storage.Certificate, result *acme.CertResult) {
+	h.deployAfterIssue(cert, result)
+	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
+}
+
+func certificateMaterialDeployTarget(cert *storage.Certificate) string {
+	if cert == nil {
+		return "none"
+	}
+	if cert.AutoDeploy {
+		if hasCertificateDeployPaths(cert) {
+			return "nginx"
+		}
+		return "none"
+	}
+	if cert.DeployTarget == "" {
+		return "none"
+	}
+	return cert.DeployTarget
+}
+
+func hasCertificateDeployPaths(cert *storage.Certificate) bool {
+	return cert != nil && strings.TrimSpace(cert.DeployCertPath) != "" && strings.TrimSpace(cert.DeployKeyPath) != ""
+}
+
+// 处理颁发后的 Nginx/显式路径证书部署 - 部署到主服务器和所有远程服务器。
 func (h *CertificateHandler) deployAfterIssue(cert *storage.Certificate, result *acme.CertResult) {
-	deployTarget := cert.DeployTarget
-	if cert.AutoDeploy && cert.DeployCertPath != "" && cert.DeployKeyPath != "" {
-		deployTarget = "both"
+	deployTarget := certificateMaterialDeployTarget(cert)
+	if cert.AutoDeploy && hasCertificateDeployPaths(cert) {
+		// 自动部署记录的路径通常是 /usr/local/nginx/cert。Xray 使用另一套确定性
+		// 托管目录，由 syncManagedXrayAfterMaterialUpdate 更新并重启，不能在这里
+		// 用同一个 Nginx 路径假装同时部署 Xray，否则会重复重启且 Xray 文件仍是旧的。
+		deployTarget = "nginx"
 	}
 	if deployTarget == "" || deployTarget == "none" {
 		return
 	}
-	if cert.DeployCertPath == "" || cert.DeployKeyPath == "" {
+	if !hasCertificateDeployPaths(cert) {
 		return
 	}
 
@@ -928,6 +954,17 @@ func (h *CertificateHandler) deployToRemoteServer(server *storage.RemoteServer, 
 	}
 }
 
+// deployToRemoteServerSync 通过请求-响应通道等待 Agent 确认证书写入和 reload 完成。
+// 自动续期不能把“WS 消息已发出”误当作“证书已替换”。
+func (h *CertificateHandler) deployToRemoteServerSync(ctx context.Context, server *storage.RemoteServer, payload WSCertDeployPayload) error {
+	body, _ := json.Marshal(payload)
+	if h.remoteManage != nil {
+		_, err := h.remoteManage.ForwardToAgent(ctx, server.ID, http.MethodPost, "/api/child/cert/deploy", body)
+		return err
+	}
+	return h.deployRemoteCertificateHTTP(ctx, server, payload)
+}
+
 // DeployCertToServerSync 同步把证书下发到指定 agent 的 xray 证书目录,返回 agent 上的 cert/key 路径。
 // 用于「添加 tls 入站时自动确保证书已在 agent 上」,避免证书缺失导致 xray 加载失败(502)。
 // Reload 用 "none":证书只写文件,真正生效由随后的 add inbound(gRPC) 触发,避免无谓重启。
@@ -1013,7 +1050,16 @@ func (h *CertificateHandler) deployToAllRemotes(domain, certPEM, keyPEM, certPat
 	}
 
 	for i := range servers {
-		go h.deployToRemoteServer(&servers[i], payload)
+		server := servers[i]
+		go func() {
+			deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer deployCancel()
+			if err := h.deployToRemoteServerSync(deployCtx, &server, payload); err != nil {
+				log.Printf("[Certificate] Remote cert deploy failed for %s on server %d: %v", domain, server.ID, err)
+				return
+			}
+			log.Printf("[Certificate] Remote cert deploy confirmed for %s on server %d", domain, server.ID)
+		}()
 	}
 	log.Printf("[Certificate] Initiated deploy to %d remote server(s) for %s", len(servers), domain)
 }
@@ -1115,15 +1161,25 @@ func (h *CertificateHandler) DeployAutoDeployCertificates(serverID int64) {
 	}
 
 	for _, cert := range certs {
+		if !hasCertificateDeployPaths(&cert) {
+			log.Printf("[Certificate] Skip auto-deploy for %s on server %d: deploy paths are empty", cert.Domain, server.ID)
+			continue
+		}
 		payload := WSCertDeployPayload{
 			Domain:   cert.Domain,
 			CertPEM:  cert.CertPEM,
 			KeyPEM:   cert.KeyPEM,
 			CertPath: filepath.Join(filepath.Dir(cert.DeployCertPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployCertPath)),
 			KeyPath:  filepath.Join(filepath.Dir(cert.DeployKeyPath), certDeployFilename(cert.Domain)+filepath.Ext(cert.DeployKeyPath)),
-			Reload:   "both",
+			Reload:   "nginx",
 		}
-		go h.deployToRemoteServer(server, payload)
+		deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if err := h.deployToRemoteServerSync(deployCtx, server, payload); err != nil {
+			log.Printf("[Certificate] Auto-deploy failed for %s on server %d: %v", cert.Domain, server.ID, err)
+		} else {
+			log.Printf("[Certificate] Auto-deploy confirmed for %s on server %d", cert.Domain, server.ID)
+		}
+		deployCancel()
 	}
 	log.Printf("[Certificate] Triggered auto-deploy of %d cert(s) to server %s", len(certs), server.Name)
 }
@@ -1260,7 +1316,7 @@ func (h *CertificateHandler) DeleteDNSProvider(w http.ResponseWriter, r *http.Re
 //   - cert_pem / key_pem 兼容两种格式:
 //     1. 裸 PEM 文本(以 "-----BEGIN" 开头,Certimate 等 webhook 直接发的格式)
 //     2. base64 编码后的 PEM(原 UI 上传路径)
-//   仅按首字符判别,base64 编码后的 PEM 不会以 "-----BEGIN" 开头(对应 base64 是 "LS0tLS1CRUdJTi"),不会冲突。
+//     仅按首字符判别,base64 编码后的 PEM 不会以 "-----BEGIN" 开头(对应 base64 是 "LS0tLS1CRUdJTi"),不会冲突。
 func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondJSON(w, http.StatusMethodNotAllowed, map[string]any{"success": false, "message": "Method not allowed"})
@@ -1327,12 +1383,12 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("更新证书失败: %v", err)})
 			return
 		}
-		h.syncManagedXrayAfterMaterialUpdate(existing, result.CertPEM, result.KeyPEM)
 		if existing.DeployCertPath == "" {
 			existing.DeployCertPath = deployCertPath
 			existing.DeployKeyPath = deployKeyPath
 			_ = h.repo.UpdateCertificate(ctx, existing)
 		}
+		h.deployAfterMaterialUpdate(existing, result)
 		h.checkMasterCertReady(existing)
 		respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已更新", "certificate_id": existing.ID})
 		return
@@ -1358,7 +1414,7 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 	if err := h.repo.UpdateCertificateIssued(ctx, cert.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate); err != nil {
 		log.Printf("[Certificate] UpdateCertificateIssued after upload failed: %v", err)
 	} else {
-		h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
+		h.deployAfterMaterialUpdate(cert, result)
 	}
 
 	h.checkMasterCertReady(cert)

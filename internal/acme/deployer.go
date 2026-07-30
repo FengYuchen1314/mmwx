@@ -36,8 +36,31 @@ func ReloadNginx() error {
 	for _, nginxBin := range []string{"/usr/local/nginx/sbin/nginx", "nginx"} {
 		if path, err := exec.LookPath(nginxBin); err == nil {
 			cmd := exec.Command(path, "-s", "reload")
-			if output, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("nginx reload: %s: %w", string(output), err)
+			reloadOutput, reloadErr := cmd.CombinedOutput()
+			if reloadErr == nil {
+				return nil
+			}
+
+			// nginx.pid 由运行中的 master 进程创建，不能手工伪造。reload 失败且
+			// systemd 确认服务未运行时，按首次部署处理并启动服务。
+			if systemctl, serr := exec.LookPath("systemctl"); serr == nil {
+				if activeErr := exec.Command(systemctl, "is-active", "--quiet", "nginx").Run(); activeErr != nil {
+					if _, startErr := exec.Command(systemctl, "start", "nginx").CombinedOutput(); startErr != nil {
+						// 容器里可能装有 systemctl 二进制但没有运行 systemd；继续尝试
+						// 裸 nginx 启动，最终错误由下面的启动命令给出。
+					} else {
+						return nil
+					}
+				} else {
+					// 服务实际处于 active，说明不是“首次启动缺 PID”；保留原 reload
+					// 错误（通常是配置校验失败），不能再启动第二个 master 掩盖根因。
+					return fmt.Errorf("nginx reload: %s: %w", string(reloadOutput), reloadErr)
+				}
+			}
+
+			// 无 systemd（如容器）且没有运行中的 master 时，直接启动 nginx。
+			if output, startErr := exec.Command(path).CombinedOutput(); startErr != nil {
+				return fmt.Errorf("nginx start after reload failed: %s: %w", string(output), startErr)
 			}
 			return nil
 		}
