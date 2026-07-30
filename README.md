@@ -170,6 +170,11 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.0 (2026-07-30)
+- 🌈 套餐支持配置默认surge模板
+- 🛠️ fix: 模板重复配置tiktok
+- 🛠️ fix: 管理员小程序展示内容调整
+- 🛠️ fix: 自定义代理组配置重复
 ### v0.3.9 (2026-07-30)
 - 🌈 同步订阅显示流量节点功能
 - 🌈 增加备份数据库与自动恢复
