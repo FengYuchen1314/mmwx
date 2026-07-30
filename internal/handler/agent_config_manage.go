@@ -140,6 +140,8 @@ type RemoteServerDeleteRequest struct {
 	// DeleteNodes 是否连带删除该服务器下的节点(original_server 匹配)。
 	// 前端删除确认默认勾选(true);不传(nil)时保持旧行为=不删节点,兼容其它调用方。
 	DeleteNodes *bool `json:"delete_nodes,omitempty"`
+	// UninstallAgent 为 true 时，必须先让目标服务器调度 Agent 自卸载；受理失败则不删除服务器记录。
+	UninstallAgent *bool `json:"uninstall_agent,omitempty"`
 }
 
 // RemoteServerUpdateRequest 表示更新远程服务器的请求
@@ -764,10 +766,48 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 
 	ctx := r.Context()
 
-	// 删服务器前先拿到名字,供连带删节点用(节点按 original_server=服务器名 关联)。
-	var serverName string
-	if srv, gerr := h.repo.GetRemoteServer(ctx, req.ID); gerr == nil && srv != nil {
-		serverName = srv.Name
+	// 删服务器前先拿到完整记录：用于卸载 Agent，并供连带删节点使用。
+	server, getErr := h.repo.GetRemoteServer(ctx, req.ID)
+	if getErr != nil || server == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "服务器不存在"})
+		return
+	}
+	serverName := server.Name
+
+	if req.UninstallAgent != nil && *req.UninstallAgent {
+		if _, fedErr := h.repo.GetFederatedServer(ctx, req.ID); fedErr == nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(RemoteServerResponse{
+				Success: false,
+				Message: "分享服务器不能卸载拥有方 Agent，请取消卸载选项后重试",
+			})
+			return
+		}
+		if h.remoteManager == nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: "Agent 卸载服务不可用，服务器未删除"})
+			return
+		}
+		uninstallCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_, uninstallErr := h.remoteManager.forwardToRemoteServer(
+			uninstallCtx,
+			req.ID,
+			stdhttp.MethodPost,
+			"/api/child/agent/uninstall-stream",
+			nil,
+		)
+		cancel()
+		if uninstallErr != nil {
+			log.Printf("[Remote Server] uninstall agent before deleting %s failed: %v", serverName, uninstallErr)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(RemoteServerResponse{
+				Success: false,
+				Message: "卸载 Agent 失败，服务器未删除：" + uninstallErr.Error(),
+			})
+			return
+		}
+		log.Printf("[Remote Server] agent uninstall accepted before deleting server %s", serverName)
 	}
 
 	if err := h.repo.DeleteRemoteServer(ctx, req.ID); err != nil {
