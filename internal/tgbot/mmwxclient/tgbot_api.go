@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // BindRequest 给 /api/admin/tgbot/bind 的入参。kind=new 时 Username 必填,kind=bind 时不要传 username。
@@ -193,6 +194,45 @@ func (c *Client) GetAdminSubview(ctx context.Context, username string) (*AdminSu
 		return nil, err
 	}
 	return &out, nil
+}
+
+// AdminNodeTrafficItem 管理员视角下单个节点的全局流量。
+type AdminNodeTrafficItem struct {
+	NodeID   int64  `json:"node_id"`
+	NodeName string `json:"node_name"`
+	Uplink   int64  `json:"uplink"`
+	Downlink int64  `json:"downlink"`
+}
+
+// AdminMonthlyNodeTraffic 返回本月第一天至今的所有节点流量汇总。
+func (c *Client) AdminMonthlyNodeTraffic(ctx context.Context) ([]AdminNodeTrafficItem, error) {
+	var out struct {
+		Items []AdminNodeTrafficItem `json:"items"`
+	}
+	monthStart := time.Now().Format("2006-01") + "-01"
+	q := url.Values{"date": []string{monthStart}}
+	if err := c.get(ctx, "/api/admin/traffic/node-totals", q, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+// RemoteServerStatus 是管理员状态页需要的最小服务器信息。
+type RemoteServerStatus struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
+// RemoteServers 返回主控管理的全部服务器，不按订阅或套餐过滤。
+func (c *Client) RemoteServers(ctx context.Context) ([]RemoteServerStatus, error) {
+	var out struct {
+		Servers []RemoteServerStatus `json:"servers"`
+	}
+	if err := c.get(ctx, "/api/admin/remote-servers", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Servers, nil
 }
 
 // NodeTrafficItem 用户在单个节点的已用流量(本周期)。

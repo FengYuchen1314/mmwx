@@ -351,9 +351,11 @@ function renderHome(d){
 }
 function renderTraffic(d){
  var nodes=d.nodes||[];
+	if(d.is_admin)nodes=nodes.filter(function(n){return (n.used||0)>0;});
  nodes=nodes.slice().sort(function(x,y){return (y.used||0)-(x.used||0);});
  var total=nodes.reduce(function(a,n){return a+(n.used||0);},0);
- var h='<div class="card"><div class="title">各节点已用流量 · 合计 '+hb(total)+'</div>';
+ var title=d.traffic_period==="month"?"本月各节点流量":"各节点已用流量";
+ var h='<div class="card"><div class="title">'+title+' · 合计 '+hb(total)+'</div>';
  if(!nodes.length)h+='<div class="muted">本周期暂无各节点流量数据。</div>';
  var max=0;nodes.forEach(function(n){if((n.used||0)>max)max=n.used;});if(max<=0)max=1;
  nodes.forEach(function(n){var pct=Math.max(2,(n.used||0)/max*100);
@@ -365,8 +367,9 @@ function renderTraffic(d){
 function renderStatus(d){
  var ns=d.node_status||[];
  var on=ns.filter(function(n){return n.status==="online";}).length;
- var h='<div class="card"><div class="title">节点状态 · 在线 '+on+'/'+ns.length+'</div>';
- if(!ns.length)h+='<div class="muted">套餐内暂无节点。</div>';
+ var kind=d.status_kind==="server"?"服务器":"节点";
+ var h='<div class="card"><div class="title">'+kind+'状态 · 在线 '+on+'/'+ns.length+'</div>';
+ if(!ns.length)h+='<div class="muted">暂无'+kind+'。</div>';
  ns.forEach(function(n){var ic,lb,col;
   if(n.status==="online"){ic='<span class="dot" style="background:var(--ok)"></span>';lb="在线";col="var(--ok)";}
   else if(n.status==="unknown"){ic='<span class="qm">?</span>';lb="外部";col="var(--unknown)";}

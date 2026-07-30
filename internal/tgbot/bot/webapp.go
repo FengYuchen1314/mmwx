@@ -246,9 +246,9 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	}
 	resp["subscriptions"] = subs
 
-	// 管理员账号(无套餐、无个人订阅)→ 用系统订阅列表第一个订阅 + 其节点。
-	// 订阅链接取第一个订阅;流量页/状态页用该订阅的全部节点(用量按节点名从已用流量合并,无则 0)。
-	if s.cfg.IsAdmin(tgID) && len(subs) == 0 {
+	// 管理员主页始终使用全局视图：订阅管理第一条、所有非零流量节点、全部服务器状态。
+	if s.cfg.IsAdmin(tgID) {
+		resp["subscriptions"] = []map[string]any{}
 		if sv, err := s.client.GetAdminSubview(ctx, username); err == nil && sv != nil {
 			if sv.Subscription != nil {
 				resp["subscriptions"] = []map[string]any{{
@@ -256,23 +256,35 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 					"url": base + "/" + sv.Subscription.CombinedCode,
 				}}
 			}
-			usedByName := map[string]int64{}
-			for _, n := range nodes {
-				if nm, ok := n["name"].(string); ok {
-					if u, ok2 := n["used"].(int64); ok2 {
-						usedByName[nm] = u
-					}
-				}
-			}
-			nn := []map[string]any{}
-			ns := []map[string]any{}
-			for _, sn := range sv.Nodes {
-				nn = append(nn, map[string]any{"name": sn.Name, "used": usedByName[sn.Name]})
-				ns = append(ns, map[string]any{"name": sn.Name, "protocol": sn.Protocol, "status": sn.Status})
-			}
-			resp["nodes"] = nn
-			resp["node_status"] = ns
 		}
+
+		adminNodes := []map[string]any{}
+		if items, err := s.client.AdminMonthlyNodeTraffic(ctx); err == nil {
+			for _, n := range items {
+				used := n.Uplink + n.Downlink
+				if used <= 0 {
+					continue
+				}
+				adminNodes = append(adminNodes, map[string]any{"name": n.NodeName, "used": used})
+			}
+		}
+		resp["nodes"] = adminNodes
+		resp["traffic_period"] = "month"
+
+		serverStatuses := []map[string]any{}
+		if servers, err := s.client.RemoteServers(ctx); err == nil {
+			for _, server := range servers {
+				status := "offline"
+				if strings.EqualFold(strings.TrimSpace(server.Status), "connected") {
+					status = "online"
+				}
+				serverStatuses = append(serverStatuses, map[string]any{
+					"name": server.Name, "status": status,
+				})
+			}
+		}
+		resp["node_status"] = serverStatuses
+		resp["status_kind"] = "server"
 	}
 
 	// 生效公告(按套餐/节点归属定向)→ Mini App 首页横幅
