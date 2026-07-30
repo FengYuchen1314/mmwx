@@ -196,16 +196,6 @@
     ]
   },
   {
-    "name": "social",
-    "label": "Tiktok",
-    "emoji": "🎶",
-    "site_rules": [
-      {
-        "key": "tiktok"
-      }
-    ]
-  },
-  {
     "name": "streaming",
     "label": "流媒体",
     "emoji": "🎬",
