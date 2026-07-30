@@ -576,6 +576,7 @@ type SystemConfig struct {
 	ClientCompatibilityMode bool   // 自动过滤客户端不兼容的节点
 	EnableShortLink         bool   // 全局启用订阅短链接
 	EnableSubInfoNodes      bool   // 在 Clash 订阅顶部添加过期时间和剩余流量信息节点
+	SubInfoV2RayOnly        bool   // 信息节点仅对 V2Ray 系列客户端输出
 	SubInfoExpirePrefix     string // 过期时间信息节点前缀
 	SubInfoTrafficPrefix    string // 剩余流量信息节点前缀
 	SpeedCollectInterval    int    // 网速采集间隔（秒），默认 3
@@ -1795,6 +1796,9 @@ WHERE NOT EXISTS (SELECT 1 FROM system_config WHERE id = 1);
 		return err
 	}
 	if err := r.ensureSystemConfigColumn("enable_sub_info_nodes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureSystemConfigColumn("sub_info_v2ray_only", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := r.ensureSystemConfigColumn("sub_info_expire_prefix", "TEXT NOT NULL DEFAULT '📅过期时间'"); err != nil {
@@ -4809,6 +4813,24 @@ type User struct {
 	UpdatedAt                time.Time
 }
 
+// GetUserPackagePeriod 返回用户当前套餐的生效起止时间。
+func (r *TrafficRepository) GetUserPackagePeriod(ctx context.Context, username string) (start, end *time.Time, err error) {
+	var startAt, endAt sql.NullTime
+	err = r.db.QueryRowContext(ctx, `SELECT package_start_date, package_end_date FROM users WHERE username = ? LIMIT 1`, strings.TrimSpace(username)).Scan(&startAt, &endAt)
+	if err != nil {
+		return nil, nil, err
+	}
+	if startAt.Valid {
+		v := startAt.Time
+		start = &v
+	}
+	if endAt.Valid {
+		v := endAt.Time
+		end = &v
+	}
+	return start, end, nil
+}
+
 // UserProfileUpdate 捕获用户的可编辑配置文件字段。
 type UserProfileUpdate struct {
 	Email     string
@@ -6912,7 +6934,7 @@ func (r *TrafficRepository) DeleteProxyProviderConfig(ctx context.Context, id in
 func (r *TrafficRepository) GetSystemConfig(ctx context.Context) (SystemConfig, error) {
 	const query = `
 SELECT proxy_groups_source_url, client_compatibility_mode, COALESCE(enable_short_link, 1),
-       COALESCE(enable_sub_info_nodes, 0), COALESCE(sub_info_expire_prefix, '📅过期时间'),
+       COALESCE(enable_sub_info_nodes, 0), COALESCE(sub_info_v2ray_only, 0), COALESCE(sub_info_expire_prefix, '📅过期时间'),
        COALESCE(sub_info_traffic_prefix, '⌛剩余流量'),
        COALESCE(speed_collect_interval, 3), COALESCE(traffic_collect_interval, 60),
        COALESCE(traffic_check_interval, 120), COALESCE(heartbeat_interval, 30),
@@ -6947,7 +6969,7 @@ WHERE id = 1
 `
 
 	var cfg SystemConfig
-	var compatibilityMode, enableShortLink, enableSubInfoNodes, agentLogEnabled int
+	var compatibilityMode, enableShortLink, enableSubInfoNodes, subInfoV2RayOnly, agentLogEnabled int
 	var notifyServerRenewal int
 	var notifyEnabled, notifyLogin, notifySubFetch, notifyDailyTraffic int
 	var notifyServerOffline, notifyServerOnline, notifyTrafficThreshold int
@@ -6958,7 +6980,7 @@ WHERE id = 1
 	var notifyUserReg, notifyTGBound, notifyCert, notifyAgentLO, notifyDeviceLimit, notifyIPBan int
 	err := r.db.QueryRowContext(ctx, query).Scan(
 		&cfg.ProxyGroupsSourceURL, &compatibilityMode, &enableShortLink,
-		&enableSubInfoNodes, &cfg.SubInfoExpirePrefix, &cfg.SubInfoTrafficPrefix,
+		&enableSubInfoNodes, &subInfoV2RayOnly, &cfg.SubInfoExpirePrefix, &cfg.SubInfoTrafficPrefix,
 		&cfg.SpeedCollectInterval, &cfg.TrafficCollectInterval,
 		&cfg.TrafficCheckInterval, &cfg.HeartbeatInterval,
 		&agentLogEnabled,
@@ -6987,6 +7009,7 @@ WHERE id = 1
 	cfg.ClientCompatibilityMode = compatibilityMode != 0
 	cfg.EnableShortLink = enableShortLink != 0
 	cfg.EnableSubInfoNodes = enableSubInfoNodes != 0
+	cfg.SubInfoV2RayOnly = subInfoV2RayOnly != 0
 	if cfg.SubInfoExpirePrefix == "" {
 		cfg.SubInfoExpirePrefix = "📅过期时间"
 	}
@@ -7041,6 +7064,7 @@ SET proxy_groups_source_url = ?,
     client_compatibility_mode = ?,
     enable_short_link = ?,
     enable_sub_info_nodes = ?,
+	 sub_info_v2ray_only = ?,
     sub_info_expire_prefix = ?,
     sub_info_traffic_prefix = ?,
     speed_collect_interval = ?,
@@ -7146,7 +7170,7 @@ WHERE id = 1
 	}
 
 	result, err := r.db.ExecContext(ctx, updateStmt, cfg.ProxyGroupsSourceURL, compatibilityMode, enableShortLink,
-		boolToInt(cfg.EnableSubInfoNodes), subInfoExpirePrefix, subInfoTrafficPrefix,
+		boolToInt(cfg.EnableSubInfoNodes), boolToInt(cfg.SubInfoV2RayOnly), subInfoExpirePrefix, subInfoTrafficPrefix,
 		cfg.SpeedCollectInterval, cfg.TrafficCollectInterval, cfg.TrafficCheckInterval, cfg.HeartbeatInterval,
 		agentLogEnabled,
 		boolToInt(cfg.NotifyEnabled), cfg.TelegramBotToken, cfg.TelegramChatID,
@@ -7178,7 +7202,7 @@ WHERE id = 1
 	if rowsAffected == 0 {
 		const insertStmt = `
 INSERT INTO system_config (id, proxy_groups_source_url, client_compatibility_mode, enable_short_link,
-	 enable_sub_info_nodes, sub_info_expire_prefix, sub_info_traffic_prefix,
+	 enable_sub_info_nodes, sub_info_v2ray_only, sub_info_expire_prefix, sub_info_traffic_prefix,
     speed_collect_interval, traffic_collect_interval, traffic_check_interval, heartbeat_interval, agent_log_enabled,
     notify_enabled, telegram_bot_token, telegram_chat_id, notify_login, notify_subscribe_fetch,
     notify_daily_traffic, notify_server_offline, notify_server_online, notify_traffic_threshold,
@@ -7191,10 +7215,10 @@ INSERT INTO system_config (id, proxy_groups_source_url, client_compatibility_mod
     notify_package_expired, notify_user_registered, notify_telegram_bound, notify_cert_result,
     notify_agent_long_offline, notify_agent_long_offline_minutes, notify_device_limit_exceeded, notify_ip_ban,
     notify_server_renewal)
-VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 		if _, err := r.db.ExecContext(ctx, insertStmt, cfg.ProxyGroupsSourceURL, compatibilityMode, enableShortLink,
-			boolToInt(cfg.EnableSubInfoNodes), subInfoExpirePrefix, subInfoTrafficPrefix,
+			boolToInt(cfg.EnableSubInfoNodes), boolToInt(cfg.SubInfoV2RayOnly), subInfoExpirePrefix, subInfoTrafficPrefix,
 			cfg.SpeedCollectInterval, cfg.TrafficCollectInterval, cfg.TrafficCheckInterval, cfg.HeartbeatInterval, agentLogEnabled,
 			boolToInt(cfg.NotifyEnabled), cfg.TelegramBotToken, cfg.TelegramChatID,
 			boolToInt(cfg.NotifyLogin), boolToInt(cfg.NotifySubscribeFetch), boolToInt(cfg.NotifyDailyTraffic),

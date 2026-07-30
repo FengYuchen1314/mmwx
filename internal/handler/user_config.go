@@ -30,6 +30,7 @@ type userConfigRequest struct {
 	ProxyGroupsSourceURL    string   `json:"proxy_groups_source_url"`
 	ClientCompatibilityMode bool     `json:"client_compatibility_mode"` // 自动过滤客户端不兼容的节点
 	EnableSubInfoNodes      bool     `json:"enable_sub_info_nodes"`
+	SubInfoV2RayOnly        bool     `json:"sub_info_v2ray_only"`
 	SubInfoExpirePrefix     string   `json:"sub_info_expire_prefix"`
 	SubInfoTrafficPrefix    string   `json:"sub_info_traffic_prefix"`
 }
@@ -51,6 +52,7 @@ type userConfigResponse struct {
 	ProxyGroupsSourceURL    string  `json:"proxy_groups_source_url"`
 	ClientCompatibilityMode bool    `json:"client_compatibility_mode"` // 自动过滤客户端不兼容的节点
 	EnableSubInfoNodes      bool    `json:"enable_sub_info_nodes"`
+	SubInfoV2RayOnly        bool    `json:"sub_info_v2ray_only"`
 	SubInfoExpirePrefix     string  `json:"sub_info_expire_prefix"`
 	SubInfoTrafficPrefix    string  `json:"sub_info_traffic_prefix"`
 }
@@ -107,6 +109,7 @@ func handleGetUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.T
 				ProxyGroupsSourceURL:    systemConfig.ProxyGroupsSourceURL,
 				ClientCompatibilityMode: systemConfig.ClientCompatibilityMode,
 				EnableSubInfoNodes:      systemConfig.EnableSubInfoNodes,
+				SubInfoV2RayOnly:        systemConfig.SubInfoV2RayOnly,
 				SubInfoExpirePrefix:     systemConfig.SubInfoExpirePrefix,
 				SubInfoTrafficPrefix:    systemConfig.SubInfoTrafficPrefix,
 			}
@@ -143,6 +146,7 @@ func handleGetUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.T
 		ProxyGroupsSourceURL:    systemConfig.ProxyGroupsSourceURL,
 		ClientCompatibilityMode: systemConfig.ClientCompatibilityMode,
 		EnableSubInfoNodes:      systemConfig.EnableSubInfoNodes,
+		SubInfoV2RayOnly:        systemConfig.SubInfoV2RayOnly,
 		SubInfoExpirePrefix:     systemConfig.SubInfoExpirePrefix,
 		SubInfoTrafficPrefix:    systemConfig.SubInfoTrafficPrefix,
 	}
@@ -309,6 +313,7 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 	systemConfig.ProxyGroupsSourceURL = proxyGroupsSourceURL
 	systemConfig.ClientCompatibilityMode = payload.ClientCompatibilityMode
 	systemConfig.EnableSubInfoNodes = payload.EnableSubInfoNodes
+	systemConfig.SubInfoV2RayOnly = payload.SubInfoV2RayOnly
 	systemConfig.SubInfoExpirePrefix = payload.SubInfoExpirePrefix
 	systemConfig.SubInfoTrafficPrefix = payload.SubInfoTrafficPrefix
 	if err := repo.UpdateSystemConfig(r.Context(), systemConfig); err != nil {
@@ -333,6 +338,7 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		ProxyGroupsSourceURL:    proxyGroupsSourceURL,
 		ClientCompatibilityMode: payload.ClientCompatibilityMode,
 		EnableSubInfoNodes:      systemConfig.EnableSubInfoNodes,
+		SubInfoV2RayOnly:        systemConfig.SubInfoV2RayOnly,
 		SubInfoExpirePrefix:     systemConfig.SubInfoExpirePrefix,
 		SubInfoTrafficPrefix:    systemConfig.SubInfoTrafficPrefix,
 	}

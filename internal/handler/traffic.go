@@ -177,7 +177,16 @@ func (h *TrafficHandler) handleUserNodes(w http.ResponseWriter, r *http.Request)
 		return (out[i].Uplink + out[i].Downlink) > (out[j].Uplink + out[j].Downlink)
 	})
 
-	h.writeJSON(w, http.StatusOK, map[string]any{"success": true, "items": out})
+	period := map[string]any{"start": nil, "end": nil}
+	if start, end, perr := h.repo.GetUserPackagePeriod(ctx, username); perr == nil {
+		if start != nil {
+			period["start"] = start.Format("2006-01-02")
+		}
+		if end != nil {
+			period["end"] = end.Format("2006-01-02")
+		}
+	}
+	h.writeJSON(w, http.StatusOK, map[string]any{"success": true, "items": out, "package_period": period})
 }
 
 // handleNodeUsers 返回某节点上各用户的流量(节点视图 drilldown 反向用)。

@@ -661,6 +661,20 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	} else {
 		// clash 和 clashmeta 类型直接输出源文件, 不需要转换
 		// 使用子商店生产者转换订阅
+		// V2Ray 输出会在下面转换成 Base64 URI，必须在转换前把信息节点放进 Clash proxies；
+		// 转换完成后已不再是 YAML，无法沿用后面的 YAML 注入步骤。
+		if isV2RayClientType(clientType) && h.repo != nil {
+			if sysCfg, cfgErr := h.repo.GetSystemConfig(r.Context()); cfgErr == nil && sysCfg.EnableSubInfoNodes && sysCfg.SubInfoV2RayOnly {
+				totalLimit, totalUsed, expireAt := h.resolveSubscriptionTraffic(
+					r.Context(), hasSubscribeFile, subscribeFile, externalTrafficLimit, externalTrafficUsed,
+				)
+				remaining := totalLimit - totalUsed
+				if remaining < 0 {
+					remaining = 0
+				}
+				data = prependSubInfoNodesToClash(data, sysCfg, expireAt, remaining)
+			}
+		}
 		convertedData, err := h.convertSubscription(r.Context(), data, clientType)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("failed to convert subscription for client %s: %w", clientType, err))
@@ -725,7 +739,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 							fixWireGuardAllowedIPs(proxiesNode)
 							reorderProxies(proxiesNode)
 							if h.repo != nil {
-								if sysCfg, cfgErr := h.repo.GetSystemConfig(r.Context()); cfgErr == nil && sysCfg.EnableSubInfoNodes {
+								if sysCfg, cfgErr := h.repo.GetSystemConfig(r.Context()); cfgErr == nil && sysCfg.EnableSubInfoNodes && !sysCfg.SubInfoV2RayOnly {
 									remainingTraffic := totalTrafficLimit - totalTrafficUsed
 									if remainingTraffic < 0 {
 										remainingTraffic = 0
@@ -1176,6 +1190,40 @@ func createSubInfoNodes(config storage.SystemConfig, expireAt *time.Time, remain
 		}}
 	}
 	return []*yaml.Node{createNode(expireText), createNode(trafficText)}
+}
+
+func isV2RayClientType(clientType string) bool {
+	switch strings.ToLower(strings.TrimSpace(clientType)) {
+	case "v2ray", "v2rayn", "v2rayng", "v2box":
+		return true
+	}
+	return false
+}
+
+// prependSubInfoNodesToClash 在格式转换前将信息节点加入 proxies。
+// 解析失败时保持原订阅，避免信息展示功能影响正常订阅下发。
+func prependSubInfoNodesToClash(data []byte, config storage.SystemConfig, expireAt *time.Time, remainingTraffic int64) []byte {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil || len(doc.Content) == 0 {
+		return data
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return data
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "proxies" || root.Content[i+1].Kind != yaml.SequenceNode {
+			continue
+		}
+		proxies := root.Content[i+1]
+		proxies.Content = append(createSubInfoNodes(config, expireAt, remainingTraffic), proxies.Content...)
+		out, err := yaml.Marshal(&doc)
+		if err == nil {
+			return out
+		}
+		return data
+	}
+	return data
 }
 
 func formatSubInfoTraffic(value int64) string {
