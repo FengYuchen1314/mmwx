@@ -3,7 +3,24 @@ package handler
 import (
 	"strings"
 	"testing"
+
+	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 )
+
+func TestNormalizeSnellVersionForSurgeProducer(t *testing.T) {
+	proxy := substore.Proxy{
+		"name": "snell-v6", "type": "snell", "server": "1.2.3.4",
+		"port": float64(443), "psk": "secret", "version": float64(6),
+	}
+	normalizeSurgeProxyNumbers(proxy)
+	line, err := substore.NewSurgeProducer().ProduceOne(proxy, "", nil)
+	if err != nil {
+		t.Fatalf("ProduceOne: %v", err)
+	}
+	if !strings.Contains(line, "version=6") || strings.Contains(line, "%!") {
+		t.Fatalf("Snell version 类型未正确归一: %s", line)
+	}
+}
 
 // mihomo 遇 snell v6 是整份配置拒载,过滤器须同时删节点与组引用,且不误伤 v4/v5。
 func TestFilterSnellV6FromClashYAML(t *testing.T) {

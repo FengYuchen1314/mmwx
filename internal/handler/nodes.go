@@ -1220,7 +1220,9 @@ func (h *nodesHandler) handleNodeURI(w http.ResponseWriter, r *http.Request, idS
 	// snell 是 Surge 私有协议,没有标准分享 URI(URIProducer 对它走 default 直接跳过、产出空串)。
 	// 其唯一能被客户端(Surge/小火箭)识别的分享文本是配置行,故改用 Surge producer 输出配置行。
 	if proxyType == "snell" {
-		line, serr := substore.NewSurgeProducer().ProduceOne(substore.Proxy(m), "", nil)
+		proxy := substore.Proxy(m)
+		normalizeSurgeProxyNumbers(proxy)
+		line, serr := substore.NewSurgeProducer().ProduceOne(proxy, "", nil)
 		if serr != nil || strings.TrimSpace(line) == "" {
 			writeError(w, http.StatusUnprocessableEntity, fmt.Errorf("生成 snell 配置行失败: %v", serr))
 			return
