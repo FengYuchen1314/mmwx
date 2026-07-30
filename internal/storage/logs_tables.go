@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -220,6 +221,31 @@ func (r *TrafficRepository) InsertTaskRun(ctx context.Context, taskName string, 
 	_, err := r.db.ExecContext(ctx,
 		`INSERT INTO task_runs (task_name, started_at, duration_ms, status, detail) VALUES (?, ?, ?, ?, ?)`,
 		taskName, startedAt, durationMs, status, detail)
+	return err
+}
+
+// StartTaskRun 插入一条运行中记录并返回 ID，供耗时任务在开始时立即出现在日志页面。
+func (r *TrafficRepository) StartTaskRun(ctx context.Context, taskName, detail string) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	res, err := r.db.ExecContext(ctx,
+		`INSERT INTO task_runs (task_name, started_at, duration_ms, status, detail) VALUES (?, ?, 0, 'running', ?)`,
+		taskName, time.Now(), detail)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// FinishTaskRun 原地完成一条运行中记录。
+func (r *TrafficRepository) FinishTaskRun(ctx context.Context, id int64, durationMs int64, status, detail string) error {
+	if r == nil || r.db == nil || id <= 0 {
+		return nil
+	}
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE task_runs SET duration_ms = ?, status = ?, detail = ? WHERE id = ?`,
+		durationMs, status, detail, id)
 	return err
 }
 

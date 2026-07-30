@@ -4057,12 +4057,14 @@ func (h *RemoteManageHandler) addStreamSettings(proxy map[string]interface{}, st
 			if fp, ok := tlsSettings["fingerprint"].(string); ok && fp != "" {
 				proxy["client-fingerprint"] = fp
 			}
-			// 反查 xray → clash:客户端不支持 pinnedPeerCertSha256,只能退化到 skip-cert-verify。
-			// - pinnedPeerCertSha256 非空 → skip-cert-verify=true(客户端宽松,但服务端仍精确锁证书)
-			// - allowInsecure(老数据兼容)→ 同上
+			// 反查 xray → clash:保留证书 SHA-256，后续 URI producer 会输出 pcs/pinSHA256。
+			// 老 allowInsecure 数据仍映射为 skip-cert-verify，等待补全任务取得真实指纹。
 			pinned, _ := tlsSettings["pinnedPeerCertSha256"].(string)
 			allowInsecure, _ := tlsSettings["allowInsecure"].(bool)
-			if strings.TrimSpace(pinned) != "" || allowInsecure {
+			if pinned = strings.TrimSpace(pinned); pinned != "" {
+				proxy["tls-fingerprint"] = pinned
+				proxy["skip-cert-verify"] = true
+			} else if allowInsecure {
 				proxy["skip-cert-verify"] = true
 			} else {
 				proxy["skip-cert-verify"] = false

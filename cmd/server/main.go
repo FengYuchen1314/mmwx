@@ -136,6 +136,7 @@ func main() {
 		"traffic_collector": 5 * time.Minute,
 		"speed_collector":   5 * time.Minute,
 	}))
+	go startTaskRunCleanup(context.Background(), repo)
 
 	addr := getAddr(config, repo)
 
@@ -566,6 +567,10 @@ func main() {
 	// 在 xray 里不存在(TCPing 通但连不上);以及 agent 重装 / 配置回滚等漂移。
 	// 与上面的 cleaner 方向相反、互补;补发用 DB 原凭据,订阅 UUID 不变。
 	handler.NewInboundClientReconciler(repo, remoteManageHandler).Start(context.Background())
+
+	// 启动后补全存量 TLS 节点的服务端证书 SHA-256，随后每天刷新一次以跟进证书续期。
+	// 每次运行写入 task_runs，可在日志管理 → 定时任务中查看详情。
+	handler.NewNodeTLSFingerprintBackfiller(repo).Start(context.Background(), 2*time.Minute)
 
 	// 依赖 limiterPusher 的端点
 	packageUpdateHandler := handler.NewPackageUpdateHandler(repo, remoteManageHandler, limiterPusher)
@@ -1852,5 +1857,31 @@ func startLogCleanup() {
 
 	for range ticker.C {
 		runCleanup()
+	}
+}
+
+// startTaskRunCleanup 只保留最近两天的定时任务运行记录。
+// 启动时立即清理，之后每小时巡检，避免长期运行时 task_runs 持续增长。
+func startTaskRunCleanup(ctx context.Context, repo *storage.TrafficRepository) {
+	cleanup := func() {
+		deleted, err := repo.DeleteOldTaskRuns(ctx, time.Now().Add(-48*time.Hour))
+		if err != nil {
+			logger.Error("[定时任务日志] 清理过期记录失败", "error", err)
+			return
+		}
+		if deleted > 0 {
+			logger.Info("[定时任务日志] 已清理两天前的记录", "count", deleted)
+		}
+	}
+	cleanup()
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanup()
+		}
 	}
 }

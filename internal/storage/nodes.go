@@ -213,6 +213,32 @@ func (r *TrafficRepository) ListNodes(ctx context.Context, username string) ([]N
 	return nodes, nil
 }
 
+// UpdateNodeProxyConfigs 原子更新节点的解析配置与 Clash 配置。
+// 供证书指纹等后台修复任务使用，避免调用 UpdateNode 时用扫描到的旧 Node 覆盖用户并发修改的
+// 名称、标签、中转等无关字段。
+func (r *TrafficRepository) UpdateNodeProxyConfigs(ctx context.Context, id int64, parsedConfig, clashConfig string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if id <= 0 {
+		return errors.New("node id is required")
+	}
+	res, err := r.db.ExecContext(ctx, `UPDATE nodes
+		SET parsed_config = ?, clash_config = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?`, parsedConfig, clashConfig, id)
+	if err != nil {
+		return fmt.Errorf("update node proxy configs: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("node proxy configs rows affected: %w", err)
+	}
+	if affected == 0 {
+		return ErrNodeNotFound
+	}
+	return nil
+}
+
 func (r *TrafficRepository) CountNodes(ctx context.Context) (int64, error) {
 	if r == nil || r.db == nil {
 		return 0, errors.New("traffic repository not initialized")

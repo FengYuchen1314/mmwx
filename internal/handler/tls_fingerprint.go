@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -14,6 +16,19 @@ import (
 
 	xtls "github.com/xtls/xray-core/transport/internet/tls"
 )
+
+// certPEMSha256 返回 PEM 中第一张（叶）证书的 DER SHA-256。
+func certPEMSha256(certPEM string) (string, error) {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return "", errors.New("certificate PEM not found")
+	}
+	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		return "", fmt.Errorf("parse certificate: %w", err)
+	}
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:]), nil
+}
 
 // fetchPeerCertSha256 对 address:port 做 TLS handshake,返回第一张 peer cert 的 SHA256(hex)。
 //

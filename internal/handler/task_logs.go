@@ -8,8 +8,9 @@ import (
 )
 
 // TaskLogHandler 提供定时任务运行记录查询，admin 专用。
-//   GET /api/admin/tasks/runs?task=&status=&limit=&offset=  运行记录（后端分页）
-//   GET /api/admin/tasks/types                              任务类型清单（下拉筛选用）
+//
+//	GET /api/admin/tasks/runs?task=&status=&limit=&offset=  运行记录（后端分页）
+//	GET /api/admin/tasks/types                              任务类型清单（下拉筛选用）
 type TaskLogHandler struct {
 	repo *storage.TrafficRepository
 }
@@ -24,7 +25,7 @@ type taskType struct {
 	Label string `json:"label"`
 }
 
-// 与各任务 taskrun.Record 里传的机器名一一对应（8 个真·周期任务）。
+// 与各任务 taskrun.Record 里传的机器名一一对应。
 var taskTypes = []taskType{
 	{"traffic_collector", "流量采集"},
 	{"speed_collector", "测速采集"},
@@ -34,6 +35,7 @@ var taskTypes = []taskType{
 	{"notify_daily_traffic", "每日流量推送"},
 	{"ddns_reconciler", "DDNS 重试"},
 	{"cert_renewal", "证书续期"},
+	{"node_tls_fingerprint_backfill", "节点证书指纹补全"},
 }
 
 func (h *TaskLogHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
