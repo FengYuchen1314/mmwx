@@ -848,6 +848,7 @@ func main() {
 	systemSettingsHandler := handler.NewSystemSettingsHandler(repo, cryptoConfig)
 	systemSettingsHandler.SetCollector(trafficCollector)
 	systemSettingsHandler.SetWSHandler(remoteWSHandler)
+	systemSettingsHandler.SetOnMasterURLChanged(remoteManageHandler.BroadcastMasterURLUpdate)
 	// 启动时加载加密设置
 	if encVal, _ := repo.GetSystemSetting(context.Background(), "require_encryption"); encVal == "true" {
 		cryptoConfig.SetRequireEncryption(true)
@@ -1185,6 +1186,7 @@ func main() {
 	remoteWSHandler.SetScanResultHandler(remoteManageHandler.HandleScanResult)
 	remoteWSHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
 	remoteWSHandler.SetMasterProxyDeployer(remoteManageHandler.DeployMasterProxyByID)
+	remoteWSHandler.SetMasterURLSyncCallback(remoteManageHandler.SyncMasterURLOnReconnect)
 	mux.Handle("/api/admin/certificates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListCertificates)))
 	mux.Handle("/api/admin/certificates/valid", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListValidCertificates)))
 	mux.Handle("/api/admin/certificates/self-signed", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.GenerateSelfSignedCert)))

@@ -1265,7 +1265,59 @@ func (h *RemoteManageHandler) ForwardToServer(ctx context.Context, serverID int6
 	return h.forwardToRemoteServer(ctx, serverID, method, path, body)
 }
 
-// BroadcastMasterURLUpdate 向所有已连接的非本机 agent 推送新的 master_url。
+// syncMasterURLToAgent 校准单台 Agent 的回连地址。同机 Agent 必须保留
+// 127.0.0.1:主控端口，联邦服务器则属于其它主控，两者都不能改写。
+func (h *RemoteManageHandler) syncMasterURLToAgent(ctx context.Context, server *storage.RemoteServer, newMasterURL string) error {
+	if server == nil || server.IsFederated || server.SameHostAsMaster ||
+		server.IPAddress == "127.0.0.1" || server.IPAddress == "::1" {
+		return nil
+	}
+	payload, _ := json.Marshal(map[string]string{"master_url": newMasterURL})
+	resp, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/agent/update-master-url", payload)
+	if err != nil {
+		return err
+	}
+	log.Printf("[MasterURLSync] Server %d (%s): %s", server.ID, server.Name, string(resp))
+	return nil
+}
+
+// redeployMasterDomainOnSameHost 重建同机偷自己服务器的 Xray 高优先级路由、
+// 新主控域名证书与 Nginx 反代。两步分别执行，便于日志精确呈现缺证书等问题。
+func (h *RemoteManageHandler) redeployMasterDomainOnSameHost(ctx context.Context, server *storage.RemoteServer) {
+	if server == nil || server.IsFederated || !server.SameHostAsMaster || !server.Use443 {
+		return
+	}
+	if err := h.DeployStealSelfConfig(ctx, server.ID); err != nil {
+		log.Printf("[MasterURLSync] Server %d (%s): refresh steal-self/Xray config failed: %v", server.ID, server.Name, err)
+	}
+	if err := h.DeployMasterProxyByID(ctx, server.ID); err != nil {
+		log.Printf("[MasterURLSync] Server %d (%s): deploy master domain proxy failed: %v", server.ID, server.Name, err)
+		return
+	}
+	log.Printf("[MasterURLSync] Server %d (%s): master domain proxy refreshed", server.ID, server.Name)
+}
+
+// SyncMasterURLOnReconnect 在 Agent 每次认证后补发最新地址。pending 首连的
+// 偷自己配置由 handleAuth 中的安装就绪重试串行处理，避免两路覆盖同一配置。
+func (h *RemoteManageHandler) SyncMasterURLOnReconnect(ctx context.Context, serverID int64, prevStatus string) {
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	if err != nil || server.IsFederated {
+		return
+	}
+	masterURL, _ := h.repo.GetSystemSetting(ctx, "master_url")
+	masterURL = strings.TrimRight(strings.TrimSpace(masterURL), "/")
+	if masterURL != "" {
+		if err := h.syncMasterURLToAgent(ctx, server, masterURL); err != nil {
+			log.Printf("[MasterURLSync] Server %d (%s) reconnect sync failed: %v", server.ID, server.Name, err)
+		}
+	}
+	if prevStatus != "pending" {
+		h.redeployMasterDomainOnSameHost(ctx, server)
+	}
+}
+
+// BroadcastMasterURLUpdate 向所有已连接的 agent 推送新的 master_url，并重建
+// 同机偷自己服务器上的新主控域名反代。离线服务器由重连回调补发。
 func (h *RemoteManageHandler) BroadcastMasterURLUpdate(ctx context.Context, newMasterURL string) {
 	servers, err := h.repo.ListRemoteServers(ctx)
 	if err != nil {
@@ -1273,22 +1325,15 @@ func (h *RemoteManageHandler) BroadcastMasterURLUpdate(ctx context.Context, newM
 		return
 	}
 
-	payload, _ := json.Marshal(map[string]string{"master_url": newMasterURL})
-
 	for _, s := range servers {
-		if s.Status != "connected" {
+		if s.Status != "connected" || s.IsFederated {
 			continue
 		}
-		// 跳过本机 agent（偷自己场景，master_url 为 127.0.0.1）
-		if s.IPAddress == "127.0.0.1" || s.IPAddress == "::1" {
-			continue
-		}
-		resp, err := h.forwardToRemoteServer(ctx, s.ID, http.MethodPost, "/api/child/agent/update-master-url", payload)
-		if err != nil {
+		server := s
+		if err := h.syncMasterURLToAgent(ctx, &server, newMasterURL); err != nil {
 			log.Printf("[BroadcastMasterURL] Server %d (%s): failed: %v", s.ID, s.Name, err)
-			continue
 		}
-		log.Printf("[BroadcastMasterURL] Server %d (%s): %s", s.ID, s.Name, string(resp))
+		h.redeployMasterDomainOnSameHost(ctx, &server)
 	}
 }
 

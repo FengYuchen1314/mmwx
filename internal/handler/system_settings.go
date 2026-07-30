@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,10 +17,11 @@ import (
 )
 
 type SystemSettingsHandler struct {
-	repo      *storage.TrafficRepository
-	crypto    *CryptoConfig
-	collector *traffic.Collector // 可选,SetIntervals 时调 hot-reload ticker;nil 时仅落库
-	wsHandler *RemoteWSHandler   // 可选,SetDashboardRefresh 后广播 config_update 给所有 WS-mode agent
+	repo               *storage.TrafficRepository
+	crypto             *CryptoConfig
+	collector          *traffic.Collector // 可选,SetIntervals 时调 hot-reload ticker;nil 时仅落库
+	wsHandler          *RemoteWSHandler   // 可选,SetDashboardRefresh 后广播 config_update 给所有 WS-mode agent
+	onMasterURLChanged func(ctx context.Context, newURL string)
 }
 
 func NewSystemSettingsHandler(repo *storage.TrafficRepository, crypto *CryptoConfig) *SystemSettingsHandler {
@@ -32,6 +34,11 @@ func (h *SystemSettingsHandler) SetCollector(c *traffic.Collector) { h.collector
 
 // SetWSHandler 注入 WS handler 让 SetDashboardRefresh 后向所有 agent 广播 config_update。
 func (h *SystemSettingsHandler) SetWSHandler(ws *RemoteWSHandler) { h.wsHandler = ws }
+
+// SetOnMasterURLChanged 注入主控地址变更后的 Agent 同步器。
+func (h *SystemSettingsHandler) SetOnMasterURLChanged(fn func(ctx context.Context, newURL string)) {
+	h.onMasterURLChanged = fn
+}
 
 type GetAPITokenResponse struct {
 	Success bool   `json:"success"`
@@ -140,11 +147,16 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 	}
 
 	if req.MasterURL != nil {
-		if err := h.repo.SetSystemSetting(r.Context(), "master_url", *req.MasterURL); err != nil {
+		newMasterURL := strings.TrimRight(strings.TrimSpace(*req.MasterURL), "/")
+		oldMasterURL, _ := h.repo.GetSystemSetting(r.Context(), "master_url")
+		if err := h.repo.SetSystemSetting(r.Context(), "master_url", newMasterURL); err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "保存失败"})
 			return
+		}
+		if h.onMasterURLChanged != nil && strings.TrimRight(strings.TrimSpace(oldMasterURL), "/") != newMasterURL {
+			go h.onMasterURLChanged(context.Background(), newMasterURL)
 		}
 	}
 	if req.LocalOnly != nil {

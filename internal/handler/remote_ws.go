@@ -349,6 +349,9 @@ type RemoteWSHandler struct {
 	// xrayModeCorrectCallback 在 auth 成功后异步触发,校正 embedded→external 漂移(agent 上报的实际 mode)。
 	// 实现见 RemoteManageHandler.CorrectXrayModeDrift。老 agent 不上报 mode → agentMode 空 → 跳过。
 	xrayModeCorrectCallback func(ctx context.Context, serverID int64, agentMode string)
+	// masterURLSyncCallback 在 Agent 上线后校准回连地址及同机主控反代配置。
+	// 这使修改主控地址时离线的 Agent 也能在重连后补发。
+	masterURLSyncCallback func(ctx context.Context, serverID int64, prevStatus string)
 	// authFailIPs 记录最近 auth 失败的 IP,用于"狂连"场景的 backoff:
 	//   - 同 IP 在 cooldown 内的连接直接拒绝 upgrade(节省 CPU 与日志)
 	//   - 同 IP 的失败日志按窗口聚合,防止刷屏
@@ -1217,6 +1220,10 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 		go h.xrayModeCorrectCallback(context.Background(), server.ID, authPayload.XrayMode)
 	}
 
+	if h.masterURLSyncCallback != nil {
+		go h.masterURLSyncCallback(context.Background(), server.ID, server.Status)
+	}
+
 	// 在第一次连接时自动部署窃取配置（服务器处于挂起状态）。同机 Agent 使用的域名
 	// 就是主控域名时，再顺序部署主控反代。必须等偷自己配置完成后再做，二者都会写
 	// servers/{domain}.conf，并发下发会让最后完成的一方随机覆盖另一方。
@@ -1780,6 +1787,11 @@ func (h *RemoteWSHandler) SetStealSelfDeployer(deployer func(ctx context.Context
 // SetMasterProxyDeployer 注入同机 Agent 的主控反代部署器。
 func (h *RemoteWSHandler) SetMasterProxyDeployer(deployer func(ctx context.Context, serverID int64) error) {
 	h.masterProxyDeployer = deployer
+}
+
+// SetMasterURLSyncCallback 注入 Agent 上线时的主控地址闭环同步。
+func (h *RemoteWSHandler) SetMasterURLSyncCallback(cb func(ctx context.Context, serverID int64, prevStatus string)) {
+	h.masterURLSyncCallback = cb
 }
 
 func shouldAutoProxyMaster(server *storage.RemoteServer, sameHostAsMaster bool, masterDomain string) bool {

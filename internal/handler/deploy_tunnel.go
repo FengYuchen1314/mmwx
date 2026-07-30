@@ -66,7 +66,7 @@ func (h *RemoteManageHandler) deployTunnelConfig(ctx context.Context, server *st
 	}
 
 	// 同机部署时，主控域名路由到 nginx，否则主控 HTTPS 不可达
-	if server.IPAddress == "127.0.0.1" {
+	if server.IPAddress == "127.0.0.1" || server.IPAddress == "::1" || server.SameHostAsMaster {
 		if masterDomain := getDomainFromMasterURL(h.repo, ctx); masterDomain != "" && masterDomain != domain {
 			h.addWebsiteTunnelConfig(xrayConfig, masterDomain)
 		}
