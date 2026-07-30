@@ -207,3 +207,30 @@ func TestNormalizeConfigEmojiIconCanUseEitherOne(t *testing.T) {
 		t.Fatalf("expected only-icon item to fill emoji from icon, got emoji=%q icon=%q", got[1].Emoji, got[1].Icon)
 	}
 }
+
+func TestNormalizeConfigMergesDuplicateCategoryAndGroup(t *testing.T) {
+	input := []byte(`[
+		{"name":"social","label":"社交媒体","emoji":"🌐","site_rules":[{"key":"facebook"},{"key":"tiktok"}]},
+		{"name":"social","label":"Tiktok","emoji":"🎶","site_rules":[{"key":"tiktok"}]},
+		{"name":"tiktok","label":"Tiktok","emoji":"🎶","site_rules":[{"key":"tiktok"}]},
+		{"name":"tiktok-copy","label":"Tiktok","emoji":"🎶","site_rules":[{"key":"tiktok-extra"}]}
+	]`)
+
+	normalized, err := NormalizeConfig(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []ProxyGroupCategory
+	if err := json.Unmarshal(normalized, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected social and tiktok only, got %#v", got)
+	}
+	if got[0].Name != "social" || len(got[0].SiteRules) != 2 {
+		t.Fatalf("duplicate social should merge without repeating tiktok: %#v", got[0])
+	}
+	if got[1].Name != "tiktok" || len(got[1].SiteRules) != 2 {
+		t.Fatalf("duplicate Tiktok group should merge its rules: %#v", got[1])
+	}
+}

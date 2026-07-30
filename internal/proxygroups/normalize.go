@@ -54,12 +54,88 @@ func NormalizeConfig(data []byte) ([]byte, error) {
 	for i := range categories {
 		normalizeCategory(&categories[i])
 	}
+	categories = mergeDuplicateCategories(categories)
 
 	normalized, err := json.Marshal(categories)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
 	return normalized, nil
+}
+
+// mergeDuplicateCategories 合并重复的分类标识或最终代理组名称。
+// 部分历史 proxy-groups-lite.json 曾把 Tiktok 误写成 name=social，导致前端两个复选框
+// 共用同一个选中键；另一些自定义源可能用不同 name 生成相同 group_label，最终产生重复代理组。
+// 保留首次出现分类的展示信息，并合并后续分类的规则与 presets，既避免重复又不丢规则。
+func mergeDuplicateCategories(categories []ProxyGroupCategory) []ProxyGroupCategory {
+	result := make([]ProxyGroupCategory, 0, len(categories))
+	byName := make(map[string]int, len(categories))
+	byGroup := make(map[string]int, len(categories))
+	for _, category := range categories {
+		nameKey := strings.ToLower(category.Name)
+		groupKey := strings.ToLower(category.GroupLabel)
+		index, duplicateName := byName[nameKey]
+		duplicate := duplicateName
+		if !duplicateName && groupKey != "" {
+			index, duplicate = byGroup[groupKey]
+		}
+		if duplicate {
+			mergeCategory(&result[index], category)
+			if nameKey != "" {
+				byName[nameKey] = index
+			}
+			// name 重复通常意味着后续条目写错了标识（历史 Tiktok/name=social 即如此），
+			// 不要把它不同的 group_label 也绑定到原分类，否则会吞掉后面的正确 Tiktok 分类。
+			if !duplicateName && groupKey != "" {
+				byGroup[groupKey] = index
+			}
+			continue
+		}
+		index = len(result)
+		result = append(result, category)
+		if nameKey != "" {
+			byName[nameKey] = index
+		}
+		if groupKey != "" {
+			byGroup[groupKey] = index
+		}
+	}
+	return result
+}
+
+func mergeCategory(target *ProxyGroupCategory, source ProxyGroupCategory) {
+	target.Presets = appendUniqueStrings(target.Presets, source.Presets...)
+	target.SiteRules = appendUniqueRules(target.SiteRules, source.SiteRules...)
+	target.IPRules = appendUniqueRules(target.IPRules, source.IPRules...)
+}
+
+func appendUniqueStrings(values []string, additions ...string) []string {
+	seen := make(map[string]bool, len(values)+len(additions))
+	for _, value := range values {
+		seen[value] = true
+	}
+	for _, value := range additions {
+		if !seen[value] {
+			values = append(values, value)
+			seen[value] = true
+		}
+	}
+	return values
+}
+
+func appendUniqueRules(rules []RuleProviderConfig, additions ...RuleProviderConfig) []RuleProviderConfig {
+	seen := make(map[string]bool, len(rules)+len(additions))
+	for _, rule := range rules {
+		seen[rule.Key+"\x00"+rule.Behavior] = true
+	}
+	for _, rule := range additions {
+		key := rule.Key + "\x00" + rule.Behavior
+		if !seen[key] {
+			rules = append(rules, rule)
+			seen[key] = true
+		}
+	}
+	return rules
 }
 
 func normalizeCategory(category *ProxyGroupCategory) {
