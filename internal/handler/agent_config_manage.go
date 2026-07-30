@@ -172,6 +172,28 @@ type RemoteServerUpdateRequest struct {
 	DDNSProviderID int64 `json:"ddns_provider_id"`
 }
 
+// followLinkedServerDomain 保留“地址与域名原本是同一值”的关联关系。
+// 独立配置的 domain 不会被 pull_address 覆盖。
+func followLinkedServerDomain(oldServer *storage.RemoteServer, req *RemoteServerUpdateRequest) {
+	if oldServer == nil || req == nil {
+		return
+	}
+	oldAddress := strings.TrimSpace(oldServer.PullAddress)
+	newAddress := strings.TrimSpace(req.PullAddress)
+	oldDomain := strings.TrimSpace(oldServer.Domain)
+	submittedDomain := strings.TrimSpace(req.Domain)
+	if oldAddress == "" || newAddress == "" || oldAddress == newAddress ||
+		oldDomain == "" || oldDomain != oldAddress || submittedDomain != oldDomain {
+		return
+	}
+	// IP 不能写进 domain；从域名改为 IP 时清空跟随域名，后续回落到实时 IP。
+	if net.ParseIP(newAddress) != nil {
+		req.Domain = ""
+		return
+	}
+	req.Domain = newAddress
+}
+
 // 生成加密安全令牌
 func generateSecureToken() (string, error) {
 	b := make([]byte, 32)
@@ -931,6 +953,12 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
+	oldNodeHost := chooseClashServerHost(oldServer)
+
+	// 表单中“服务器地址”(pull_address)和“服务器域名”(domain)历史上是两个字段。
+	// 当 domain 原本就跟随 pull_address 时，用户只修改地址应把这对关联值一起迁移；
+	// 否则旧 domain 会因 chooseClashServerHost 的优先级继续覆盖新地址。
+	followLinkedServerDomain(oldServer, &req)
 
 	// 内联(embedded)Xray 不再要求许可证,update 路径同样放开(与创建保持一致)。
 
@@ -1021,29 +1049,6 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
-	// 锁定入口 IP 变更时,立即把已存在节点的 clash server 校正到锁定后的 effective host。
-	// 放在 pull_address 落库之后:确保 GetRemoteServer 读到的是本次刚写入的新地址,
-	// 否则"同时改服务器地址 + 勾锁定"会刷到旧地址。不触发时(req.LockEntryIP==nil)跳过,
-	// 保持与旧行为一致 —— 只有前端明确提交了锁定开关才动节点地址。
-	if req.LockEntryIP != nil {
-		if latest, gerr := h.repo.GetRemoteServer(ctx, req.ID); gerr == nil && latest != nil {
-			if host := chooseClashServerHost(latest); host != "" {
-				if n, e := h.repo.RefreshNodesServerAddress(ctx, latest.Name, host); e != nil {
-					log.Printf("[Remote Server] lock-entry v4 refresh for %s failed: %v", latest.Name, e)
-				} else if n > 0 {
-					log.Printf("[Remote Server] lock-entry: refreshed %d node(s) clash.server → %s for %s", n, host, latest.Name)
-				}
-			}
-			if v6 := v6RefreshTarget(latest); v6 != "" {
-				if n, e := h.repo.RefreshNodesServerAddressV6(ctx, latest.Name, v6); e != nil {
-					log.Printf("[Remote Server] lock-entry v6 refresh for %s failed: %v", latest.Name, e)
-				} else if n > 0 {
-					log.Printf("[Remote Server] lock-entry: refreshed %d v6 node(s) clash.server → %s for %s", n, v6, latest.Name)
-				}
-			}
-		}
-	}
-
 	// 如果服务器名称变更，同步更新关联的节点
 	if oldServer.Name != req.Name {
 		if updated, err := h.repo.UpdateNodesByServerName(ctx, oldServer.Name, req.Name); err != nil {
@@ -1053,24 +1058,21 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
-	// 域名变更同步刷新该服务器下所有节点 clash_config.server。
-	// Domain 优先于 IP(动态 IP 场景下域名稳定),空 Domain 时回退到 IPAddress。
-	newDomain := strings.TrimSpace(req.Domain)
-	oldDomain := strings.TrimSpace(oldServer.Domain)
-	if newDomain != oldDomain {
-		addr := newDomain
-		if addr == "" {
-			addr = oldServer.IPAddress
+	// 后端权威比较修改前后的“实际节点入口”，不再依赖旧前端是否顺带
+	// lock_entry_ip。pull_address / domain / lock 任一改变了有效入口，都立即刷新关联节点。
+	if latest, gerr := h.repo.GetRemoteServer(ctx, req.ID); gerr != nil {
+		log.Printf("[Remote Server] reload server %d for node address refresh failed: %v", req.ID, gerr)
+	} else if newNodeHost := chooseClashServerHost(latest); newNodeHost != "" && newNodeHost != oldNodeHost {
+		if n, e := h.repo.RefreshNodesServerAddress(ctx, latest.Name, newNodeHost); e != nil {
+			log.Printf("[Remote Server] refresh node address for %s failed: %v", latest.Name, e)
+		} else {
+			log.Printf("[Remote Server] refreshed %d node(s) clash.server: %s → %s for %s", n, oldNodeHost, newNodeHost, latest.Name)
 		}
-		if addr != "" {
-			finalName := req.Name
-			if finalName == "" {
-				finalName = oldServer.Name
-			}
-			if n, err := h.repo.RefreshNodesServerAddress(ctx, finalName, addr); err != nil {
-				log.Printf("[Remote Server] Refresh nodes server address failed for %s: %v", finalName, err)
+		if v6 := v6RefreshTarget(latest); v6 != "" {
+			if n, e := h.repo.RefreshNodesServerAddressV6(ctx, latest.Name, v6); e != nil {
+				log.Printf("[Remote Server] refresh v6 nodes for %s failed: %v", latest.Name, e)
 			} else if n > 0 {
-				log.Printf("[Remote Server] Refreshed %d node(s) server address → %s after domain change on %s", n, addr, finalName)
+				log.Printf("[Remote Server] refreshed %d v6 node(s) clash.server → %s for %s", n, v6, latest.Name)
 			}
 		}
 	}

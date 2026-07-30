@@ -1283,11 +1283,21 @@ func (h *RemoteManageHandler) syncMasterURLToAgent(ctx context.Context, server *
 
 // redeployMasterDomainOnSameHost 重建同机偷自己服务器的 Xray 高优先级路由、
 // 新主控域名证书与 Nginx 反代。两步分别执行，便于日志精确呈现缺证书等问题。
+//
+// 这是自动路径(域名广播 / agent 重连触发),不是用户主动点击。fallback/tunnel 模式的
+// steal-self 配置与主控域名强绑定,切域名后必须重下发;但 default/空模式 DeployStealSelfConfig
+// dispatch 到的是**无保护强制覆盖** deployDefaultConfigManual,会把 agent 已有的业务配置
+// (inbound/outbound/routing)覆盖成内嵌默认模板。故 default 模式下先探测 agent 是否已有用户内容,
+// 有则跳过配置下发、只重建反代——避免"切换主控域名后 agent 已有配置被默认配置覆盖"。
+// 全新装机 agent 无用户内容 → serverHasXrayContent 返回 false → 仍会正常下发默认模板初始化。
 func (h *RemoteManageHandler) redeployMasterDomainOnSameHost(ctx context.Context, server *storage.RemoteServer) {
 	if server == nil || server.IsFederated || !server.SameHostAsMaster || !server.Use443 {
 		return
 	}
-	if err := h.DeployStealSelfConfig(ctx, server.ID); err != nil {
+	isDefaultMode := server.StealMode == "" || server.StealMode == "default"
+	if isDefaultMode && h.serverHasXrayContent(ctx, server.ID) {
+		log.Printf("[MasterURLSync] Server %d (%s): default steal mode & agent already has xray content, skip config redeploy (only refresh proxy)", server.ID, server.Name)
+	} else if err := h.DeployStealSelfConfig(ctx, server.ID); err != nil {
 		log.Printf("[MasterURLSync] Server %d (%s): refresh steal-self/Xray config failed: %v", server.ID, server.Name, err)
 	}
 	if err := h.DeployMasterProxyByID(ctx, server.ID); err != nil {
