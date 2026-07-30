@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"miaomiaowux/internal/acme"
@@ -37,11 +38,13 @@ func certDeployPaths(domain, dir string) (certPath, keyPath string) {
 }
 
 type CertificateHandler struct {
-	repo                *storage.TrafficRepository
-	wsHandler           *RemoteWSHandler
-	acmeClient          *acme.Client
-	onMasterURLChanged  func(ctx context.Context, newURL string)
-	remoteManage        *RemoteManageHandler // 联邦(分享)服务器证书下发时,复用其 ForwardToAgent 走拥有方主控
+	repo               *storage.TrafficRepository
+	wsHandler          *RemoteWSHandler
+	acmeClient         *acme.Client
+	onMasterURLChanged func(ctx context.Context, newURL string)
+	remoteManage       *RemoteManageHandler // 联邦(分享)服务器证书下发时,复用其 ForwardToAgent 走拥有方主控
+	xrayCertSyncMu     sync.Mutex
+	xrayCertSynced     sync.Map // "serverID:certID" -> 证书内容指纹
 }
 
 func (h *CertificateHandler) SetOnMasterURLChanged(fn func(ctx context.Context, newURL string)) {
@@ -404,6 +407,7 @@ func (h *CertificateHandler) requestLocalCertificate(cert *storage.Certificate) 
 		log.Printf("[Certificate] UpdateCertificateIssued failed for %s: %v", cert.Domain, err)
 		return
 	}
+	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
 
 	log.Printf("[Certificate] Successfully issued certificate for %s, expires %s", cert.Domain, result.ExpiryDate.Format("2006-01-02"))
 	SendCertResultNotification(ctx, cert.Domain, true, fmt.Sprintf("有效期至 %s", result.ExpiryDate.Format("2006-01-02")))
@@ -557,6 +561,7 @@ func (h *CertificateHandler) renewLocalCertificate(cert *storage.Certificate) {
 		log.Printf("[Certificate] UpdateCertificateIssued failed for %s: %v", cert.Domain, err)
 		return
 	}
+	h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
 
 	log.Printf("[Certificate] Successfully renewed certificate for %s, expires %s", cert.Domain, result.ExpiryDate.Format("2006-01-02"))
 
@@ -934,6 +939,10 @@ func (h *CertificateHandler) DeployCertToServerSync(ctx context.Context, server 
 	name := certDeployFilename(cert.Domain)
 	certPath := "/usr/local/etc/xray/certs/" + name + ".pem"
 	keyPath := "/usr/local/etc/xray/certs/" + name + ".key"
+	deployed := func() (string, string, error) {
+		h.rememberXrayCertSync(server.ID, cert)
+		return certPath, keyPath, nil
+	}
 	payload := WSCertDeployPayload{
 		Domain:   cert.Domain,
 		CertPEM:  cert.CertPEM,
@@ -953,7 +962,7 @@ func (h *CertificateHandler) DeployCertToServerSync(ctx context.Context, server 
 			return "", "", err
 		}
 		log.Printf("[Certificate] Sync cert_deploy via federation to %s for %s", server.Name, payload.Domain)
-		return certPath, keyPath, nil
+		return deployed()
 	}
 
 	// 1) 优先 WS —— 走请求-响应(ForwardToAgent over WS 命中 agent 同步的 HandleCertDeploy,写完证书返回 200 才继续)。
@@ -967,12 +976,12 @@ func (h *CertificateHandler) DeployCertToServerSync(ctx context.Context, server 
 			cancel()
 			if ferr == nil {
 				log.Printf("[Certificate] Sync cert_deploy via WS(req-resp) to %s for %s", server.Name, payload.Domain)
-				return certPath, keyPath, nil
+				return deployed()
 			}
 			log.Printf("[Certificate] Sync WS(req-resp) cert_deploy to %s failed: %v, falling back to HTTP", server.Name, ferr)
 		} else if err := h.wsHandler.SendCertDeploy(server.Token, payload); err == nil {
 			log.Printf("[Certificate] Sync cert_deploy via WS(async, no remoteManage) to %s for %s", server.Name, payload.Domain)
-			return certPath, keyPath, nil
+			return deployed()
 		}
 	}
 
@@ -981,7 +990,7 @@ func (h *CertificateHandler) DeployCertToServerSync(ctx context.Context, server 
 		return "", "", err
 	}
 	log.Printf("[Certificate] Sync cert_deploy via HTTP to %s for %s", server.Name, payload.Domain)
-	return certPath, keyPath, nil
+	return deployed()
 }
 
 // 将证书部署到所有连接的远程服务器。
@@ -1318,6 +1327,7 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("更新证书失败: %v", err)})
 			return
 		}
+		h.syncManagedXrayAfterMaterialUpdate(existing, result.CertPEM, result.KeyPEM)
 		if existing.DeployCertPath == "" {
 			existing.DeployCertPath = deployCertPath
 			existing.DeployKeyPath = deployKeyPath
@@ -1347,6 +1357,8 @@ func (h *CertificateHandler) UploadCertificate(w http.ResponseWriter, r *http.Re
 
 	if err := h.repo.UpdateCertificateIssued(ctx, cert.ID, result.CertPath, result.KeyPath, result.CertPEM, result.KeyPEM, result.IssueDate, result.ExpiryDate); err != nil {
 		log.Printf("[Certificate] UpdateCertificateIssued after upload failed: %v", err)
+	} else {
+		h.syncManagedXrayAfterMaterialUpdate(cert, result.CertPEM, result.KeyPEM)
 	}
 
 	h.checkMasterCertReady(cert)
