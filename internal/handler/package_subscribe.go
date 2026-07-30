@@ -528,6 +528,9 @@ func (h *PackageSubscribeHandler) convertFormat(r *http.Request, yamlData []byte
 		}
 		proxies = append(proxies, substore.Proxy(proxyMap))
 	}
+	if isSurgeClientType(clientType) {
+		normalizeSurgeProxies(proxies)
+	}
 
 	if clientType == "clash-to-surge" {
 		sub := NewSubscriptionHandlerConcrete(h.repo, "subscribes")

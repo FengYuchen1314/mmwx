@@ -831,7 +831,9 @@ func isSurgeClientType(clientType string) bool {
 func injectProxiesIntoSurgeTemplate(templateContent string, proxies []map[string]any) (string, error) {
 	surgeProxies := make([]substore.Proxy, 0, len(proxies))
 	for _, p := range proxies {
-		surgeProxies = append(surgeProxies, substore.Proxy(p))
+		proxy := substore.Proxy(p)
+		normalizeSurgeProxyNumbers(proxy)
+		surgeProxies = append(surgeProxies, proxy)
 	}
 
 	producer := substore.NewSurgeProducer()

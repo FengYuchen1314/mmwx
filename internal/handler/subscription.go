@@ -1683,6 +1683,9 @@ func (h *SubscriptionHandler) convertSubscription(ctx context.Context, yamlData 
 		}
 		proxies = append(proxies, substore.Proxy(proxyMap))
 	}
+	if isSurgeClientType(clientType) {
+		normalizeSurgeProxies(proxies)
+	}
 
 	if len(proxies) == 0 {
 		return nil, errors.New("no valid proxies found in YAML")
@@ -1765,6 +1768,7 @@ func (h *SubscriptionHandler) convertSubscription(ctx context.Context, yamlData 
 
 // ConvertClashToSurge 使用规则将 Clash 配置转换为 Surge 格式
 func (h *SubscriptionHandler) convertClashToSurge(config map[string]interface{}, proxies []substore.Proxy) ([]byte, error) {
+	normalizeSurgeProxies(proxies)
 	// 解析 Clash 配置结构
 	clashConfig := &substore.ClashConfig{}
 
