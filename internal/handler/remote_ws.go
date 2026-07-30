@@ -1222,18 +1222,33 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	// servers/{domain}.conf，并发下发会让最后完成的一方随机覆盖另一方。
 	if server.Use443 && server.Domain != "" && server.Status == "pending" && h.stealSelfDeployer != nil {
 		go func() {
-			// 等待代理完全初始化
+			// Agent 首次认证发生在安装脚本尚未结束时很常见。旧逻辑只等 5 秒并尝试一次：
+			// Nginx 未装完或证书尚未就绪就永久错过自动部署（状态随后已变 connected）。
+			// 在两分钟窗口内有限重试；各步骤均为覆盖式下发，可安全重复。
 			time.Sleep(5 * time.Second)
-			deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer deployCancel()
-			if err := h.stealSelfDeployer(deployCtx, server.ID); err != nil {
-				log.Printf("[Remote WS] Failed to auto-deploy steal-self config for server %s (%d): %v", server.Name, server.ID, err)
-			} else {
-				log.Printf("[Remote WS] Auto-deployed steal-self config for server %s (%d)", server.Name, server.ID)
+			var deployErr error
+			for attempt := 1; attempt <= 12; attempt++ {
+				deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
+				deployErr = h.stealSelfDeployer(deployCtx, server.ID)
+				deployCancel()
+				if deployErr == nil {
+					log.Printf("[Remote WS] Auto-deployed steal-self config for server %s (%d), attempt=%d", server.Name, server.ID, attempt)
+					break
+				}
+				log.Printf("[Remote WS] Auto-deploy steal-self config not ready for server %s (%d), attempt=%d/12: %v", server.Name, server.ID, attempt, deployErr)
+				if attempt < 12 {
+					time.Sleep(10 * time.Second)
+				}
+			}
+			if deployErr != nil {
+				log.Printf("[Remote WS] Failed to auto-deploy steal-self config for server %s (%d) after retries: %v", server.Name, server.ID, deployErr)
+				return
 			}
 
-			masterDomain := getDomainFromMasterURL(h.repo, deployCtx)
+			masterDomain := getDomainFromMasterURL(h.repo, context.Background())
 			if shouldAutoProxyMaster(server, authPayload.SameHostAsMaster, masterDomain) && h.masterProxyDeployer != nil {
+				deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer deployCancel()
 				if err := h.masterProxyDeployer(deployCtx, server.ID); err != nil {
 					log.Printf("[Remote WS] Failed to auto-deploy master proxy for server %s (%d): %v", server.Name, server.ID, err)
 				} else {

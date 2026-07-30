@@ -2167,6 +2167,24 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// tunnel 偷自己时 443 已由 tunnel-in 对外监听。首次创建 Reality 若前端仍提交 443，
+	// 必须在转发给 Agent 前改成 tunnel-in.settings.port；否则 Agent 会先因端口占用拒绝，
+	// 后面的 cleanupTunnelRouteForReality 根本没有机会更新转发目标。
+	if r.Method == http.MethodPost && inboundReq != nil {
+		if action, _ := inboundReq["action"].(string); action == "" || strings.EqualFold(action, "add") {
+			if inbound, ok := inboundReq["inbound"].(map[string]interface{}); ok && isRealityInbound(inbound) {
+				server, serr := h.repo.GetRemoteServer(r.Context(), id)
+				if serr == nil && server != nil && server.StealMode == "tunnel" && toInt(inbound["port"]) == 443 {
+					if internalPort := h.getTunnelInSettingsPort(r.Context(), id); internalPort > 0 {
+						inbound["port"] = internalPort
+						body, _ = json.Marshal(inboundReq)
+						log.Printf("[HandleInbounds] Remapped tunnel Reality inbound port 443 to tunnel-in settings.port %d on server %d", internalPort, id)
+					}
+				}
+			}
+		}
+	}
+
 	// TLS 入站兜底校验:hysteria2 / vless+tls / trojan 等必须 TLS 的协议,前端漏填证书时
 	// xray-core 的错是 "both file and bytes are empty",对用户不友好且让人怀疑后端 bug。
 	// 这里在 forward 前明确拒绝并给出用户能看懂的提示。
@@ -4211,6 +4229,12 @@ func (h *RemoteManageHandler) getTunnelInSettingsPort(ctx context.Context, serve
 		return 0
 	}
 	return 0
+}
+
+func isRealityInbound(inbound map[string]interface{}) bool {
+	streamSettings, _ := inbound["streamSettings"].(map[string]interface{})
+	security, _ := streamSettings["security"].(string)
+	return strings.EqualFold(strings.TrimSpace(security), "reality")
 }
 
 // InboundToClashProxyByServerID 将 Xray 入站配置转换为 Clash 代理 JSON 字符串。
