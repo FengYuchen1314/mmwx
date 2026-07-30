@@ -332,31 +332,55 @@ func orderPackageNodes(ctx context.Context, repo *storage.TrafficRepository, use
 	return ordered
 }
 
-// loadTemplate 优先级:套餐绑的模板 → 系统默认模板 → rule_templates 目录第一个 yaml。
+// loadTemplate 按请求客户端类型选择模板。Clash 与 Surge 各自使用套餐绑定模板，
+// 未绑定时回退到对应的系统默认模板，再回退到目录中同类型的第一个模板。
 // pkg 为 nil 时跳过套餐模板这一级(serveAllNodes 等无套餐上下文场景)。
 // loadTemplate 返回模板内容与文件名(文件名用于判断 Clash/Surge 格式)。
 func (h *PackageSubscribeHandler) loadTemplate(r *http.Request, pkg *storage.Package) (content string, filename string, err error) {
 	templatesDir := "rule_templates"
+	wantSurge := isSurgeClientType(resolveClientType(r))
 
 	var candidates []string
 	// 最高优先:订阅所属用户若有模板管理权限且设了个人默认模板(且本人拥有该模板),用它覆盖套餐/系统默认。
 	// 归属校验不过(模板被删/改归属)时静默跳过,自动回退到下面的套餐/系统默认。
-	if username := strings.TrimSpace(auth.UsernameFromContext(r.Context())); username != "" {
-		if s, err := h.repo.GetUserSettings(r.Context(), username); err == nil {
-			if f := strings.TrimSpace(s.DefaultTemplateFilename); f != "" && userHasTemplatePermission(r.Context(), h.repo, username) {
-				if owner, _ := h.repo.GetRuleTemplateOwner(r.Context(), f); owner == username {
-					candidates = append(candidates, f)
+	if !wantSurge {
+		username := strings.TrimSpace(auth.UsernameFromContext(r.Context()))
+		if username != "" {
+			if s, err := h.repo.GetUserSettings(r.Context(), username); err == nil {
+				if f := strings.TrimSpace(s.DefaultTemplateFilename); f != "" && userHasTemplatePermission(r.Context(), h.repo, username) {
+					if owner, _ := h.repo.GetRuleTemplateOwner(r.Context(), f); owner == username {
+						candidates = append(candidates, f)
+					}
 				}
 			}
 		}
 	}
-	if pkg != nil && strings.TrimSpace(pkg.TemplateFilename) != "" {
-		candidates = append(candidates, pkg.TemplateFilename)
+	if pkg != nil {
+		filename := pkg.TemplateFilename
+		if wantSurge {
+			filename = pkg.SurgeTemplateFilename
+			// 兼容迁移前曾写在通用字段中的 Surge 模板。
+			if strings.TrimSpace(filename) == "" && isSurgeTemplateFile(pkg.TemplateFilename) {
+				filename = pkg.TemplateFilename
+			}
+		}
+		if strings.TrimSpace(filename) != "" {
+			candidates = append(candidates, filename)
+		}
 	}
-	if cfg, err := h.repo.GetSystemConfig(r.Context()); err == nil && cfg.DefaultTemplateFilename != "" {
-		candidates = append(candidates, cfg.DefaultTemplateFilename)
+	if cfg, err := h.repo.GetSystemConfig(r.Context()); err == nil {
+		filename := cfg.DefaultTemplateFilename
+		if wantSurge {
+			filename = cfg.DefaultSurgeTemplateFilename
+		}
+		if strings.TrimSpace(filename) != "" {
+			candidates = append(candidates, filename)
+		}
 	}
 	for _, name := range candidates {
+		if isSurgeTemplateFile(name) != wantSurge {
+			continue
+		}
 		data, rerr := os.ReadFile(filepath.Join(templatesDir, name))
 		if rerr == nil {
 			return string(data), name, nil
@@ -366,7 +390,7 @@ func (h *PackageSubscribeHandler) loadTemplate(r *http.Request, pkg *storage.Pac
 	entries, derr := os.ReadDir(templatesDir)
 	if derr == nil {
 		for _, e := range entries {
-			if e.IsDir() || !isRuleTemplateFile(e.Name()) {
+			if e.IsDir() || !isRuleTemplateFile(e.Name()) || isSurgeTemplateFile(e.Name()) != wantSurge {
 				continue
 			}
 			data, rerr := os.ReadFile(filepath.Join(templatesDir, e.Name()))
