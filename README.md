@@ -2,6 +2,8 @@
 
 妙妙屋 X（MiaoMiaoWuX）的独立服务器探针前端。项目将 React 静态页面、只读 API 代理和 WebSocket 代理部署到同一个 Cloudflare Worker，访客只接触探针域名，无需直接访问主控域名。
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iluobei/mmwx-probe)
+
 ## 功能
 
 - 卡片和列表两种服务器视图
@@ -34,7 +36,30 @@ Worker 仅代理三个固定路径，不接受访客指定上游地址，因此�
 
 先进入主控的“系统设置 → 探针”，启用探针、选择展示服务器和指标，然后生成“独立探针访问密钥”。密钥明文只显示一次，请立即保存，切勿提交到 Git。
 
-## Cloudflare Worker 部署
+## Cloudflare 网页部署（推荐）
+
+整个过程由 Cloudflare 从 GitHub 拉取、编译和部署，不需要在本地 clone，也不需要安装 Node.js：
+
+1. 点击上方 **Deploy to Cloudflare**。如果按钮暂时不可用，进入 Cloudflare Dashboard 的 **Workers & Pages → Create application → Import a repository**，选择 `iluobei/mmwx-probe`。
+2. 保持以下构建设置：
+   - Production branch：`main`
+   - Build command：`npm run build`
+   - Deploy command：`npx wrangler deploy`
+   - Root directory：独立仓库留空；从主项目部署时填写 `mmwx-probe`
+3. 首次部署后，进入 Worker 的 **Settings → Variables and Secrets**，添加运行时变量：
+
+   | 名称 | 类型 | 值 |
+   | --- | --- | --- |
+   | `MMWX_ORIGIN` | Text | 主控 HTTPS 地址，例如 `https://panel.example.com` |
+   | `PROBE_TOKEN` | Secret | 主控“系统设置 → 探针”生成的访问密钥 |
+
+   注意这里是 Worker 的运行时 **Variables and Secrets**，不是 **Build Variables and Secrets**。保存后点击 Deploy，使变量进入当前部署。
+4. 打开 Worker 地址，确认服务器列表、趋势图和实时更新正常。
+5. 最后回到主控，开启“仅允许独立探针访问”。此后直接访问主控的探针接口会返回 `404`。
+
+连接 GitHub 后，每次推送到 `main` 分支都会由 Workers Builds 自动构建和部署。
+
+## Wrangler 命令行部署
 
 1. 克隆项目并安装依赖：
 
@@ -45,15 +70,7 @@ Worker 仅代理三个固定路径，不接受访客指定上游地址，因此�
    npx wrangler login
    ```
 
-2. 编辑 `wrangler.jsonc`，将 `MMWX_ORIGIN` 改为主控地址：
-
-   ```jsonc
-   "vars": {
-     "MMWX_ORIGIN": "https://panel.example.com"
-   }
-   ```
-
-   地址必须是固定的 HTTPS 源站，不要包含路径或结尾斜杠。
+2. 在 Cloudflare Dashboard 的 **Settings → Variables and Secrets** 添加文本变量 `MMWX_ORIGIN`。地址必须是固定的 HTTPS 源站，不要包含路径或结尾斜杠。
 
 3. 将主控生成的密钥保存为 Worker Secret：
 
@@ -75,16 +92,16 @@ Worker 仅代理三个固定路径，不接受访客指定上游地址，因此�
 
 ## 本地开发
 
-复制本地配置，填写主控地址和同一份访问密钥：
+复制本地环境变量示例，填写主控地址和同一份访问密钥：
 
 ```bash
-cp wrangler.jsonc wrangler.local.jsonc
 cp .dev.vars.example .dev.vars
 ```
 
-编辑 `wrangler.local.jsonc` 中的 `MMWX_ORIGIN`，并在 `.dev.vars` 中填写：
+在 `.dev.vars` 中填写：
 
 ```dotenv
+MMWX_ORIGIN=https://panel.example.com
 PROBE_TOKEN=主控生成的访问密钥
 ```
 
@@ -92,7 +109,7 @@ PROBE_TOKEN=主控生成的访问密钥
 
 ```bash
 # 终端 1
-npx wrangler dev --config wrangler.local.jsonc
+npx wrangler dev
 
 # 终端 2
 npm run dev

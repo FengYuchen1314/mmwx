@@ -3,6 +3,16 @@
   "private": true,
   "version": "0.1.0",
   "description": "Standalone Cloudflare Worker probe frontend for MiaoMiaoWuX",
+  "cloudflare": {
+    "bindings": {
+      "MMWX_ORIGIN": {
+        "description": "妙妙屋 X 主控的公网 HTTPS 地址，例如 `https://panel.example.com`。"
+      },
+      "PROBE_TOKEN": {
+        "description": "在主控的 **系统设置 → 探针** 中生成的独立探针访问密钥。"
+      }
+    }
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
