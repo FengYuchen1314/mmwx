@@ -37,7 +37,15 @@ type notifyConfigResponse struct {
 	NotifyDeviceLimitExceeded     bool `json:"notify_device_limit_exceeded"`
 	NotifyIPBan                   bool `json:"notify_ip_ban"`
 	// 服务器上下线通知容忍阈值(秒):离线满该秒数才发下线通知,阈值内又上线则不发(压抖动+主控重启误报)。0=关闭。
-	NotifyServerToleranceSeconds int `json:"notify_server_tolerance_seconds"`
+	NotifyServerToleranceSeconds int     `json:"notify_server_tolerance_seconds"`
+	NotifyProbeQuality           bool    `json:"notify_probe_quality"`
+	ProbeJitterThresholdMs       int64   `json:"probe_jitter_threshold_ms"`
+	ProbeLossThresholdPct        float64 `json:"probe_loss_threshold_pct"`
+	ProbeWindowMinutes           int     `json:"probe_window_minutes"`
+	ProbeMinSamples              int     `json:"probe_min_samples"`
+	ProbeTriggerConsecutive      int     `json:"probe_trigger_consecutive"`
+	ProbeRecoverConsecutive      int     `json:"probe_recover_consecutive"`
+	ProbeCooldownMinutes         int     `json:"probe_cooldown_minutes"`
 	// 每日推送文案模板。空 = 未自定义,渲染时用默认模板。
 	NotifyDailyTrafficTemplate string `json:"notify_daily_traffic_template"`
 	// 默认模板正文,只读:前端拿它做「恢复默认」和首次填充,避免前端另抄一份导致两边漂移。
@@ -73,7 +81,15 @@ type notifyConfigRequest struct {
 	NotifyDeviceLimitExceeded     bool   `json:"notify_device_limit_exceeded"`
 	NotifyIPBan                   bool   `json:"notify_ip_ban"`
 	// 指针:nil=不改;非 nil=写入(0 合法,表示关闭容忍)。
-	NotifyServerToleranceSeconds *int `json:"notify_server_tolerance_seconds"`
+	NotifyServerToleranceSeconds *int    `json:"notify_server_tolerance_seconds"`
+	NotifyProbeQuality           bool    `json:"notify_probe_quality"`
+	ProbeJitterThresholdMs       int64   `json:"probe_jitter_threshold_ms"`
+	ProbeLossThresholdPct        float64 `json:"probe_loss_threshold_pct"`
+	ProbeWindowMinutes           int     `json:"probe_window_minutes"`
+	ProbeMinSamples              int     `json:"probe_min_samples"`
+	ProbeTriggerConsecutive      int     `json:"probe_trigger_consecutive"`
+	ProbeRecoverConsecutive      int     `json:"probe_recover_consecutive"`
+	ProbeCooldownMinutes         int     `json:"probe_cooldown_minutes"`
 	// 指针:nil=不改;非 nil=写入(空字符串合法,表示恢复默认模板)。
 	// 必须是指针 —— 前端每次改开关都 PUT 整个对象,若用值类型,任何一次开关操作
 	// 都会把管理员写的文案冲成空。
@@ -122,6 +138,7 @@ func (h *NotifyConfigHandler) handleGet(w http.ResponseWriter, r *http.Request) 
 
 	// 读不出(键不存在是正常的"未自定义")→ 空,前端展示默认模板
 	tpl, _ := h.repo.GetSystemSetting(r.Context(), notifyDailyTemplateKey)
+	probeCfg := LoadProbeQualityAlertConfig(r.Context(), h.repo)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(notifyConfigResponse{
@@ -150,6 +167,14 @@ func (h *NotifyConfigHandler) handleGet(w http.ResponseWriter, r *http.Request) 
 		NotifyDeviceLimitExceeded:     sysCfg.NotifyDeviceLimitExceeded,
 		NotifyIPBan:                   sysCfg.NotifyIPBan,
 		NotifyServerToleranceSeconds:  h.repo.GetServerNotifyToleranceSeconds(r.Context()),
+		NotifyProbeQuality:            probeCfg.Enabled,
+		ProbeJitterThresholdMs:        probeCfg.JitterThresholdMs,
+		ProbeLossThresholdPct:         probeCfg.LossThresholdPct,
+		ProbeWindowMinutes:            probeCfg.WindowMinutes,
+		ProbeMinSamples:               probeCfg.MinSamples,
+		ProbeTriggerConsecutive:       probeCfg.TriggerConsecutive,
+		ProbeRecoverConsecutive:       probeCfg.RecoverConsecutive,
+		ProbeCooldownMinutes:          probeCfg.CooldownMinutes,
 		// 返回**存的原值**(未自定义时为空),不替换成默认 —— 前端据此区分「用默认」与
 		// 「自定义成了跟默认一样」,后者会把文案冻在旧默认上,以后改默认推不下去。
 		NotifyDailyTrafficTemplate:        tpl,
@@ -235,6 +260,15 @@ func (h *NotifyConfigHandler) handleUpdate(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
+	if err := SaveProbeQualityAlertConfig(r.Context(), h.repo, ProbeQualityAlertConfig{
+		Enabled: req.NotifyProbeQuality, JitterThresholdMs: req.ProbeJitterThresholdMs,
+		LossThresholdPct: req.ProbeLossThresholdPct, WindowMinutes: req.ProbeWindowMinutes,
+		MinSamples: req.ProbeMinSamples, TriggerConsecutive: req.ProbeTriggerConsecutive,
+		RecoverConsecutive: req.ProbeRecoverConsecutive, CooldownMinutes: req.ProbeCooldownMinutes,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 
 	if n := GetNotifier(); n != nil {
 		n.UpdateConfig(notify.Config{
@@ -262,6 +296,7 @@ func (h *NotifyConfigHandler) handleUpdate(w http.ResponseWriter, r *http.Reques
 			AgentLongOfflineMinutes:   sysCfg.NotifyAgentLongOfflineMinutes,
 			NotifyDeviceLimitExceeded: sysCfg.NotifyDeviceLimitExceeded,
 			NotifyIPBan:               sysCfg.NotifyIPBan,
+			NotifyProbeQuality:        true,
 		})
 	}
 

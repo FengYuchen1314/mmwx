@@ -12,17 +12,20 @@ const (
 	EventIPBan            EventType = "ip_ban"
 
 	// Phase 2 新增 9 个事件
-	EventTrafficThreshold80  EventType = "traffic_threshold_80"  // 用户流量达 80%(预警)
-	EventOverLimit           EventType = "over_limit"            // 用户流量超 100%(已踢)
-	EventPackageExpiring     EventType = "package_expiring"      // 套餐 N 天内到期
-	EventPackageExpired      EventType = "package_expired"       // 套餐已到期(清理时点)
-	EventUserRegistered      EventType = "user_registered"       // 新用户注册
-	EventTelegramBound       EventType = "telegram_bound"        // 用户首次绑定 TG
-	EventCertResult          EventType = "cert_result"           // 证书申请成功/失败
-	EventAgentLongOffline    EventType = "agent_long_offline"    // agent 长期离线(N 分钟无心跳)
-	EventDeviceLimitExceeded EventType = "device_limit_exceeded" // 用户触发设备数超限(agent 踢最旧)
-	EventServerRenewalDue    EventType = "server_renewal_due"    // 服务器流量重置日(=续费日)将至
-	EventServerRenewed       EventType = "server_renewed"        // 重置日次日仍在线,视为续费成功
+	EventTrafficThreshold80 EventType = "traffic_threshold_80" // 用户流量达 80%(预警)
+	EventOverLimit          EventType = "over_limit"           // 用户流量超 100%(已踢)
+	EventPackageExpiring    EventType = "package_expiring"     // 套餐 N 天内到期
+	EventPackageExpired     EventType = "package_expired"      // 套餐已到期(清理时点)
+	EventUserRegistered     EventType = "user_registered"      // 新用户注册
+	EventTelegramBound      EventType = "telegram_bound"       // 用户首次绑定 TG
+	EventCertResult         EventType = "cert_result"          // 证书申请成功/失败
+	EventAgentLongOffline   EventType = "agent_long_offline"   // agent 长期离线(N 分钟无心跳)
+	// EventDeviceLimitExceeded 保留历史事件值兼容已有配置；当前语义是并发连接数超限。
+	EventDeviceLimitExceeded EventType = "device_limit_exceeded"
+	EventServerRenewalDue    EventType = "server_renewal_due" // 服务器流量重置日(=续费日)将至
+	EventServerRenewed       EventType = "server_renewed"     // 重置日次日仍在线,视为续费成功
+	EventProbeQualityAlert   EventType = "probe_quality_alert"
+	EventProbeQualityRecover EventType = "probe_quality_recovered"
 )
 
 type Config struct {
@@ -56,6 +59,7 @@ type Config struct {
 	// NotifyServerRenewal 同时管「续费将至」和「续费成功」两个事件 —— 它们是同一件事的
 	// 两端,拆成两个开关只会让通知设置面板更长,没有单独关掉其中一个的实际场景。
 	NotifyServerRenewal bool
+	NotifyProbeQuality  bool
 }
 
 type Event struct {

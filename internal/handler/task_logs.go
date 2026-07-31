@@ -36,6 +36,7 @@ var taskTypes = []taskType{
 	{"ddns_reconciler", "DDNS 重试"},
 	{"cert_renewal", "证书续期"},
 	{"node_tls_fingerprint_backfill", "节点证书指纹补全"},
+	{"probe_quality_alert", "探针质量告警"},
 }
 
 func (h *TaskLogHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

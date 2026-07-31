@@ -677,10 +677,9 @@ func SendAgentLongOfflineNotification(ctx context.Context, serverName, ip string
 	)
 }
 
-// SendDeviceLimitExceededNotification 用户触发设备数超限(agent 上报 kick delta)
-// deviceLimit=0 时省略该行(主控不易精确拿到子账号 email 的 device_limit)
 // SendConnLimitExceededNotification 用户在某节点触发**连接数上限**、新连接被拒绝时通知管理员。
-// delta = 本次上报周期内被拒次数;nodeName 为空则省略节点行。沿用 EventDeviceLimitExceeded 开关与 5min 节流。
+// delta = 本次上报周期内被拒次数;nodeName 为空则省略节点行。
+// EventDeviceLimitExceeded 是历史兼容名称，实际开关和通知语义均为连接数超限。
 func SendConnLimitExceededNotification(ctx context.Context, username, nodeName string, delta int) {
 	msg := fmt.Sprintf("用户: `%s`\n本周期内新连接被拒: %d 次", username, delta)
 	if nodeName != "" {

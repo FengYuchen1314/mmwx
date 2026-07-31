@@ -608,8 +608,9 @@ type SystemConfig struct {
 	NotifyCertResult              bool // 证书申请成败
 	NotifyAgentLongOffline        bool // agent 长期离线
 	NotifyAgentLongOfflineMinutes int  // 默认 30
-	NotifyDeviceLimitExceeded     bool // 设备数超限(agent 上报触发)
-	NotifyIPBan                   bool // IP 被暴力防护封禁
+	// 历史字段名保留以兼容数据库；当前语义是连接数超限(agent 上报触发)。
+	NotifyDeviceLimitExceeded bool
+	NotifyIPBan               bool // IP 被暴力防护封禁
 	// NotifyServerRenewal 服务器续费提醒:按 traffic_reset_day 在到期前 7/3 天提醒,
 	// 重置日次日仍在线则发续费成功。一个开关同时管这两条——它们是同一件事的两端。
 	NotifyServerRenewal          bool

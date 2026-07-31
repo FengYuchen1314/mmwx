@@ -35,11 +35,11 @@ func (n *Notifier) GetConfig() Config {
 type SkipReason string
 
 const (
-	ReasonEnabled         SkipReason = ""
-	ReasonGlobalDisabled  SkipReason = "global_disabled"
-	ReasonBotTokenEmpty   SkipReason = "bot_token_empty"
-	ReasonChatIDEmpty     SkipReason = "chat_id_empty"
-	ReasonEventDisabled   SkipReason = "event_disabled"
+	ReasonEnabled        SkipReason = ""
+	ReasonGlobalDisabled SkipReason = "global_disabled"
+	ReasonBotTokenEmpty  SkipReason = "bot_token_empty"
+	ReasonChatIDEmpty    SkipReason = "chat_id_empty"
+	ReasonEventDisabled  SkipReason = "event_disabled"
 )
 
 // CheckEnabled 返回 (是否启用, 不启用原因)。
@@ -97,6 +97,8 @@ func (n *Notifier) CheckEnabled(eventType EventType) (bool, SkipReason) {
 		on = n.cfg.NotifyDeviceLimitExceeded
 	case EventIPBan:
 		on = n.cfg.NotifyIPBan
+	case EventProbeQualityAlert, EventProbeQualityRecover:
+		on = n.cfg.NotifyProbeQuality
 	default:
 		on = false
 	}

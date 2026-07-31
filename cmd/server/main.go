@@ -133,8 +133,9 @@ func main() {
 	// 定时任务运行记录器(P3)。高频 collector 的成功按 5min 节流(否则 speed 3s/次会写爆表),
 	// 其余低频任务每次都记。失败永远记。各任务通过 taskrun.Record 全局调用,无需改构造函数。
 	taskrun.Init(taskrun.New(repo, map[string]time.Duration{
-		"traffic_collector": 5 * time.Minute,
-		"speed_collector":   5 * time.Minute,
+		"traffic_collector":   5 * time.Minute,
+		"speed_collector":     5 * time.Minute,
+		"probe_quality_alert": 5 * time.Minute,
 	}))
 	go startTaskRunCleanup(context.Background(), repo)
 
@@ -242,6 +243,7 @@ func main() {
 		NotifyAgentLongOffline:    systemConfig.NotifyAgentLongOffline,
 		AgentLongOfflineMinutes:   systemConfig.NotifyAgentLongOfflineMinutes,
 		NotifyDeviceLimitExceeded: systemConfig.NotifyDeviceLimitExceeded,
+		NotifyProbeQuality:        true,
 	})
 
 	// TG bot 已拆为独立项目 ../mmwX-tgbot,通过 /api/admin/tgbot/* HTTP 调主控。
@@ -943,6 +945,7 @@ func main() {
 	// capN=1440(1 分钟间隔约 1 天窗口):伪装页延迟折线图/24 小时色块条据此回溯。
 	// 内存量级:1440 点 × 16B × 目标数(≤30) × 服务器数,几十台机也就几 MB,可接受。
 	probeMetricsStore := handler.NewProbeMetricsStore(1440)
+	probeQualityAlertScheduler := handler.NewProbeQualityAlertScheduler(repo, probeMetricsStore)
 	remoteWSHandler.SetProbeStore(probeMetricsStore)   // 写侧:接收 agent 上报的 sysmetrics/latency
 	federationHandler.SetProbeStore(probeMetricsStore) // 拥有方 server-info 透传 cpu/mem/disk 给消费方探针
 	// HTTP/pull 模式的 agent 没有 WS 连接,探针指标只能从 /api/remote/traffic 这条 POST 进来;
@@ -1347,6 +1350,7 @@ func main() {
 	trafficCollector.OnServerOffline = handler.SendServerOfflineNotification
 	// 启动 Xray 流量收集器（每 1 分钟）
 	go trafficCollector.Start(collectorCtx)
+	go probeQualityAlertScheduler.Start(collectorCtx)
 	// 启动拉模式服务器的速度收集（每 3 秒）
 	go trafficCollector.StartSpeedCollection(collectorCtx)
 	// 启动每日快照和清理任务

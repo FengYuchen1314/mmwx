@@ -2,11 +2,21 @@ package handler
 
 import (
 	"encoding/json"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ProbeQualityStats 是告警检测使用的滚动窗口统计，不进入公开探针响应。
+type ProbeQualityStats struct {
+	Samples, Success, Failed int
+	P50Ms, P95Ms, JitterMs   int64
+	LossPct                  float64
+	LastAt                   int64
+}
 
 // 真探针数据后端的内存态。伪装探针页要像哪吒探针那样展示各服务器的 CPU/内存/硬盘 + ping 延迟曲线,
 // 但用户选择「仅内存实时滚动」——不建 DB 时序表,主控内存维护环形缓冲,重启清空。
@@ -285,6 +295,61 @@ func (s *ProbeMetricsStore) Snapshot(serverID int64, maxSlots int) (*ProbeServer
 		lat[k] = ProbeTargetSeries{CurrentMs: cur, Slots: cp}
 	}
 	return &ProbeServerView{HasSys: m.hasSys, Sys: m.sys, Latency: lat}, true
+}
+
+// QualityStats 返回某服务器各探测目标在指定时间窗口内的质量统计。
+func (s *ProbeMetricsStore) QualityStats(serverID int64, window time.Duration, now time.Time) map[string]ProbeQualityStats {
+	if s == nil || window <= 0 {
+		return nil
+	}
+	cutoff := now.Add(-window).Unix()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, ok := s.data[serverID]
+	if !ok {
+		return nil
+	}
+	out := make(map[string]ProbeQualityStats, len(m.latency))
+	for key, points := range m.latency {
+		var successful []int64
+		stats := ProbeQualityStats{}
+		for _, point := range points {
+			if point.Ts < cutoff || point.Ts > now.Unix()+300 {
+				continue
+			}
+			stats.Samples++
+			if point.Ts > stats.LastAt {
+				stats.LastAt = point.Ts
+			}
+			if point.LatencyMs < 0 {
+				stats.Failed++
+			} else {
+				stats.Success++
+				successful = append(successful, point.LatencyMs)
+			}
+		}
+		if stats.Samples == 0 {
+			continue
+		}
+		stats.LossPct = float64(stats.Failed) * 100 / float64(stats.Samples)
+		if len(successful) > 0 {
+			sort.Slice(successful, func(i, j int) bool { return successful[i] < successful[j] })
+			percentile := func(p float64) int64 {
+				idx := int(math.Ceil(float64(len(successful))*p)) - 1
+				if idx < 0 {
+					idx = 0
+				}
+				if idx >= len(successful) {
+					idx = len(successful) - 1
+				}
+				return successful[idx]
+			}
+			stats.P50Ms, stats.P95Ms = percentile(0.50), percentile(0.95)
+			stats.JitterMs = stats.P95Ms - stats.P50Ms
+		}
+		out[key] = stats
+	}
+	return out
 }
 
 // Evict 清掉 updatedAt 早于 cutoff 的服务器(掉线服务器),防内存无界增长。
