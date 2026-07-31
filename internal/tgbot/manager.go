@@ -22,6 +22,7 @@ const (
 	settingToken      = "tgbot_token"
 	settingAdminIDs   = "tgbot_admin_ids"
 	settingDevPreview = "tgbot_webapp_dev_preview"
+	settingBotURL     = "tgbot_url"
 )
 
 type Settings struct {
@@ -30,6 +31,7 @@ type Settings struct {
 	AdminTGIDs    []int64 `json:"admin_tg_ids"`
 	WebDevPreview bool    `json:"webapp_dev_preview"`
 	Running       bool    `json:"running"`
+	BotURL        string  `json:"bot_url"`
 }
 
 type Manager struct {
@@ -67,6 +69,7 @@ func (m *Manager) Load(ctx context.Context, revealToken bool) Settings {
 		_ = json.Unmarshal([]byte(raw), &s.AdminTGIDs)
 	}
 	s.WebDevPreview = readBool(ctx, m.repo, settingDevPreview)
+	s.BotURL, _ = m.repo.GetSystemSetting(ctx, settingBotURL)
 	m.mu.Lock()
 	s.Running = m.running
 	m.mu.Unlock()
@@ -139,6 +142,14 @@ func (m *Manager) Restart(parent context.Context) error {
 		cancel()
 		m.tokens.Revoke(token)
 		return err
+	}
+	if botURL := service.BotURL(); botURL != "" {
+		if err := m.repo.SetSystemSetting(parent, settingBotURL, botURL); err != nil {
+			cancel()
+			service.Stop()
+			m.tokens.Revoke(token)
+			return err
+		}
 	}
 	m.cancel = func() { cancel(); service.Stop(); m.tokens.Revoke(token) }
 	m.service = service

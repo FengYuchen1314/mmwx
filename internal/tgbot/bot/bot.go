@@ -43,6 +43,13 @@ func (s *Service) botURL() string {
 	return "https://t.me/" + s.botUsername
 }
 
+// BotURL 返回 getMe 探测到的机器人公开地址。
+func (s *Service) BotURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.botURL()
+}
+
 func New(cfg config.Config, client *mmwxclient.Client) *Service {
 	s := &Service{cfg: cfg, client: client}
 	s.webHandler = s.newWebAppHandler()

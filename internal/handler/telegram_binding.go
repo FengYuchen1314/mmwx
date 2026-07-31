@@ -62,9 +62,11 @@ func (h *TelegramBindingHandler) writeStatus(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	binding, _ := h.repo.GetUserTelegramBinding(r.Context(), username)
+	botURL, _ := h.repo.GetSystemSetting(r.Context(), "tgbot_url")
 	respondJSON(w, http.StatusOK, map[string]any{
 		"username": username, "bound": binding.TelegramID != 0,
 		"telegram_id": binding.TelegramID, "telegram_username": binding.TelegramUsername,
+		"bot_url": strings.TrimSpace(botURL),
 	})
 }
 
@@ -91,9 +93,10 @@ func (h *TelegramBindingHandler) createBindInvite(w http.ResponseWriter, r *http
 		return
 	}
 	_ = h.repo.WriteTGAudit(r.Context(), storage.TGAudit{Username: username, Action: "bind_invite", Detail: "created_by=" + actor})
+	botURL, _ := h.repo.GetSystemSetting(r.Context(), "tgbot_url")
 	respondJSON(w, http.StatusOK, map[string]any{
 		"success": true, "code": code, "command": "/start " + code,
-		"expires_at": expiresAt.Format(time.RFC3339),
+		"expires_at": expiresAt.Format(time.RFC3339), "bot_url": strings.TrimSpace(botURL),
 	})
 }
 
