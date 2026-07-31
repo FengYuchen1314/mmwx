@@ -119,12 +119,32 @@ func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Requ
 	w.Header().Set("Content-Type", "application/json")
 	localOnly, _ := h.repo.GetSystemSetting(r.Context(), "master_local_only")
 	subscriptionURL, _ := h.repo.GetSystemSetting(r.Context(), "subscription_url")
+	recoveryEnabled, _ := h.repo.GetSystemSetting(r.Context(), settingHTTPSRecoveryEnabled)
+	recoveryURL, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryURL)
+	recoveryFailure, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryFailureMin)
+	recoveryGrace, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryGraceMin)
+	recoveryPending, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryPending)
+	recoveryReason, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryReason)
 	json.NewEncoder(w).Encode(map[string]any{
-		"success":          true,
-		"master_url":       value,
-		"subscription_url": subscriptionURL,
-		"local_only":       localOnly == "1",
+		"success":                        true,
+		"master_url":                     value,
+		"subscription_url":               subscriptionURL,
+		"local_only":                     localOnly == "1",
+		"https_recovery_enabled":         recoveryEnabled == "1",
+		"recovery_url":                   recoveryURL,
+		"recovery_failure_minutes":       parsePositiveInt(recoveryFailure, 5),
+		"recovery_startup_grace_minutes": parsePositiveInt(recoveryGrace, 10),
+		"recovery_pending":               recoveryPending == "1",
+		"recovery_reason":                recoveryReason,
 	})
+}
+
+func parsePositiveInt(raw string, fallback int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 1 {
+		return fallback
+	}
+	return n
 }
 
 // 设置主服务器地址
@@ -135,9 +155,13 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 	}
 
 	var req struct {
-		MasterURL       *string `json:"master_url"`
-		SubscriptionURL *string `json:"subscription_url"`
-		LocalOnly       *bool   `json:"local_only"`
+		MasterURL                   *string `json:"master_url"`
+		SubscriptionURL             *string `json:"subscription_url"`
+		LocalOnly                   *bool   `json:"local_only"`
+		HTTPSRecoveryEnabled        *bool   `json:"https_recovery_enabled"`
+		RecoveryURL                 *string `json:"recovery_url"`
+		RecoveryFailureMinutes      *int    `json:"recovery_failure_minutes"`
+		RecoveryStartupGraceMinutes *int    `json:"recovery_startup_grace_minutes"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -146,11 +170,59 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if req.MasterURL == nil && req.SubscriptionURL == nil && req.LocalOnly == nil {
+	if req.MasterURL == nil && req.SubscriptionURL == nil && req.LocalOnly == nil && req.HTTPSRecoveryEnabled == nil && req.RecoveryURL == nil && req.RecoveryFailureMinutes == nil && req.RecoveryStartupGraceMinutes == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "未提供需要更新的设置"})
 		return
+	}
+	if req.RecoveryURL != nil {
+		value := strings.TrimSpace(*req.RecoveryURL)
+		if value != "" {
+			var err error
+			value, err = normalizeRecoveryURL(value, "12889")
+			if err != nil {
+				writeError(w, http.StatusBadRequest, errors.New("恢复地址必须是可公网访问的 HTTP 地址"))
+				return
+			}
+		}
+		if err := h.repo.SetSystemSetting(r.Context(), settingRecoveryURL, value); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	if req.HTTPSRecoveryEnabled != nil {
+		value := "0"
+		if *req.HTTPSRecoveryEnabled {
+			value = "1"
+		}
+		if err := h.repo.SetSystemSetting(r.Context(), settingHTTPSRecoveryEnabled, value); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	if req.RecoveryFailureMinutes != nil {
+		if *req.RecoveryFailureMinutes < 1 || *req.RecoveryFailureMinutes > 60 {
+			writeError(w, 400, errors.New("故障确认时间必须为 1-60 分钟"))
+			return
+		}
+		if err := h.repo.SetSystemSetting(r.Context(), settingRecoveryFailureMin, strconv.Itoa(*req.RecoveryFailureMinutes)); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	if req.RecoveryStartupGraceMinutes != nil {
+		if *req.RecoveryStartupGraceMinutes < 1 || *req.RecoveryStartupGraceMinutes > 120 {
+			writeError(w, 400, errors.New("启动保护时间必须为 1-120 分钟"))
+			return
+		}
+		if err := h.repo.SetSystemSetting(r.Context(), settingRecoveryGraceMin, strconv.Itoa(*req.RecoveryStartupGraceMinutes)); err != nil {
+			writeError(w, 500, err)
+			return
+		}
+	}
+	if req.RecoveryURL != nil && h.wsHandler != nil {
+		go h.wsHandler.PushProbeConfigToAll(context.Background())
 	}
 	if req.SubscriptionURL != nil {
 		value := strings.TrimRight(strings.TrimSpace(*req.SubscriptionURL), "/")

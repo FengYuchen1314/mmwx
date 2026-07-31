@@ -446,6 +446,9 @@ func (h *RemoteWSHandler) buildProbeConfigUpdates(ctx context.Context, serverID 
 	}
 
 	updates := map[string]string{}
+	if recoveryURL := get(settingRecoveryURL); recoveryURL != "" {
+		updates["recovery_url"] = recoveryURL
+	}
 	active := enabled && selected
 	b := func(key string) string {
 		if active && get(key) == "1" {

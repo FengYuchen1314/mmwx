@@ -1369,6 +1369,14 @@ func main() {
 	remoteWSHandler.StartCleanupLoop(collectorCtx, 1*time.Minute)
 	// 启动通知调度器
 	go handler.StartNotifyScheduler(collectorCtx, repo)
+	handler.FinishPendingMasterHTTPSRecovery(collectorCtx, repo)
+	recoveryPort := "12889"
+	if config != nil && config.Port != "" {
+		recoveryPort = config.Port
+	} else if envPort := os.Getenv("PORT"); envPort != "" {
+		recoveryPort = envPort
+	}
+	go handler.NewMasterHTTPSRecoveryMonitor(repo, recoveryPort, handler.SignalGracefulRestart).Start(collectorCtx)
 
 	// 一次性数据迁移:给老 routed 节点补 creator 的 user_subaccounts 行 — 让 admin 自己用 routed 节点的
 	// 流量能走 user_subaccounts 命中而不依赖 ResolveUsernameByEmail 的 _admin__ 反查 fallback。
@@ -1509,11 +1517,14 @@ func getAddr(config *ServerConfig, repo *storage.TrafficRepository) string {
 		host = v
 	}
 	if repo != nil {
+		forcePublic, _ := repo.GetSystemSetting(context.Background(), "master_force_public_http")
 		localOnly, err := repo.GetSystemSetting(context.Background(), "master_local_only")
 		if err != nil {
 			log.Printf("[Main] Failed to read master access setting, using %s: %v", host, err)
-		} else if localOnly == "1" {
+		} else if localOnly == "1" && forcePublic != "1" {
 			host = "127.0.0.1"
+		} else if forcePublic == "1" {
+			host = "0.0.0.0"
 		}
 	}
 	log.Printf("[Main] HTTP server binding to %s:%s", host, port)

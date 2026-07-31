@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -148,6 +150,7 @@ type RemoteHeartbeatResponse struct {
 	TokenExpiresSoon bool   `json:"token_expires_soon,omitempty"` // 令牌将在 24 小时内过期
 	TokenExpiresAt   int64  `json:"token_expires_at,omitempty"`   // 令牌过期时间戳
 	ServerTime       int64  `json:"server_time"`                  // 当前服务器时间
+	MasterURL        string `json:"master_url,omitempty"`         // 恢复连接时让 Agent 持久化主控的新地址
 }
 
 // RemoteHeartbeat 处理来自远程服务器的心跳请求
@@ -338,6 +341,7 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 		TokenExpiresSoon: result.TokenExpiresSoon,
 		ServerTime:       time.Now().Unix(),
 	}
+	resp.MasterURL, _ = h.repo.GetSystemSetting(ctx, "master_url")
 
 	if result.TokenExpiresAt != nil {
 		resp.TokenExpiresAt = result.TokenExpiresAt.Unix()
@@ -543,6 +547,18 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 			}
 		}
 	}
+	scriptRecoveryURL, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryURL)
+	if strings.TrimSpace(scriptRecoveryURL) == "" {
+		port := strings.TrimSpace(os.Getenv("PORT"))
+		if port == "" {
+			port = "12889"
+		}
+		host := scriptServer
+		if parsed, err := url.Parse("//" + scriptServer); err == nil && parsed.Hostname() != "" {
+			host = parsed.Hostname()
+		}
+		scriptRecoveryURL = "http://" + net.JoinHostPort(host, port)
+	}
 
 	// 返回安装脚本内容
 	script := `#!/bin/bash
@@ -558,6 +574,7 @@ AUTO_STEAL_SELF="` + map[bool]string{true: "1", false: "0"}[stealSelf] + `"
 FRONT_SERVICE=` + shSingleQuote(frontService) + `
 XRAY_MODE=` + shSingleQuote(xrayMode) + `
 MASTER_PUBLIC_KEY=` + shSingleQuote(h.masterPublicKeyBase64()) + `
+RECOVERY_URL=` + shSingleQuote(scriptRecoveryURL) + `
 LISTEN_PORT=` + shSingleQuote(listenPortParam) + `
 
 # 协议:优先用主控注入的 SCRIPT_PROTOCOL(来自系统设置 master_url 的 scheme),
@@ -663,6 +680,7 @@ cat > /etc/mmw-agent/config.yaml << EOF
 
 mode: remote
 master_url: ${MASTER_URL}
+recovery_url: ${RECOVERY_URL}
 token: ${TOKEN}
 connection_mode: websocket
 xray_mode: ${XRAY_MODE}

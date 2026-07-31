@@ -9757,6 +9757,24 @@ func (r *TrafficRepository) SetSystemSetting(ctx context.Context, key, value str
 	return nil
 }
 
+// SetSystemSettings atomically persists settings that form one state transition.
+func (r *TrafficRepository) SetSystemSettings(ctx context.Context, values map[string]string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for key, value := range values {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`, key, value); err != nil {
+			return fmt.Errorf("设置系统设置 %s: %w", key, err)
+		}
+	}
+	return tx.Commit()
+}
+
 // serverNotifyToleranceKey 上下线通知容忍阈值(秒)在 system_settings 里的 key。
 const serverNotifyToleranceKey = "notify_server_tolerance_seconds"
 
