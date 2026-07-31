@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -38,12 +40,9 @@ func (e *TrafficLimitEnforcer) Start(ctx context.Context, interval time.Duration
 	}
 }
 
-// recordedCheck 跑一次 CheckAll 并记入 task_runs（P3）。CheckAll 本身不返回 error/摘要，
-// 故这里只记「跑过 + 耗时」；任务内部的错误仍走它自己的日志。
 func (e *TrafficLimitEnforcer) recordedCheck(ctx context.Context) {
 	taskrun.Record(ctx, "traffic_enforcer", func() (string, error) {
-		e.CheckAll(ctx)
-		return "", nil
+		return e.CheckAll(ctx)
 	})
 }
 
@@ -85,11 +84,16 @@ func shouldResetThisMonth(now time.Time, isReset bool, resetDay int, lastResetAt
 	return lastResetAt.Year() != now.Year() || lastResetAt.Month() != now.Month()
 }
 
-func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
+func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
+	var (
+		userResetCount   int
+		serverResetCount int
+		runErrors        []error
+	)
 	users, err := e.repo.ListUsersWithPackage(ctx)
 	if err != nil {
 		log.Printf("[TrafficLimitEnforcer] Failed to list users: %v", err)
-		return
+		runErrors = append(runErrors, fmt.Errorf("list users: %w", err))
 	}
 
 	pkgCache := make(map[int64]*storage.Package)
@@ -163,12 +167,11 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 		// 还原"超额"标志:重置后用户应该重新有流量配额,wasOverLimit → 立即恢复入站。
 		if shouldResetThisMonth(now, user.IsReset, user.ResetDay, user.LastResetAt) {
 			log.Printf("[TrafficLimitEnforcer] User %s monthly reset (day=%d, last=%v)", user.Username, user.ResetDay, user.LastResetAt)
-			if err := e.repo.ResetUserTrafficCycle(ctx, user.Username); err != nil {
+			if err := e.repo.ResetUserTrafficCycleAt(ctx, user.Username, now); err != nil {
 				log.Printf("[TrafficLimitEnforcer] Failed to reset user %s: %v", user.Username, err)
+				runErrors = append(runErrors, fmt.Errorf("reset user %s: %w", user.Username, err))
 			} else {
-				if err := e.repo.UpdateUserLastResetAt(ctx, user.Username, now); err != nil {
-					log.Printf("[TrafficLimitEnforcer] Failed to write last_reset_at for %s: %v", user.Username, err)
-				}
+				userResetCount++
 				// 复用现有"恢复入站"路径:如果用户之前因超额被踢,reset 后自动放回
 				if wasOver, _ := e.repo.IsUserOverLimit(ctx, user.Username); wasOver {
 					log.Printf("[TrafficLimitEnforcer] User %s back under limit after monthly reset, restoring inbounds", user.Username)
@@ -239,30 +242,38 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) {
 		}
 	}
 
-	// 服务器按 traffic_reset_day 自动重置流量:逻辑同手动"重置流量"(offset = -当前用量)。
-	// 触发时刻固定当天 08:05 之后,避开时区在 00:00 附近的跨天误判;只影响服务器,不动用户套餐重置。
-	isAfter0805 := now.Hour() > 8 || (now.Hour() == 8 && now.Minute() >= 5)
-	if isAfter0805 {
-		if servers, sErr := e.repo.ListRemoteServers(ctx); sErr == nil {
-			for _, s := range servers {
-				if s.IsFederated {
-					continue // 联邦分享的服务器流量归拥有方管,本机不重置
-				}
-				if !shouldResetThisMonth(now, true, s.TrafficResetDay, s.LastTrafficResetAt) {
-					continue
-				}
-				if rErr := e.repo.ResetRemoteServerTrafficCycle(ctx, s.ID); rErr != nil {
-					log.Printf("[TrafficLimitEnforcer] reset server %d(%s) traffic failed: %v", s.ID, s.Name, rErr)
-					continue
-				}
-				_ = e.repo.UpdateRemoteServerLastTrafficResetAt(ctx, s.ID, now)
-				_ = e.repo.ClearTrafficThresholdNotified(ctx, s.ID) // 新周期清去重标记,越线可再次告警
-				log.Printf("[TrafficLimitEnforcer] server %d(%s) monthly traffic reset (day=%d)", s.ID, s.Name, s.TrafficResetDay)
+	// 服务器统一按 UTC 账单日在 00:05 后重置，不受主控或 Agent 所在时区影响。
+	if servers, sErr := e.repo.ListRemoteServers(ctx); sErr == nil {
+		for _, s := range servers {
+			if s.IsFederated {
+				continue // 联邦分享的服务器流量归拥有方管,本机不重置
 			}
-		} else {
-			log.Printf("[TrafficLimitEnforcer] list servers for reset failed: %v", sErr)
+			utcNow := now.UTC()
+			isAfter0005 := utcNow.Hour() > 0 || (utcNow.Hour() == 0 && utcNow.Minute() >= 5)
+			var lastResetUTC *time.Time
+			if s.LastTrafficResetAt != nil {
+				t := s.LastTrafficResetAt.UTC()
+				lastResetUTC = &t
+			}
+			if !isAfter0005 || !shouldResetThisMonth(utcNow, true, s.TrafficResetDay, lastResetUTC) {
+				continue
+			}
+			if rErr := e.repo.ResetRemoteServerTrafficCycleAt(ctx, s.ID, now); rErr != nil {
+				log.Printf("[TrafficLimitEnforcer] reset server %d(%s) traffic failed: %v", s.ID, s.Name, rErr)
+				runErrors = append(runErrors, fmt.Errorf("reset server %d(%s): %w", s.ID, s.Name, rErr))
+				continue
+			}
+			serverResetCount++
+			log.Printf("[TrafficLimitEnforcer] server %d(%s) monthly traffic reset (day=%d, utc_time=%s)",
+				s.ID, s.Name, s.TrafficResetDay, utcNow.Format(time.RFC3339))
 		}
+	} else {
+		log.Printf("[TrafficLimitEnforcer] list servers for reset failed: %v", sErr)
+		runErrors = append(runErrors, fmt.Errorf("list servers: %w", sErr))
 	}
+
+	summary := fmt.Sprintf("users_reset=%d servers_reset=%d", userResetCount, serverResetCount)
+	return summary, errors.Join(runErrors...)
 }
 
 // removeUserFromAllInbounds 从该用户所有 inbound 摘除 client。

@@ -8166,7 +8166,22 @@ func (r *TrafficRepository) UpdatePackage(ctx context.Context, pkg Package) erro
 		trafficMode = "oneway"
 	}
 
-	result, err := r.db.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin update package: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var oldIsReset, oldResetDay int
+	if err := tx.QueryRowContext(ctx, `SELECT is_reset, reset_day FROM packages WHERE id = ?`, pkg.ID).
+		Scan(&oldIsReset, &oldResetDay); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrPackageNotFound
+		}
+		return fmt.Errorf("read old package reset settings: %w", err)
+	}
+
+	result, err := tx.ExecContext(ctx, query, name, pkg.Description, pkg.TrafficLimitBytes,
 		pkg.CycleDays, isReset, pkg.ResetDay, string(nodesJSON), pkg.SpeedLimitMbps, pkg.DeviceLimit, autoSpeedJSON, trafficMode, pkg.TemplateFilename, pkg.SurgeTemplateFilename, nodeMultJSON, nodeSpeedJSON, nodeDeviceJSON, pkg.ID)
 	if err != nil {
 		return fmt.Errorf("update package: %w", err)
@@ -8181,6 +8196,18 @@ func (r *TrafficRepository) UpdatePackage(ctx context.Context, pkg Package) erro
 		return ErrPackageNotFound
 	}
 
+	// 套餐重置设置是已绑定用户的默认真值源。只同步仍与旧套餐值一致的用户，
+	// 从而更新普通订阅用户，同时保留管理员显式设置过的逐用户覆盖。
+	if oldIsReset != isReset || oldResetDay != pkg.ResetDay {
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET is_reset = ?, reset_day = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE package_id = ? AND COALESCE(is_reset,0) = ? AND COALESCE(reset_day,1) = ?`,
+			isReset, pkg.ResetDay, pkg.ID, oldIsReset, oldResetDay); err != nil {
+			return fmt.Errorf("sync package reset settings to users: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit update package: %w", err)
+	}
 	return nil
 }
 
@@ -11930,6 +11957,16 @@ func (r *TrafficRepository) GetUserTrafficByUsername(ctx context.Context, userna
 // user_email_traffic 走基线而非清零:把 uplink/downlink 的当前值抬进 cycle_base_*,判定只看差值。
 // 这样 total_* 的历史累计得以保留,collector 的 `uplink = uplink + delta` 累加逻辑也无需改动。
 func (r *TrafficRepository) ResetUserTrafficCycle(ctx context.Context, username string) error {
+	return r.resetUserTrafficCycle(ctx, username, nil)
+}
+
+// ResetUserTrafficCycleAt 执行自动月度重置，并在同一事务写入 last_reset_at。
+// 流量归零与幂等标记不可拆开，否则任一步失败都会留下“看似没重置”或同月重复重置。
+func (r *TrafficRepository) ResetUserTrafficCycleAt(ctx context.Context, username string, resetAt time.Time) error {
+	return r.resetUserTrafficCycle(ctx, username, &resetAt)
+}
+
+func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username string, resetAt *time.Time) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
@@ -11960,6 +11997,16 @@ func (r *TrafficRepository) ResetUserTrafficCycle(ctx context.Context, username 
 		WHERE attributed_username = ?`
 	if _, err := tx.ExecContext(ctx, emailStmt, username); err != nil {
 		return fmt.Errorf("reset user email traffic cycle: %w", err)
+	}
+	if resetAt != nil {
+		const markerStmt = `UPDATE users SET last_reset_at = ?, traffic_warned_80 = 0, updated_at = CURRENT_TIMESTAMP WHERE username = ?`
+		result, err := tx.ExecContext(ctx, markerStmt, *resetAt, username)
+		if err != nil {
+			return fmt.Errorf("mark user traffic cycle reset: %w", err)
+		}
+		if affected, _ := result.RowsAffected(); affected == 0 {
+			return ErrUserNotFound
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -12034,6 +12081,69 @@ func (r *TrafficRepository) ResetRemoteServerTrafficCycle(ctx context.Context, s
 		return fmt.Errorf("get server traffic used: %w", err)
 	}
 	return r.UpdateRemoteServerTrafficOffset(ctx, serverID, -aggregated)
+}
+
+// ResetRemoteServerTrafficCycleAt 原子执行服务器月度重置、幂等标记和告警去重清理。
+func (r *TrafficRepository) ResetRemoteServerTrafficCycleAt(ctx context.Context, serverID int64, resetAt time.Time) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin server traffic reset: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var mode, source string
+	var sysRx, sysTx int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(traffic_stats_mode,'both'), COALESCE(traffic_source,'xray'),
+		COALESCE(system_rx_cycle,0), COALESCE(system_tx_cycle,0) FROM remote_servers WHERE id = ?`, serverID).
+		Scan(&mode, &source, &sysRx, &sysTx); err != nil {
+		return fmt.Errorf("read server traffic state: %w", err)
+	}
+	var used int64
+	if source == "system" {
+		switch mode {
+		case "upload":
+			used = sysTx
+		case "download":
+			used = sysRx
+		case "max":
+			used = sysRx
+			if sysTx > used {
+				used = sysTx
+			}
+		default:
+			used = sysRx + sysTx
+		}
+	} else {
+		var query string
+		switch mode {
+		case "upload":
+			query = `SELECT COALESCE(SUM(uplink),0) FROM node_traffic WHERE server_id = ?`
+		case "download":
+			query = `SELECT COALESCE(SUM(downlink),0) FROM node_traffic WHERE server_id = ?`
+		case "max":
+			query = `SELECT MAX(COALESCE(SUM(uplink),0),COALESCE(SUM(downlink),0)) FROM node_traffic WHERE server_id = ?`
+		default:
+			query = `SELECT COALESCE(SUM(uplink + downlink),0) FROM node_traffic WHERE server_id = ?`
+		}
+		if err := tx.QueryRowContext(ctx, query, serverID).Scan(&used); err != nil {
+			return fmt.Errorf("aggregate server traffic: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE remote_servers
+		SET traffic_used_offset = ?, last_traffic_reset_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		-used, resetAt, serverID); err != nil {
+		return fmt.Errorf("apply server traffic reset: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM traffic_threshold_notified WHERE server_id = ?`, serverID); err != nil {
+		return fmt.Errorf("clear server traffic notification marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit server traffic reset: %w", err)
+	}
+	return nil
 }
 
 // ==================== 流量快照 CRUD ====================

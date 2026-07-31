@@ -1660,6 +1660,7 @@ func startDatabaseBackupTask(ctx context.Context, repo *storage.TrafficRepositor
 func startDatabaseHealthTask(ctx context.Context, repo *storage.TrafficRepository, stopBackgroundTasks context.CancelFunc) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	unhealthy := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -1669,12 +1670,42 @@ func startDatabaseHealthTask(ctx context.Context, repo *storage.TrafficRepositor
 			err := repo.QuickCheck(checkCtx)
 			cancel()
 			if err != nil {
-				logger.Error("数据库完整性检查失败，已停止流量采集及后台数据库写入任务，防止继续损坏；请检查磁盘并重启以触发备份恢复", "error", err)
-				stopBackgroundTasks()
-				return
+				unhealthy = true
+				// 查询超时、database is locked、短暂 I/O 错误不等于数据库已损坏。
+				// 旧逻辑遇到一次临时错误就取消共享 context，流量重置等任务会永久停止且无法自愈。
+				if isDefiniteDatabaseCorruption(err) {
+					logger.Error("数据库确认损坏，已停止后台数据库写入任务；请检查磁盘并重启以触发备份恢复", "error", err)
+					stopBackgroundTasks()
+					return
+				}
+				logger.Warn("数据库健康检查暂时失败，将继续重试；后台任务未停止", "error", err)
+				continue
+			}
+			if unhealthy {
+				logger.Info("数据库健康检查已恢复")
+				unhealthy = false
 			}
 		}
 	}
+}
+
+func isDefiniteDatabaseCorruption(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"database disk image is malformed",
+		"file is not a database",
+		"sqlite_corrupt",
+		"sqlite_notadb",
+		"quick_check failed:",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func startDailySnapshotTask(ctx context.Context, trafficHandler *handler.TrafficSummaryHandler, trafficCollector *traffic.Collector) {
