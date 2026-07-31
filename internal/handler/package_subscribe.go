@@ -235,6 +235,20 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
+	clientType := resolveClientType(r)
+	// 套餐订阅走独立处理器，不能依赖普通订阅路径的信息节点注入。
+	// 普通模式只给 Clash 系 YAML 客户端添加；“仅 V2Ray”模式则在 URI 转换前添加，
+	// 由 producer 将两个 SS 占位节点转换为客户端可展示的链接。
+	if sysCfg.EnableSubInfoNodes && shouldAddPackageSubInfoNodes(clientType, sysCfg.SubInfoV2RayOnly) {
+		limit := resolveTrafficLimitBytes(&user, pkg)
+		used, _ := h.repo.GetUserBillableTraffic(r.Context(), username)
+		remaining := limit - used
+		if remaining < 0 {
+			remaining = 0
+		}
+		result = string(prependSubInfoNodesToClash([]byte(result), sysCfg, user.PackageEndDate, remaining))
+	}
+
 	// 通知 admin "用户拉了套餐订阅" + 静默期记录访问 IP — 跟 SubscriptionHandler L286 同款。
 	// 之前套餐订阅这条路径完全没有这两个调用,所以 admin tg 从来收不到「用户拉套餐订阅」通知。
 	// 放在这里:此前所有可能失败的步骤(查套餐 / 拼节点 / 加模板 / 渲染)都已成功,
@@ -249,7 +263,6 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Format conversion
-	clientType := resolveClientType(r)
 	if clientType == "" || clientType == "clash" || clientType == "clashmeta" {
 		// 原样 YAML 输出(不经 producer)→ 过滤 snell v6(mihomo 只支持 v1–v5,v6 会整份拒载)
 		result = string(filterSnellV6FromClashYAML([]byte(result)))
@@ -271,6 +284,18 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	setSubscriptionName(w, pkg.Name, "")
 	h.writeTrafficHeader(r.Context(), w, user, pkg)
 	w.Write(converted)
+}
+
+func shouldAddPackageSubInfoNodes(clientType string, v2rayOnly bool) bool {
+	if v2rayOnly {
+		return isV2RayClientType(clientType)
+	}
+	switch strings.ToLower(strings.TrimSpace(clientType)) {
+	case "", "clash", "clashmeta", "stash", "egern":
+		return true
+	default:
+		return false
+	}
 }
 
 // setSubscriptionName 让客户端显示套餐名作为订阅名。
