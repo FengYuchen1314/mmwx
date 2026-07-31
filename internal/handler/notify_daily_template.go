@@ -21,7 +21,13 @@ const defaultDailyTrafficTemplate = `*每日流量统计*
 {{服务器列表}}
 
 *用户流量:*
-{{用户列表}}`
+{{用户列表}}
+
+*{{增量日期}}节点增量:* {{节点增量总计}}GB
+{{节点增量列表}}
+
+*{{增量日期}}用户增量:* {{用户增量总计}}GB
+{{用户增量列表}}`
 
 // dailyTrafficPlaceholders 前端「可用占位符」说明的唯一数据源(经 /preview 返回),
 // 避免前端硬编码一份、后端改了对不上。
@@ -33,13 +39,23 @@ var dailyTrafficPlaceholders = []struct {
 	{"{{服务器列表}}", "按用量降序的服务器行,每行「• 名称: 已用/上限 (百分比)」;无上限的服务器只显示已用"},
 	{"{{用户列表}}", "按用量降序的用户行,每行「• 用户名: 已用GB」;用量为 0 的用户不出现"},
 	{"{{日期}}", "推送当天日期,格式 2006-01-02"},
+	{"{{增量日期}}", "增量统计所属日期,通常为推送日的前一天"},
+	{"{{节点增量总计}}", "增量日期内所有节点流量增量合计,单位 GB"},
+	{"{{节点增量列表}}", "按增量降序的节点行,每行「• 节点名: 增量GB」"},
+	{"{{用户增量总计}}", "增量日期内所有用户计费流量增量合计,已包含套餐及节点倍率,单位 GB"},
+	{"{{用户增量列表}}", "按增量降序的用户行,每行「• 用户名: 增量GB」"},
 }
 
 type dailyTrafficData struct {
-	Date        string
-	TotalGB     string // 已格式化,如 "12.34"
-	ServerLines []string
-	UserLines   []string
+	Date                 string
+	TotalGB              string // 已格式化,如 "12.34"
+	ServerLines          []string
+	UserLines            []string
+	IncrementDate        string
+	NodeIncrementTotalGB string
+	NodeIncrementLines   []string
+	UserIncrementTotalGB string
+	UserIncrementLines   []string
 }
 
 // blankRunRe 用于把列表被删空后留下的大段空行压回一个空行。
@@ -69,12 +85,31 @@ func renderDailyTrafficTemplate(tpl string, d dailyTrafficData) string {
 	if len(d.UserLines) == 0 {
 		tpl = dropLinesContaining(tpl, "{{用户列表}}")
 	}
+	if len(d.NodeIncrementLines) == 0 {
+		tpl = dropLinesContaining(tpl, "{{节点增量列表}}")
+	}
+	if len(d.UserIncrementLines) == 0 {
+		tpl = dropLinesContaining(tpl, "{{用户增量列表}}")
+	}
+	// 增量查询失败时总计为空；把对应标题/总计整行一起移除，避免发出「节点增量: GB」。
+	// 合法的无流量日总计是 "0.00"，仍会正常显示。
+	if d.NodeIncrementTotalGB == "" {
+		tpl = dropLinesContaining(tpl, "{{节点增量总计}}")
+	}
+	if d.UserIncrementTotalGB == "" {
+		tpl = dropLinesContaining(tpl, "{{用户增量总计}}")
+	}
 
 	values := map[string]string{
-		"{{总流量}}":   d.TotalGB,
-		"{{日期}}":    d.Date,
-		"{{服务器列表}}": strings.Join(d.ServerLines, "\n"),
-		"{{用户列表}}":  strings.Join(d.UserLines, "\n"),
+		"{{总流量}}":    d.TotalGB,
+		"{{日期}}":     d.Date,
+		"{{服务器列表}}":  strings.Join(d.ServerLines, "\n"),
+		"{{用户列表}}":   strings.Join(d.UserLines, "\n"),
+		"{{增量日期}}":   d.IncrementDate,
+		"{{节点增量总计}}": d.NodeIncrementTotalGB,
+		"{{节点增量列表}}": strings.Join(d.NodeIncrementLines, "\n"),
+		"{{用户增量总计}}": d.UserIncrementTotalGB,
+		"{{用户增量列表}}": strings.Join(d.UserIncrementLines, "\n"),
 	}
 	out := placeholderRe.ReplaceAllStringFunc(tpl, func(m string) string {
 		if v, ok := values[m]; ok {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -285,6 +286,15 @@ func buildDailyTrafficData(ctx context.Context, repo *storage.TrafficRepository)
 		Date:    time.Now().Format("2006-01-02"),
 		TotalGB: fmt.Sprintf("%.2f", float64(totalUsed)/(1024*1024*1024)),
 	}
+	if inc, incErr := buildDailyIncrementData(ctx, repo, time.Now()); incErr != nil {
+		log.Printf("[Notify] 构建每日增量统计失败: %v", incErr)
+	} else {
+		data.IncrementDate = inc.Date
+		data.NodeIncrementTotalGB = fmt.Sprintf("%.2f", float64(inc.NodeTotal)/(1024*1024*1024))
+		data.NodeIncrementLines = inc.NodeLines
+		data.UserIncrementTotalGB = fmt.Sprintf("%.2f", float64(inc.UserTotal)/(1024*1024*1024))
+		data.UserIncrementLines = inc.UserLines
+	}
 
 	for _, s := range serverList {
 		usedGB := float64(s.used) / (1024 * 1024 * 1024)
@@ -325,6 +335,157 @@ func buildDailyTrafficData(ctx context.Context, repo *storage.TrafficRepository)
 		return data, false
 	}
 	return data, true
+}
+
+type dailyIncrementData struct {
+	Date      string
+	NodeTotal int64
+	UserTotal int64
+	NodeLines []string
+	UserLines []string
+}
+
+// buildDailyIncrementData 用连续两个本地零点快照计算完整自然日增量。
+// 推送通常在早上执行，因此 today(今日 00:00) - yesterday(昨日 00:00) 正好是昨日全天。
+func buildDailyIncrementData(ctx context.Context, repo *storage.TrafficRepository, now time.Time) (dailyIncrementData, error) {
+	today := now.Format("2006-01-02")
+	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
+	out := dailyIncrementData{Date: yesterday}
+
+	nodeBefore, err := repo.GetNodeTrafficSnapshots(ctx, yesterday)
+	if err != nil {
+		return out, fmt.Errorf("load yesterday node snapshots: %w", err)
+	}
+	nodeAfter, err := repo.GetNodeTrafficSnapshots(ctx, today)
+	if err != nil {
+		return out, fmt.Errorf("load today node snapshots: %w", err)
+	}
+	servers, err := repo.ListRemoteServers(ctx)
+	if err != nil {
+		return out, fmt.Errorf("list servers for node labels: %w", err)
+	}
+	serverNames := make(map[int64]string, len(servers))
+	for _, s := range servers {
+		serverNames[s.ID] = s.Name
+	}
+	nodes, err := repo.ListAllNodes(ctx)
+	if err != nil {
+		return out, fmt.Errorf("list nodes for labels: %w", err)
+	}
+	nodeNames := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		if n.InboundTag == "" || n.NodeName == "" {
+			continue
+		}
+		key := n.OriginalServer + "\x00" + n.InboundTag
+		if _, exists := nodeNames[key]; !exists {
+			nodeNames[key] = n.NodeName
+		}
+	}
+	type bytePair struct{ up, down int64 }
+	nodeBase := make(map[string]bytePair, len(nodeBefore))
+	for _, s := range nodeBefore {
+		if s.Type == "inbound" {
+			nodeBase[strconv.FormatInt(s.ServerID, 10)+"\x00"+s.Tag] = bytePair{s.Uplink, s.Downlink}
+		}
+	}
+	type usage struct {
+		name string
+		used int64
+	}
+	var nodeUsage []usage
+	for _, s := range nodeAfter {
+		if s.Type != "inbound" {
+			continue
+		}
+		key := strconv.FormatInt(s.ServerID, 10) + "\x00" + s.Tag
+		base, ok := nodeBase[key]
+		if !ok || s.Date == nodeBeforeDate(nodeBefore, s.ServerID, s.Tag, s.Type) {
+			continue
+		}
+		up, down := s.Uplink-base.up, s.Downlink-base.down
+		if up < 0 {
+			up = 0
+		}
+		if down < 0 {
+			down = 0
+		}
+		used := up + down
+		if used <= 0 {
+			continue
+		}
+		serverName := serverNames[s.ServerID]
+		name := nodeNames[serverName+"\x00"+s.Tag]
+		if name == "" {
+			name = serverName + "/" + s.Tag
+		}
+		nodeUsage = append(nodeUsage, usage{name: name, used: used})
+		out.NodeTotal += used
+	}
+	sort.Slice(nodeUsage, func(i, j int) bool { return nodeUsage[i].used > nodeUsage[j].used })
+	for _, n := range nodeUsage {
+		out.NodeLines = append(out.NodeLines, fmt.Sprintf("• %s: %.2fGB", notify.EscapeMarkdown(n.name), float64(n.used)/(1024*1024*1024)))
+	}
+
+	// 用户用 email 级累计快照差分，避免用户在月度/手动重置套餐周期时 user_traffic 被清零。
+	emailBefore, err := repo.GetUserEmailTrafficSnapshots(ctx, yesterday)
+	if err != nil {
+		return out, fmt.Errorf("load yesterday user snapshots: %w", err)
+	}
+	emailAfter, err := repo.GetUserEmailTrafficSnapshots(ctx, today)
+	if err != nil {
+		return out, fmt.Errorf("load today user snapshots: %w", err)
+	}
+	attr, err := repo.BuildEmailAttributor(ctx)
+	if err != nil {
+		return out, fmt.Errorf("build user attribution: %w", err)
+	}
+	emailBase := make(map[string]storage.UserEmailTrafficSnapshot, len(emailBefore))
+	for _, s := range emailBefore {
+		emailBase[strconv.FormatInt(s.ServerID, 10)+"\x00"+s.Email] = s
+	}
+	userUsage := make(map[string]int64)
+	for _, s := range emailAfter {
+		key := strconv.FormatInt(s.ServerID, 10) + "\x00" + s.Email
+		base, ok := emailBase[key]
+		if !ok || s.Date == base.Date {
+			continue
+		}
+		up, down := s.Uplink-base.Uplink, s.Downlink-base.Downlink
+		if up < 0 {
+			up = 0
+		}
+		if down < 0 {
+			down = 0
+		}
+		attribution := attr.Classify(s.Email, s.ServerID)
+		if attribution.Username == "" {
+			continue
+		}
+		weighted := int64(math.Round(float64(up+down) * attr.EmailWeight(s.Email, s.ServerID)))
+		if weighted > 0 {
+			userUsage[attribution.Username] += weighted
+		}
+	}
+	var users []usage
+	for username, used := range userUsage {
+		users = append(users, usage{name: username, used: used})
+		out.UserTotal += used
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].used > users[j].used })
+	for _, u := range users {
+		out.UserLines = append(out.UserLines, fmt.Sprintf("• %s: %.2fGB", notify.EscapeMarkdown(u.name), float64(u.used)/(1024*1024*1024)))
+	}
+	return out, nil
+}
+
+func nodeBeforeDate(rows []storage.NodeTrafficSnapshot, serverID int64, tag, trafficType string) string {
+	for _, s := range rows {
+		if s.ServerID == serverID && s.Tag == tag && s.Type == trafficType {
+			return s.Date
+		}
+	}
+	return ""
 }
 
 func sendDailyTrafficNotification(ctx context.Context, repo *storage.TrafficRepository, n *notify.Notifier) {

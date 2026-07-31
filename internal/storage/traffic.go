@@ -13178,11 +13178,11 @@ func (r *TrafficRepository) GetNodeTrafficSnapshots(ctx context.Context, date st
 SELECT s.id, s.server_id, s.tag, s.type, s.date, s.uplink, s.downlink
 FROM node_traffic_snapshots s
 JOIN (
-    SELECT server_id, tag, MAX(date) AS max_date
+    SELECT server_id, tag, type, MAX(date) AS max_date
     FROM node_traffic_snapshots
     WHERE date <= ?
-    GROUP BY server_id, tag
-) latest ON s.server_id = latest.server_id AND s.tag = latest.tag AND s.date = latest.max_date`
+    GROUP BY server_id, tag, type
+) latest ON s.server_id = latest.server_id AND s.tag = latest.tag AND s.type = latest.type AND s.date = latest.max_date`
 	rows, err := r.db.QueryContext(ctx, query, date)
 	if err != nil {
 		return nil, err

@@ -292,7 +292,12 @@ func (h *NotifyConfigHandler) handlePreview(w http.ResponseWriter, r *http.Reque
 				"• 示例服务器 A: 8.2GB/100GB (8%)",
 				"• 示例服务器 B: 4.1GB",
 			},
-			UserLines: []string{"• alice: 7.20GB", "• bob: 5.14GB"},
+			UserLines:            []string{"• alice: 7.20GB", "• bob: 5.14GB"},
+			IncrementDate:        time.Now().AddDate(0, 0, -1).Format("2006-01-02"),
+			NodeIncrementTotalGB: "3.21",
+			NodeIncrementLines:   []string{"• 香港节点: 2.10GB", "• 日本节点: 1.11GB"},
+			UserIncrementTotalGB: "3.56",
+			UserIncrementLines:   []string{"• alice: 2.40GB", "• bob: 1.16GB"},
 		}
 	}
 
