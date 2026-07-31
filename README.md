@@ -171,6 +171,9 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <summary>更新日志</summary>
 
 ### v0.4.1 (2026-07-31)
+- 🌈 管理员miniapp增加服务器xray开关
+- 🛠️ fix: 流量重置逻辑闭环
+### v0.4.1 (2026-07-31)
 - 🌈 增加批量关闭跳过证书验证按钮
 - 🛠️ fix: surge snellv6 版本号转换错误
 - 🛠️ fix: 修改服务器地址没有成功更新节点server
