@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60">
+  <g fill="#a78bca"><path d="M0 0h10L5 5l5 5H0zM60 0H50l5 5-5 5h10zM0 60h10l-5-5 5-5H0zM60 60H50l5-5-5-5h10z"/><circle cx="30" cy="4" r="3"/><circle cx="30" cy="56" r="3"/><circle cx="4" cy="30" r="3"/><circle cx="56" cy="30" r="3"/></g>
+  <path fill="none" stroke="#c4a7df" stroke-width="2" stroke-dasharray="3 3" d="M8 4h44M8 56h44M4 8v44M56 8v44"/>
+</svg>

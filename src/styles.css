@@ -1,0 +1,43 @@
+* { box-sizing: border-box; }
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172033; background: #f5f7fb; font-synthesis: none;
+  --primary: #2563eb; --surface: #fff; --border: #e2e8f0; --muted: #64748b;
+  --shadow: 0 8px 28px rgba(15, 23, 42, .08); --radius: 12px;
+}
+html, body, #root { min-height: 100%; margin: 0; }
+button { font: inherit; }
+.center { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); text-align: center; }
+.center.error { color: #dc2626; }.pulse { animation: pulse 1.2s infinite; } @keyframes pulse { 50% { opacity: .3; } }
+.app-shell { min-height: 100vh; background: var(--page-bg, #f5f7fb); }
+.topbar { position: sticky; top: 0; z-index: 20; min-height: 64px; padding: 10px max(18px, calc((100vw - 1500px) / 2)); display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 88%, transparent); backdrop-filter: blur(14px); }
+.topbar > div { display: flex; align-items: center; min-width: 0; gap: 10px; }.topbar img { height: 36px; max-width: 150px; object-fit: contain; }.topbar h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 19px; }
+.topbar nav { display: flex; gap: 5px; }.topbar button, .ranges button { border: 1px solid var(--border); color: inherit; background: var(--surface); border-radius: 8px; padding: 6px 11px; cursor: pointer; }.topbar button.active, .ranges button.active { color: #fff; border-color: var(--primary); background: var(--primary); }
+.servers { width: min(1500px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 50px; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap: 18px; }
+.servers.list { grid-template-columns: 1fr; }.servers.list .server-card { display: grid; grid-template-columns: minmax(180px, .7fr) 2fr minmax(180px, .7fr); align-items: center; gap: 22px; }.servers.list .server-title { border: 0; padding: 0; }.servers.list .metrics { padding: 0; }.servers.list .ping-grid { border: 0; padding: 0; }
+.server-card { position: relative; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+.server-title { display: flex; align-items: center; gap: 9px; padding: 15px 17px; border-bottom: 1px solid var(--border); }.server-title h2 { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: 0; font-size: 16px; }.server-title > span:last-child { color: var(--muted); font-size: 12px; }
+.status { width: 9px; height: 9px; border-radius: 50%; background: #94a3b8; box-shadow: 0 0 0 4px rgba(148,163,184,.12); }.status.online { background: #22c55e; box-shadow: 0 0 0 4px rgba(34,197,94,.14); }
+.metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 15px 18px; padding: 17px; }.metric-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }.metric-head span { display: flex; align-items: center; gap: 5px; color: var(--muted); }.metric-head strong { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.meter { height: 5px; margin-top: 7px; overflow: hidden; border-radius: 99px; background: color-mix(in srgb, var(--border) 70%, transparent); }.meter i { display: block; height: 100%; border-radius: inherit; background: var(--primary); }
+.speed { display: flex; justify-content: space-around; padding: 8px 17px 14px; color: var(--muted); font: 12px ui-monospace, monospace; }
+.ping-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; padding: 14px 17px 17px; border-top: 1px solid var(--border); }.ping-grid button { min-width: 0; padding: 0; border: 0; color: inherit; background: none; cursor: pointer; }.ping-grid span { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }.ping-grid strong { margin-left: auto; color: #172033; }.ping-grid em { display: flex; gap: 2px; height: 7px; margin-top: 8px; }.ping-grid em i { flex: 1; min-width: 2px; border-radius: 2px; background: #cbd5e1; }.ping-grid em i.good { background: #22c55e; }.ping-grid em i.warn { background: #f59e0b; }.ping-grid em i.bad { background: #ef4444; }
+.empty { grid-column: 1 / -1; padding: 80px; color: var(--muted); text-align: center; }footer { padding: 20px; color: var(--muted); text-align: center; font-size: 12px; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 18px; background: rgba(15,23,42,.55); }.modal { width: min(760px, 100%); padding: 20px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: 0 24px 60px rgba(0,0,0,.25); }.modal header { display: flex; align-items: center; justify-content: space-between; }.modal h2 { margin: 0; font-size: 17px; }.modal header button { border: 0; background: none; font-size: 28px; cursor: pointer; }.ranges { display: flex; gap: 6px; margin: 14px 0; }.chart { height: 300px; }.loading { height: 100%; display: grid; place-items: center; color: var(--muted); }
+
+/* Flat 与主控 flat 主题保持相同的圆角、阴影和蓝色主调。 */
+:root.theme-flat { --primary: #2563eb; --radius: 10px; --shadow: 0 4px 18px rgba(15,23,42,.07); --page-bg: #f8fafc; }
+
+/* Pixel 保留方角、硬阴影和暖色强调。 */
+:root.theme-pixel { --primary: #f97316; --radius: 2px; --page-bg: #fff7ed; --shadow: 4px 4px 0 #fed7aa; }
+:root.theme-pixel .server-card, :root.theme-pixel .modal { border-width: 2px; }
+:root.theme-pixel button { border-radius: 2px; }
+
+/* Anime 使用与主控相同的紫白棋盘、紫色变量和蕾丝边框资源。 */
+:root.theme-anime { --primary: #8b5cf6; --surface: #fefeff; --border: #d8c9fa; --muted: #77679d; --radius: 12px; --page-bg: #f8f5ff; --shadow: 0 8px 28px rgba(139,92,246,.12); }
+:root.theme-anime .app-shell { background-color: #faf8ff; background-image: linear-gradient(45deg, rgba(229,222,251,.55) 25%, transparent 25%), linear-gradient(-45deg, rgba(229,222,251,.55) 25%, transparent 25%), linear-gradient(45deg, transparent 75%, rgba(229,222,251,.55) 75%), linear-gradient(-45deg, transparent 75%, rgba(229,222,251,.55) 75%); background-position: 0 0, 0 16px, 16px -16px, -16px 0; background-size: 32px 32px; }
+:root.theme-anime .server-card::after, :root.theme-anime .modal::after { content: ''; pointer-events: none; position: absolute; inset: 5px; border: 10px solid transparent; border-image: url('/anime-lace.svg') 30 round; }
+:root.theme-anime .server-card { padding: 7px; }.theme-anime .server-title, .theme-anime .ping-grid { border-color: #eadffc; }.theme-anime .ping-grid strong { color: #2f2350; }
+
+:root.dark { color: #e5e7eb; --surface: #111827; --border: #334155; --muted: #94a3b8; --page-bg: #0f172a; --shadow: 0 8px 30px rgba(0,0,0,.35); }
+:root.dark .ping-grid strong { color: #f8fafc; }
+@media (max-width: 760px) { .servers { width: min(100% - 20px, 1500px); padding-top: 14px; }.servers.list { grid-template-columns: 1fr; }.servers.list .server-card { display: block; }.metrics { grid-template-columns: 1fr 1fr; gap: 13px; }.topbar { padding-inline: 12px; }.topbar h1 { font-size: 16px; }.topbar button { padding: 5px 8px; }.chart { height: 250px; } }

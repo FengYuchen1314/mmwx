@@ -1,0 +1,2 @@
+# 仅用于本地开发。复制为 .dev.vars 后填入主控生成的独立探针访问密钥。
+PROBE_TOKEN=replace-with-the-generated-probe-token
