@@ -162,6 +162,12 @@ main{padding:12px 14px}
 .st:last-child{border-bottom:0}
 .qm{display:inline-flex;width:9px;height:9px;margin-right:7px;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:var(--unknown)}
 .stlabel{font-size:12px}
+.xsw{position:relative;width:42px;height:24px;border:0;border-radius:999px;background:var(--unknown);padding:0;transition:background .2s;flex:0 0 auto}
+.xsw::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .2s}
+.xsw.on{background:var(--ok)}
+.xsw.on::after{transform:translateX(18px)}
+.xsw:disabled{opacity:.45}
+.xctl{display:flex;align-items:center;gap:9px}
 #notice{text-align:center;color:var(--muted);padding:70px 24px;line-height:1.8}
 .hide{display:none}
 nav{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--border);padding-bottom:env(safe-area-inset-bottom)}
@@ -368,16 +374,37 @@ function renderStatus(d){
  var ns=d.node_status||[];
  var on=ns.filter(function(n){return n.status==="online";}).length;
  var kind=d.status_kind==="server"?"服务器":"节点";
+ var adminServers=d.is_admin&&d.status_kind==="server";
  var h='<div class="card"><div class="title">'+kind+'状态 · 在线 '+on+'/'+ns.length+'</div>';
  if(!ns.length)h+='<div class="muted">暂无'+kind+'。</div>';
  ns.forEach(function(n){var ic,lb,col;
   if(n.status==="online"){ic='<span class="dot" style="background:var(--ok)"></span>';lb="在线";col="var(--ok)";}
   else if(n.status==="unknown"){ic='<span class="qm">?</span>';lb="外部";col="var(--unknown)";}
   else{ic='<span class="dot" style="background:var(--warn)"></span>';lb="离线";col="var(--warn)";}
-  h+='<div class="st"><span>'+ic+esc(n.name)+' <span class="muted">'+esc(n.protocol||"")+'</span></span><span class="stlabel" style="color:'+col+'">'+lb+'</span></div>';});
+  h+='<div class="st"><span>'+ic+esc(n.name)+' <span class="muted">'+esc(n.protocol||"")+'</span></span>';
+  if(adminServers){
+   h+='<span class="xctl"><span class="stlabel" style="color:'+col+'">'+lb+'</span>';
+   h+='<button class="xsw '+(n.xray_running?"on":"")+'" role="switch" aria-checked="'+(n.xray_running?"true":"false")+'" aria-label="'+esc(n.name)+' Xray '+(n.xray_running?"停止":"启动")+'" '+(n.status!=="online"?"disabled":"")+' onclick="__xrayToggle('+Number(n.id)+','+(n.xray_running?"true":"false")+',this)"></button></span>';
+  }else h+='<span class="stlabel" style="color:'+col+'">'+lb+'</span>';
+  h+='</div>';});
  h+='</div>';
  return h;
 }
+function __xrayToggle(id,running,btn){
+ var action=running?"stop":"start",verb=running?"停止":"启动";
+ if(!id||btn.disabled||!window.confirm("确定要"+verb+"这台服务器的 Xray 吗？"))return;
+ btn.disabled=true;btn.style.opacity=".45";hap("impact","medium");
+ fetch("/api/tg-webapp/admin/xray-control",{method:"POST",headers:{"Content-Type":"application/json","X-Telegram-Init-Data":window.__init},body:JSON.stringify({server_id:id,action:action})})
+  .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
+  .then(function(res){
+   if(!res.ok){throw new Error(res.j.error||verb+"失败");}
+   hap("notif","success");
+   btn.classList.toggle("on",!running);btn.setAttribute("aria-checked",!running?"true":"false");
+   setTimeout(load,1500);
+  })
+  .catch(function(err){btn.disabled=false;btn.style.opacity="";hap("notif","error");window.alert(err.message||verb+"失败");});
+}
+window.__xrayToggle=__xrayToggle;
 function render(d){
  document.getElementById("app").classList.remove("hide");
  document.getElementById("view-home").innerHTML=renderHome(d);

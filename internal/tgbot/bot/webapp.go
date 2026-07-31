@@ -44,6 +44,7 @@ func (s *Service) newWebAppHandler() http.Handler {
 	mux.HandleFunc("/api/tg-webapp/admin/announce", webRL(s.webAppAdminAnnounce))
 	mux.HandleFunc("/api/tg-webapp/admin/announcements", webRL(s.webAppAdminAnnouncementsList))
 	mux.HandleFunc("/api/tg-webapp/admin/announce-delete", webRL(s.webAppAdminAnnounceDelete))
+	mux.HandleFunc("/api/tg-webapp/admin/xray-control", webRL(s.webAppAdminXrayControl))
 
 	return mux
 }
@@ -279,7 +280,8 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 					status = "online"
 				}
 				serverStatuses = append(serverStatuses, map[string]any{
-					"name": server.Name, "status": status,
+					"id": server.ID, "name": server.Name, "status": status,
+					"xray_running": server.XrayRunning,
 				})
 			}
 		}
@@ -297,6 +299,38 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSONResp(w, http.StatusOK, resp)
+}
+
+// webAppAdminXrayControl 为管理员状态页提供 Xray 启停。
+// 身份只信任 Telegram 签名后的 tgID，不接受前端传入的管理员标记。
+func (s *Service) webAppAdminXrayControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+		return
+	}
+	if _, ok := s.adminTGID(w, r); !ok {
+		return
+	}
+	var body struct {
+		ServerID int64  `json:"server_id"`
+		Action   string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ServerID <= 0 {
+		writeJSONResp(w, http.StatusBadRequest, map[string]any{"error": "无效的服务器"})
+		return
+	}
+	body.Action = strings.ToLower(strings.TrimSpace(body.Action))
+	if body.Action != "start" && body.Action != "stop" {
+		writeJSONResp(w, http.StatusBadRequest, map[string]any{"error": "action 仅支持 start 或 stop"})
+		return
+	}
+	if err := s.client.ControlXray(r.Context(), body.ServerID, body.Action); err != nil {
+		writeJSONResp(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSONResp(w, http.StatusOK, map[string]any{
+		"success": true, "server_id": body.ServerID, "xray_running": body.Action == "start",
+	})
 }
 
 // webAppRegister 未绑定用户在 Mini App 内用「邀请码+用户名+密码」注册并绑定 TG。

@@ -219,9 +219,10 @@ func (c *Client) AdminMonthlyNodeTraffic(ctx context.Context) ([]AdminNodeTraffi
 
 // RemoteServerStatus 是管理员状态页需要的最小服务器信息。
 type RemoteServerStatus struct {
-	ID     int64  `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	XrayRunning bool   `json:"xray_running"`
 }
 
 // RemoteServers 返回主控管理的全部服务器，不按订阅或套餐过滤。
@@ -233,6 +234,16 @@ func (c *Client) RemoteServers(ctx context.Context) ([]RemoteServerStatus, error
 		return nil, err
 	}
 	return out.Servers, nil
+}
+
+// ControlXray 复用主控服务管理的控制接口。start 会走主控现有的冲突恢复逻辑，
+// stop 则直接转发给 Agent；调用者必须已经完成 Mini App 管理员身份校验。
+func (c *Client) ControlXray(ctx context.Context, serverID int64, action string) error {
+	q := url.Values{"server_id": []string{strconv.FormatInt(serverID, 10)}}
+	return c.post(ctx, "/api/admin/remote/services/control?"+q.Encode(), map[string]any{
+		"service": "xray",
+		"action":  action,
+	}, nil)
 }
 
 // NodeTrafficItem 用户在单个节点的已用流量(本周期)。
