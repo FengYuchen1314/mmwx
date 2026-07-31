@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react'
-import { Activity, Clock, Cpu, Database, HardDrive, MemoryStick, Wifi } from 'lucide-react'
+import { Activity, ArrowDown, ArrowUp, Clock, Cpu, HardDrive, LayoutGrid, List, MemoryStick, PieChart, Wifi } from 'lucide-react'
 import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import type { ProbeBucket, ProbePingSeries, ProbeServer } from './types'
 import { useProbe } from './use-probe'
+import { Twemoji } from './Twemoji'
 
 const colors = ['#8b5cf6', '#0ea5e9', '#22c55e', '#f59e0b', '#ef4444', '#ec4899']
 
@@ -86,17 +87,19 @@ function TrendDialog({ serverIndex, initial, mode, close }: {
 
 function PingPanel({ ping, serverIndex }: { ping: ProbePingSeries[]; serverIndex: number }) {
   const [mode, setMode] = useState<'latency' | 'loss' | null>(null)
+  const [selected, setSelected] = useState('__avg__')
   const average = averagePing(ping)
   const lines = [{ ...average, key: '__avg__' }, ...ping]
-  const blocks = (kind: 'latency' | 'loss') => average.buckets.map((bucket, index) => {
+  const current = selected === '__avg__' ? average : ping.find(item => (item.key || item.label) === selected) || average
+  const blocks = (kind: 'latency' | 'loss') => current.buckets.map((bucket, index) => {
     const value = kind === 'loss' ? bucket.loss : bucket.ms
     const level = value < 0 ? 'none' : kind === 'loss' ? (value >= 20 ? 'bad' : value > 0 ? 'warn' : 'good') : (value >= 200 ? 'warn' : 'good')
     return <i key={index} className={level} />
   })
   return <>
     <div className="ping-grid">
-      <button onClick={() => setMode('latency')}><span><Clock size={14} />延迟 <strong>{average.current_ms < 0 ? '超时' : `${average.current_ms.toFixed(0)} ms`}</strong></span><em>{blocks('latency')}</em></button>
-      <button onClick={() => setMode('loss')}><span><Wifi size={14} />丢包率 <strong>{average.loss_pct.toFixed(1)}%</strong></span><em>{blocks('loss')}</em></button>
+      <button onClick={() => setMode('latency')}><span><Clock size={14} /><select value={selected} onClick={event => event.stopPropagation()} onChange={event => setSelected(event.target.value)}><option value="__avg__">平均</option>{ping.map(item => <option key={item.key || item.label} value={item.key || item.label}>{item.label}</option>)}</select><strong>{current.current_ms < 0 ? '超时' : `${current.current_ms.toFixed(0)} ms`}</strong></span><em>{blocks('latency')}</em></button>
+      <button onClick={() => setMode('loss')}><span><Wifi size={14} />丢包率 <strong>{current.loss_pct.toFixed(1)}%</strong></span><em>{blocks('loss')}</em></button>
     </div>
     {mode && <TrendDialog serverIndex={serverIndex} initial={lines} mode={mode} close={() => setMode(null)} />}
   </>
@@ -104,14 +107,14 @@ function PingPanel({ ping, serverIndex }: { ping: ProbePingSeries[]; serverIndex
 
 function ServerCard({ server, index }: { server: ProbeServer; index: number }) {
   return <article className="server-card">
-    <div className="server-title"><span className={server.online ? 'status online' : 'status'} /><h2>{server.name || `服务器 ${index + 1}`}</h2><span>{server.online ? '在线' : '离线'}</span></div>
+    <div className="server-title"><span className={server.online ? 'status online' : 'status'} /><h2><Twemoji>{server.name || `服务器 ${index + 1}`}</Twemoji></h2><span>{server.online ? '在线' : '离线'}</span></div>
     <div className="metrics">
       {server.cpu_pct !== undefined && <Meter icon={<Cpu size={14} />} label="CPU" value={`${server.cpu_pct.toFixed(1)}%`} percent={server.cpu_pct} />}
-      {server.mem_total !== undefined && <Meter icon={<MemoryStick size={14} />} label="内存" value={`${bytes(server.mem_used)} / ${bytes(server.mem_total)}`} percent={pct(server.mem_used, server.mem_total)} />}
-      {server.disk_total !== undefined && <Meter icon={<HardDrive size={14} />} label="硬盘" value={`${bytes(server.disk_used)} / ${bytes(server.disk_total)}`} percent={pct(server.disk_used, server.disk_total)} />}
-      {server.traffic_used !== undefined && <Meter icon={<Database size={14} />} label="流量" value={server.traffic_limit ? `${bytes(server.traffic_used)} / ${bytes(server.traffic_limit)}` : bytes(server.traffic_used)} percent={pct(server.traffic_used, server.traffic_limit)} />}
+      {server.mem_total !== undefined && <Meter icon={<MemoryStick size={14} />} label="内存" value={`${pct(server.mem_used, server.mem_total).toFixed(1)}%`} percent={pct(server.mem_used, server.mem_total)} />}
+      {server.disk_total !== undefined && <Meter icon={<HardDrive size={14} />} label="硬盘" value={`${pct(server.disk_used, server.disk_total).toFixed(1)}%`} percent={pct(server.disk_used, server.disk_total)} />}
+      {server.traffic_used !== undefined && <Meter icon={<PieChart size={14} />} label="流量" value={server.traffic_limit ? `${bytes(server.traffic_used)} / ${bytes(server.traffic_limit)}` : bytes(server.traffic_used)} percent={pct(server.traffic_used, server.traffic_limit)} />}
     </div>
-    {(server.upload_speed !== undefined || server.download_speed !== undefined) && <div className="speed"><span>↑ {speed(server.upload_speed)}</span><span>↓ {speed(server.download_speed)}</span></div>}
+    {(server.upload_speed !== undefined || server.download_speed !== undefined) && <div className="speed"><span className="download"><ArrowDown size={16} />{speed(server.download_speed)}</span><span className="upload"><ArrowUp size={16} />{speed(server.upload_speed)}</span></div>}
     {!!server.ping?.length && <PingPanel ping={server.ping} serverIndex={index} />}
   </article>
 }
@@ -126,7 +129,7 @@ export function App() {
   const title = data.title?.trim() || '服务器状态'
   const servers = data.servers || []
   return <div className="app-shell">
-    <header className="topbar"><div>{data.logo && <img src={data.logo} alt="" />}<h1>{title}</h1></div><nav><button className={view === 'card' ? 'active' : ''} onClick={() => setMode('card')}>卡片</button><button className={view === 'list' ? 'active' : ''} onClick={() => setMode('list')}>列表</button></nav></header>
+    <header className="topbar"><div>{data.logo && <img src={data.logo} alt="" />}<h1>{title}</h1></div><nav><button aria-label="卡片视图" title="卡片视图" className={view === 'card' ? 'active' : ''} onClick={() => setMode('card')}><LayoutGrid size={18} /></button><button aria-label="列表视图" title="列表视图" className={view === 'list' ? 'active' : ''} onClick={() => setMode('list')}><List size={18} /></button></nav></header>
     <main className={`servers ${view}`}>{servers.length ? servers.map((server, index) => <ServerCard key={`${server.name}-${index}`} server={server} index={index} />) : <div className="empty">暂无服务器数据</div>}</main>
     <footer>Powered by MMWX Probe</footer>
   </div>
