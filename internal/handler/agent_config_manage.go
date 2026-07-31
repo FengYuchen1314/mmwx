@@ -1176,6 +1176,40 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	})
 }
 
+// SetTrafficStatsServers 配置管理员流量信息顶部四张卡片所统计的服务器。
+func (h *XrayServerHandler) SetTrafficStatsServers(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+	if r.Method != stdhttp.MethodPut && r.Method != stdhttp.MethodPost {
+		stdhttp.Error(w, "Method not allowed", stdhttp.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerIDs []int64 `json:"server_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, stdhttp.StatusBadRequest, "无效的请求参数")
+		return
+	}
+	seen := make(map[int64]struct{}, len(req.ServerIDs))
+	ids := make([]int64, 0, len(req.ServerIDs))
+	for _, id := range req.ServerIDs {
+		if id <= 0 {
+			writeJSONError(w, stdhttp.StatusBadRequest, "服务器 ID 必须大于 0")
+			return
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if err := h.repo.SetTrafficStatsServers(r.Context(), ids); err != nil {
+		writeJSONError(w, stdhttp.StatusBadRequest, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "server_ids": ids})
+}
+
 // switchRemoteXrayMode 通知远程 Agent 切换 xray_mode 并重启。
 func (h *XrayServerHandler) switchRemoteXrayMode(serverID int64, newMode string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

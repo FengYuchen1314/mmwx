@@ -838,6 +838,9 @@ type RemoteServer struct {
 	XrayMode              string     `json:"xray_mode"`                     // "external" (默认) 或 "embedded"
 	TimeOffsetSeconds     *int64     `json:"time_offset_seconds,omitempty"` // agent 与主控的时钟偏差（秒）
 	TrafficUsedOffset     int64      `json:"traffic_used_offset"`
+	// IncludeInTrafficStats 控制该服务器是否参与管理员流量页顶部汇总卡片。
+	// 新增及升级前的服务器默认参与；服务器明细与历史快照不受此开关影响。
+	IncludeInTrafficStats bool `json:"include_in_traffic_stats"`
 	// 流量统计规则: "both"(默认,上行+下行) / "upload"(仅上行) / "download"(仅下行)
 	// 影响:主控聚合该服务器节点流量时按规则累加。**用户流量不受此字段影响**,
 	// 用户已用流量按套餐 traffic_mode(oneway/twoway)单独算。
@@ -2323,6 +2326,9 @@ CREATE INDEX IF NOT EXISTS idx_remote_servers_status ON remote_servers(status);
 	//   'system'               → 服务器系统级网卡累计 RX/TX,跟 VPS 计费口径一致
 	// 节点视图 / 用户视图 / 套餐 enforcement 永远走 xray 维度,不受此字段影响。
 	if err := r.ensureRemoteServerColumn("traffic_source", "TEXT NOT NULL DEFAULT 'xray'"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("include_in_traffic_stats", "INTEGER NOT NULL DEFAULT 1"); err != nil {
 		return err
 	}
 	// 锁定入口 IP + 随机端口范围(节点 server 地址 / 端口分配用,解决 NAT 机上报 127.0.0.1 等问题)
@@ -9990,20 +9996,26 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 		return nil, fmt.Errorf("iterate remote servers: %w", err)
 	}
 
-	// 批量补充锁定入口 IP + 随机端口范围(避免改动上面的大 SELECT/Scan)。
+	// 批量补充锁定入口 IP、随机端口范围和顶部流量统计开关(避免改动上面的大 SELECT/Scan)。
 	if len(servers) > 0 {
+		// 查询异常时宁可保持旧行为(全选)，不能让管理员卡片静默归零。
+		for i := range servers {
+			servers[i].IncludeInTrafficStats = true
+		}
 		type nodeSet struct {
-			lock     bool
-			min, max int
+			lock         bool
+			includeStats bool
+			min, max     int
 		}
 		settings := make(map[int64]nodeSet)
-		if srows, serr := r.db.QueryContext(ctx, `SELECT id, COALESCE(lock_entry_ip,0), COALESCE(port_range_min,0), COALESCE(port_range_max,0) FROM remote_servers`); serr == nil {
+		if srows, serr := r.db.QueryContext(ctx, `SELECT id, COALESCE(lock_entry_ip,0), COALESCE(port_range_min,0), COALESCE(port_range_max,0), COALESCE(include_in_traffic_stats,1) FROM remote_servers`); serr == nil {
 			for srows.Next() {
 				var id int64
-				var lockInt int
+				var lockInt, includeStatsInt int
 				var ns nodeSet
-				if srows.Scan(&id, &lockInt, &ns.min, &ns.max) == nil {
+				if srows.Scan(&id, &lockInt, &ns.min, &ns.max, &includeStatsInt) == nil {
 					ns.lock = lockInt != 0
+					ns.includeStats = includeStatsInt != 0
 					settings[id] = ns
 				}
 			}
@@ -10014,6 +10026,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 				servers[i].LockEntryIP = ns.lock
 				servers[i].PortRangeMin = ns.min
 				servers[i].PortRangeMax = ns.max
+				servers[i].IncludeInTrafficStats = ns.includeStats
 			}
 		}
 	}
@@ -10103,12 +10116,15 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		return nil, fmt.Errorf("get remote server: %w", err)
 	}
 
-	// 锁定入口 IP + 随机端口范围:从同表补查,避免改动上面的大 SELECT/Scan(列多、positional 易错)。
-	var lockEntryInt int
-	_ = r.db.QueryRowContext(ctx,
-		`SELECT COALESCE(lock_entry_ip,0), COALESCE(port_range_min,0), COALESCE(port_range_max,0) FROM remote_servers WHERE id = ?`, id).
-		Scan(&lockEntryInt, &server.PortRangeMin, &server.PortRangeMax)
-	server.LockEntryIP = lockEntryInt != 0
+	// 节点设置和顶部流量统计开关从同表补查,避免改动上面的大 SELECT/Scan(列多、positional 易错)。
+	var lockEntryInt, includeStatsInt int
+	server.IncludeInTrafficStats = true
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT COALESCE(lock_entry_ip,0), COALESCE(port_range_min,0), COALESCE(port_range_max,0), COALESCE(include_in_traffic_stats,1) FROM remote_servers WHERE id = ?`, id).
+		Scan(&lockEntryInt, &server.PortRangeMin, &server.PortRangeMax, &includeStatsInt); err == nil {
+		server.LockEntryIP = lockEntryInt != 0
+		server.IncludeInTrafficStats = includeStatsInt != 0
+	}
 
 	server.XrayRunning = xrayRunningInt != 0
 	server.WarpInstalled = warpInstalledInt != 0
@@ -11257,6 +11273,62 @@ func (r *TrafficRepository) UpdateRemoteServerTrafficOffset(ctx context.Context,
 	_, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET traffic_used_offset = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, offset, id)
 	if err != nil {
 		return fmt.Errorf("update traffic_used_offset: %w", err)
+	}
+	return nil
+}
+
+// SetTrafficStatsServers 原子替换管理员顶部流量卡片所统计的服务器集合。
+// 空集合合法，表示四张卡片的服务器流量与网速均显示为 0。
+func (r *TrafficRepository) SetTrafficStatsServers(ctx context.Context, serverIDs []int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin traffic stats selection: %w", err)
+	}
+	defer tx.Rollback()
+
+	if len(serverIDs) > 0 {
+		placeholders := make([]string, len(serverIDs))
+		args := make([]any, len(serverIDs))
+		for i, id := range serverIDs {
+			if id <= 0 {
+				return errors.New("remote server id must be positive")
+			}
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		var count int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM remote_servers WHERE id IN (`+strings.Join(placeholders, ",")+`)`,
+			args...).Scan(&count); err != nil {
+			return fmt.Errorf("validate traffic stats servers: %w", err)
+		}
+		if count != len(serverIDs) {
+			return errors.New("one or more remote servers do not exist")
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `UPDATE remote_servers SET include_in_traffic_stats = 0, updated_at = CURRENT_TIMESTAMP`); err != nil {
+		return fmt.Errorf("clear traffic stats servers: %w", err)
+	}
+	if len(serverIDs) > 0 {
+		placeholders := make([]string, len(serverIDs))
+		args := make([]any, len(serverIDs))
+		for i, id := range serverIDs {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE remote_servers SET include_in_traffic_stats = 1, updated_at = CURRENT_TIMESTAMP WHERE id IN (`+strings.Join(placeholders, ",")+`)`,
+			args...); err != nil {
+			return fmt.Errorf("set traffic stats servers: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit traffic stats selection: %w", err)
 	}
 	return nil
 }

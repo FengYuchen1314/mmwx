@@ -83,6 +83,8 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	isAdmin := haveUser && user.Role == storage.RoleAdmin
 
 	var totalLimit, totalUsed, unlimitedUsed int64
+	// 管理员历史趋势保持全服务器口径；include_in_traffic_stats 只控制顶部四张卡片。
+	var snapshotLimit, snapshotUsed int64
 	// serverListOK 跟踪 ListRemoteServers 是否成功 — 后面 recordSnapshot 用它兜底,
 	// 防止"DB 临时报错 → 全 0 → ON CONFLICT 覆盖正确历史"事故(实际 2026-05-31 已发生)。
 	serverListOK := false
@@ -102,6 +104,13 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 					// 相邻两天写入者不同就会凭空造出负 delta。
 				}
 				if s.TrafficLimit > 0 {
+					snapshotLimit += s.TrafficLimit
+					snapshotUsed += used
+				}
+				if !s.IncludeInTrafficStats {
+					continue
+				}
+				if s.TrafficLimit > 0 {
 					totalLimit += s.TrafficLimit
 					totalUsed += used
 				} else {
@@ -116,6 +125,8 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 			extLimit, extUsed := h.fetchExternalSubscriptionTraffic(ctx, username)
 			totalLimit += extLimit
 			totalUsed += extUsed
+			snapshotLimit += extLimit
+			snapshotUsed += extUsed
 		}
 	} else if haveUser {
 		// 普通用户:套餐流量。已用按套餐流量倍率(oneway×1 / twoway×2)计费,
@@ -147,8 +158,14 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		// 当天已有的非 0 历史;所以这里照常写,避免此前每次汇总(前端 5s 轮询)刷一条 WARN 的问题。
 		if !serverListOK {
 			logger.Warn("[流量] 跳过快照: ListRemoteServers 失败,无法判断当前流量")
-		} else if err := h.recordSnapshot(ctx, totalLimit, totalUsed, totalRemaining); err != nil {
-			logger.Info("[流量] 记录快照失败", "error", err)
+		} else {
+			snapshotRemaining := snapshotLimit - snapshotUsed
+			if snapshotRemaining < 0 {
+				snapshotRemaining = 0
+			}
+			if err := h.recordSnapshot(ctx, snapshotLimit, snapshotUsed, snapshotRemaining); err != nil {
+				logger.Info("[流量] 记录快照失败", "error", err)
+			}
 		}
 	} else if haveUser {
 		if err := h.repo.RecordUserDaily(ctx, username, time.Now(), totalLimit, totalUsed, totalRemaining); err != nil {

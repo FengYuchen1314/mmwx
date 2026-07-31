@@ -447,6 +447,7 @@ func main() {
 	mux.Handle("/api/admin/remote-servers/add-shared", auth.RequireAdmin(tokenStore, userRepo, handler.NewAddSharedServerHandler(repo)))
 	mux.Handle("/api/admin/remote-servers/update", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.UpdateRemoteServer)))
 	mux.Handle("/api/admin/remote-servers/reorder", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.ReorderRemoteServers)))
+	mux.Handle("/api/admin/remote-servers/traffic-stats-selection", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.SetTrafficStatsServers)))
 	mux.Handle("/api/admin/remote-servers/delete", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.DeleteRemoteServer)))
 	mux.Handle("/api/admin/remote-servers/sync-node-address", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.SyncNodeAddress)))
 	mux.Handle("/api/admin/check-same-ip", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.CheckSameIP)))
