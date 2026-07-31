@@ -246,6 +246,11 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleBatchDisableSkipCert(w, r)
+	case path == "batch-snell-options" && r.Method == http.MethodPost:
+		if denyNonAdmin() {
+			return
+		}
+		h.handleBatchSnellOptions(w, r)
 	case path == "tags" && r.Method == http.MethodGet:
 		h.handleListTags(w, r)
 	case path == "user-imported" && r.Method == http.MethodGet:
@@ -2206,6 +2211,115 @@ func isTruthySkipCert(v any) bool {
 	default:
 		return false
 	}
+}
+
+// handleBatchSnellOptions 批量修改 Snell 客户端参数。nil 表示保持原值，bool 表示显式开关。
+// udp-relay 在内部 Clash 配置中使用标准字段 udp；Surge producer 输出时映射为 udp-relay。
+func (h *nodesHandler) handleBatchSnellOptions(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NodeIDs  []int64 `json:"node_ids"`
+		TFO      *bool   `json:"tfo"`
+		UDPRelay *bool   `json:"udp_relay"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBadRequest(w, "请求格式不正确")
+		return
+	}
+	if len(req.NodeIDs) == 0 {
+		writeBadRequest(w, "节点列表不能为空")
+		return
+	}
+	if req.TFO == nil && req.UDPRelay == nil {
+		writeBadRequest(w, "至少选择一个需要修改的参数")
+		return
+	}
+
+	username := auth.UsernameFromContext(r.Context())
+	if username == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("用户未认证"))
+		return
+	}
+	isAdmin := userIsAdmin(r.Context(), h.repo, username)
+	var successCount, failCount, skippedCount int
+	var yamlUpdates []NodeUpdate
+
+	for _, nodeID := range req.NodeIDs {
+		node, err := h.fetchNodeForAccess(r.Context(), nodeID, username, isAdmin)
+		if err != nil {
+			failCount++
+			continue
+		}
+		if !nodeIsSnell(node) {
+			skippedCount++
+			continue
+		}
+		changed := updateSnellOptionsInJSON(&node.ClashConfig, req.TFO, req.UDPRelay)
+		changed = updateSnellOptionsInJSON(&node.ParsedConfig, req.TFO, req.UDPRelay) || changed
+		if !changed {
+			skippedCount++
+			continue
+		}
+		updated, err := h.repo.UpdateNode(r.Context(), node)
+		if err != nil {
+			failCount++
+			continue
+		}
+		if updated.ClashConfig != "" {
+			yamlUpdates = append(yamlUpdates, NodeUpdate{OldName: updated.NodeName, NewName: updated.NodeName, ClashConfigJSON: updated.ClashConfig})
+		}
+		successCount++
+	}
+
+	if len(yamlUpdates) > 0 {
+		if err := h.yamlSyncManager.BatchSyncNodes(yamlUpdates); err != nil {
+			logger.Info("[批量修改Snell参数] YAML同步失败", "error", err)
+		}
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"status": "updated", "success": successCount, "failed": failCount, "skipped": skippedCount, "total": len(req.NodeIDs)})
+}
+
+func nodeIsSnell(node storage.Node) bool {
+	if strings.EqualFold(strings.TrimSpace(node.Protocol), "snell") {
+		return true
+	}
+	for _, raw := range []string{node.ClashConfig, node.ParsedConfig} {
+		var m map[string]any
+		if json.Unmarshal([]byte(raw), &m) == nil && strings.EqualFold(fmt.Sprint(m["type"]), "snell") {
+			return true
+		}
+	}
+	return false
+}
+
+func updateSnellOptionsInJSON(raw *string, tfo, udpRelay *bool) bool {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return false
+	}
+	var m map[string]any
+	if json.Unmarshal([]byte(*raw), &m) != nil || !strings.EqualFold(fmt.Sprint(m["type"]), "snell") {
+		return false
+	}
+	changed := false
+	set := func(key string, value *bool) {
+		if value == nil {
+			return
+		}
+		if old, ok := m[key].(bool); !ok || old != *value {
+			m[key] = *value
+			changed = true
+		}
+	}
+	set("tfo", tfo)
+	set("udp", udpRelay)
+	if !changed {
+		return false
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return false
+	}
+	*raw = string(b)
+	return true
 }
 
 type nodeRequest struct {

@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -248,6 +250,9 @@ const (
 	probeDisguisePingTargetsOverrideKey = "probe_disguise_ping_targets_override"
 	probeDisguisePingIntervalKey        = "probe_disguise_ping_interval_ms" // int 字符串,默认 5000
 	probeCDNRegionsEndpointKey          = "probe_cdn_regions_endpoint"      // CDN 数据端点(可配置)
+	// 独立探针源站保护:开启后，三个公开探针接口必须携带 Worker 专用密钥。
+	probeExternalOnlyKey      = "probe_external_access_only"
+	probeExternalTokenHashKey = "probe_external_token_sha256"
 )
 
 // GetProbeDisguise 返回伪装探针配置(管理端)。
@@ -263,6 +268,8 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
 	showName, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowNameKey)
 	idsRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguiseServerIDsKey)
+	externalOnly, _ := h.repo.GetSystemSetting(ctx, probeExternalOnlyKey)
+	externalTokenHash, _ := h.repo.GetSystemSetting(ctx, probeExternalTokenHashKey)
 
 	ids := []int64{}
 	if idsRaw != "" {
@@ -296,22 +303,24 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"success":               true,
-		"enabled":               enabled == "1",
-		"title":                 title,
-		"logo":                  logo,
-		"block_login":           blockLogin == "1",
-		"server_ids":            ids,
-		"show_name":             showName == "1",
-		"metric_cpu":            metricCPU == "1",
-		"metric_mem":            metricMem == "1",
-		"metric_disk":           metricDisk == "1",
-		"metric_ping":           metricPing == "1",
-		"metric_traffic":        metricTraffic != "0", // 默认显示
-		"metric_speed":          metricSpeed != "0",   // 默认显示
-		"ping_targets":          pingTargets,
-		"ping_targets_override": pingTargetsOverride,
-		"ping_interval_ms":      pingInterval,
+		"success":                   true,
+		"enabled":                   enabled == "1",
+		"title":                     title,
+		"logo":                      logo,
+		"block_login":               blockLogin == "1",
+		"server_ids":                ids,
+		"show_name":                 showName == "1",
+		"external_access_only":      externalOnly == "1",
+		"external_token_configured": strings.TrimSpace(externalTokenHash) != "",
+		"metric_cpu":                metricCPU == "1",
+		"metric_mem":                metricMem == "1",
+		"metric_disk":               metricDisk == "1",
+		"metric_ping":               metricPing == "1",
+		"metric_traffic":            metricTraffic != "0", // 默认显示
+		"metric_speed":              metricSpeed != "0",   // 默认显示
+		"ping_targets":              pingTargets,
+		"ping_targets_override":     pingTargetsOverride,
+		"ping_interval_ms":          pingInterval,
 	})
 }
 
@@ -341,6 +350,8 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		// 不存在=跟随全局。整个字段为 nil 时不改(旧前端 PUT 不带它)。
 		PingTargetsOverride *map[string][]ProbePingTarget `json:"ping_targets_override"`
 		PingInterval        *int                          `json:"ping_interval_ms"`
+		ExternalAccessOnly  *bool                         `json:"external_access_only"`
+		ExternalAccessToken *string                       `json:"external_access_token"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -365,6 +376,26 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		req.ServerIDs = []int64{}
 	}
 	idsJSON, _ := json.Marshal(req.ServerIDs)
+	// 密钥明文只用于本次计算 SHA-256，不写数据库、不返回给后续 GET。
+	newExternalToken := ""
+	if req.ExternalAccessToken != nil {
+		newExternalToken = strings.TrimSpace(*req.ExternalAccessToken)
+		if newExternalToken != "" && len(newExternalToken) < 32 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "独立探针密钥至少需要 32 个字符"})
+			return
+		}
+	}
+	if req.ExternalAccessOnly != nil && *req.ExternalAccessOnly && newExternalToken == "" {
+		existing, _ := h.repo.GetSystemSetting(ctx, probeExternalTokenHashKey)
+		if strings.TrimSpace(existing) == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请先生成独立探针访问密钥"})
+			return
+		}
+	}
 
 	// 现有 4 字段:值语义,每次写(兼容旧前端整对象 PUT)。
 	for _, kv := range []struct{ k, v string }{
@@ -415,6 +446,19 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 			v = "1"
 		}
 		if h.repo.SetSystemSetting(ctx, probeDisguiseBlockLoginKey, v) != nil {
+			fail()
+			return
+		}
+	}
+	if newExternalToken != "" {
+		hash := sha256.Sum256([]byte(newExternalToken))
+		if h.repo.SetSystemSetting(ctx, probeExternalTokenHashKey, hex.EncodeToString(hash[:])) != nil {
+			fail()
+			return
+		}
+	}
+	if req.ExternalAccessOnly != nil {
+		if h.repo.SetSystemSetting(ctx, probeExternalOnlyKey, boolStr(*req.ExternalAccessOnly)) != nil {
 			fail()
 			return
 		}

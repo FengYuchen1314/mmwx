@@ -106,6 +106,10 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 
 	title, _ := h.repo.GetSystemSetting(ctx, probeDisguiseTitleKey)
 	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
+	theme, _ := h.repo.GetSystemSetting(ctx, DefaultThemeKey)
+	if theme != "flat" && theme != "anime" && theme != "pixel" {
+		theme = "pixel"
+	}
 	// 未登录访客要据此决定 /login 是否放行,所以必须走公开端点
 	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
 	showName := func() bool { v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowNameKey); return v == "1" }()
@@ -177,9 +181,16 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	}
 
 	return map[string]any{
-		"enabled":     true,
-		"title":       title,
-		"logo":        logo,
+		"enabled": true,
+		"title":   title,
+		"logo":    logo,
+		// 独立探针前端据此同步主控默认主题。revision 当前等于主题名；以后主题配置
+		// 增加更多可变字段时可扩成独立版本号，而不破坏现有客户端。
+		"appearance": map[string]any{
+			"theme":      theme,
+			"color_mode": "light",
+			"revision":   theme,
+		},
 		"block_login": blockLogin == "1",
 		"show_name":   showName,
 		"servers":     out,
