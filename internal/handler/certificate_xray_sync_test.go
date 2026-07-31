@@ -45,6 +45,43 @@ func TestCollectManagedXrayCertPathsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestCollectXrayCertPathsIncludesHistoricalCustomDirectory(t *testing.T) {
+	config := `{"inbounds":[{"streamSettings":{"tlsSettings":{"certificates":[{"certificateFile":"/etc/xray/legacy/example.com.pem","keyFile":"/etc/xray/legacy/example.com.key"}]}}}]}`
+	refs := collectXrayCertPaths(config)
+	if got := refs["/etc/xray/legacy/example.com.pem"]; got != "/etc/xray/legacy/example.com.key" {
+		t.Fatalf("historical certificate reference missing, got %q", got)
+	}
+}
+
+func TestCertificateMatchesSnapshotPaths(t *testing.T) {
+	cert := &storage.Certificate{
+		Domain:  "example.com",
+		CertPEM: "certificate",
+		KeyPEM:  "private-key",
+	}
+	if !certificateMatchesSnapshotPaths(cert,
+		"/usr/local/etc/xray/certs/example.com.pem",
+		"/usr/local/etc/xray/certs/example.com.key") {
+		t.Fatal("managed Xray paths should match certificate material")
+	}
+	if !certificateMatchesSnapshotPaths(cert,
+		"/etc/xray/legacy/example.com.crt",
+		"/etc/xray/legacy/example.com.key") {
+		t.Fatal("legacy directory with deterministic certificate filenames should match")
+	}
+	if certificateMatchesSnapshotPaths(cert,
+		"/etc/xray/legacy/other.pem",
+		"/etc/xray/legacy/other.key") {
+		t.Fatal("unrelated certificate paths must not match")
+	}
+	cert.KeyPEM = ""
+	if certificateMatchesSnapshotPaths(cert,
+		"/usr/local/etc/xray/certs/example.com.pem",
+		"/usr/local/etc/xray/certs/example.com.key") {
+		t.Fatal("certificate without private key material must not match")
+	}
+}
+
 func TestManagedXrayCertPathsWildcard(t *testing.T) {
 	certPath, keyPath := managedXrayCertPaths("*.example.com")
 	if certPath != "/usr/local/etc/xray/certs/_.example.com.pem" {

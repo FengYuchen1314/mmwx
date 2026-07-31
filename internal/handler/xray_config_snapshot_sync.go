@@ -73,6 +73,10 @@ func (h *RemoteManageHandler) SyncXrayConfigOnReconnect(ctx context.Context, ser
 			if mergedN > 0 {
 				log.Printf("[XraySync] server=%d expect_recovery: merged %d agent-only inbound/outbound into snapshot before restore", serverID, mergedN)
 			}
+			if derr := h.deploySnapshotCertificates(fctx, serverID, cfgToApply); derr != nil {
+				log.Printf("[XraySync] server=%d expect_recovery: prepare certificates failed: %v", serverID, derr)
+				return
+			}
 			// test → PUT
 			testBody, _ := json.Marshal(map[string]string{"config": cfgToApply})
 			if raw, terr := h.forwardToRemoteServer(fctx, serverID, "POST", "/api/child/xray/test-config", testBody); terr == nil {

@@ -1,11 +1,53 @@
 package handler
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 )
+
+func TestUpdateSnellOptionsInJSONPreservesUnselectedOptions(t *testing.T) {
+	raw := `{"type":"snell","name":"test","udp":true}`
+	tfo := false
+	if !updateSnellOptionsInJSON(&raw, &tfo, nil) {
+		t.Fatal("expected config to change")
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["tfo"] != false || got["udp"] != true {
+		t.Fatalf("unexpected options after update: %#v", got)
+	}
+}
+
+func TestUpdateSnellOptionsInJSONSupportsExplicitFalse(t *testing.T) {
+	raw := `{"type":"snell","tfo":true,"udp":true}`
+	udp := false
+	if !updateSnellOptionsInJSON(&raw, nil, &udp) {
+		t.Fatal("expected config to change")
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["udp"] != false || got["tfo"] != true {
+		t.Fatalf("unexpected options after update: %#v", got)
+	}
+}
+
+func TestUpdateSnellOptionsInJSONIgnoresOtherProtocols(t *testing.T) {
+	raw := `{"type":"ss","udp":true}`
+	want := raw
+	tfo := true
+	if updateSnellOptionsInJSON(&raw, &tfo, nil) || raw != want {
+		t.Fatalf("non-Snell config changed to %s", raw)
+	}
+}
 
 func TestNormalizeSnellVersionForSurgeProducer(t *testing.T) {
 	proxy := substore.Proxy{

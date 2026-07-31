@@ -58,7 +58,44 @@ func (h *CertificateHandler) GenerateSelfSignedCert(w http.ResponseWriter, r *ht
 		return
 	}
 
-	cert := &storage.Certificate{Domain: domain, CertPEM: certPEM, KeyPEM: keyPEM}
+	// 自签证书此前只存在于本次请求内存并直接下发 Agent，主控没有任何副本，
+	// 因而数据库/数据目录备份都无法恢复。复用 ACME 客户端的证书落盘逻辑，
+	// 将材料保存到 data/certs，并在 certificates 表保存 PEM（数据库备份的兜底副本）。
+	result, perr := h.acmeClient.ProcessCertResult(domain, []byte(certPEM), []byte(keyPEM))
+	if perr != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "保存自签证书失败: " + perr.Error()})
+		return
+	}
+	cert := &storage.Certificate{
+		Domain:         domain,
+		Email:          "self-signed@local",
+		Provider:       "self-signed",
+		CertPath:       result.CertPath,
+		KeyPath:        result.KeyPath,
+		CertPEM:        result.CertPEM,
+		KeyPEM:         result.KeyPEM,
+		Status:         storage.CertStatusValid,
+		ExpiryDate:     &result.ExpiryDate,
+		IssueDate:      &result.IssueDate,
+		AutoRenew:      false,
+		ChallengeMode:  "manual",
+		RemoteServerID: req.ServerID,
+		DeployTarget:   "xray",
+		DeployCertPath: "/usr/local/etc/xray/certs/" + certDeployFilename(domain) + ".pem",
+		DeployKeyPath:  "/usr/local/etc/xray/certs/" + certDeployFilename(domain) + ".key",
+		AutoDeploy:     false,
+	}
+	if existing, eerr := h.repo.GetCertificateByDomain(ctx, domain, req.ServerID); eerr == nil && existing != nil {
+		cert.ID = existing.ID
+		if uerr := h.repo.UpdateCertificate(ctx, cert); uerr != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "更新自签证书记录失败: " + uerr.Error()})
+			return
+		}
+	} else if cerr := h.repo.CreateCertificate(ctx, cert); cerr != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "保存自签证书记录失败: " + cerr.Error()})
+		return
+	}
+
 	certPath, keyPath, derr := h.DeployCertToServerSync(ctx, server, cert)
 	if derr != nil {
 		respondJSON(w, http.StatusBadGateway, map[string]any{"success": false, "message": "下发自签证书到服务器失败: " + derr.Error()})

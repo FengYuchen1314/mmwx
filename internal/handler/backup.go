@@ -35,8 +35,9 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
-		// 先把 zip 打进内存,再整包加密后输出。备份体积小(主要是 SQLite + 订阅文件),内存可控;
-		// 好处是加密前的打包错误仍能正常回 4xx/5xx(旧实现边打包边写响应,出错无法回报)。
+		// data/ 同时包含 SQLite、ACME/上传证书及已持久化的自签证书(data/certs)。
+		// certificates 表还保存 PEM/私钥作为文件副本损坏时的兜底。
+		// 先把 zip 打进内存再输出，打包错误仍能正常回 4xx/5xx。
 		var zipBuf bytes.Buffer
 		zipWriter := zip.NewWriter(&zipBuf)
 		if err := addDirToZip(zipWriter, "data", "data"); err != nil {
@@ -274,7 +275,15 @@ func extractZipReader(reader *zip.Reader) error {
 			return fmt.Errorf("failed to open zip file %s: %w", f.Name, err)
 		}
 
-		destFile, err := os.Create(destPath)
+		mode := f.Mode().Perm()
+		if mode == 0 {
+			mode = 0644
+		}
+		lowerBase := strings.ToLower(filepath.Base(destPath))
+		if strings.HasSuffix(lowerBase, ".key") || lowerBase == "privkey.pem" {
+			mode = 0600
+		}
+		destFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
 		if err != nil {
 			srcFile.Close()
 			return fmt.Errorf("failed to create file %s: %w", destPath, err)
@@ -286,6 +295,9 @@ func extractZipReader(reader *zip.Reader) error {
 
 		if err != nil {
 			return fmt.Errorf("failed to extract file %s: %w", f.Name, err)
+		}
+		if err := os.Chmod(destPath, mode); err != nil {
+			return fmt.Errorf("failed to restore permissions for %s: %w", f.Name, err)
 		}
 	}
 

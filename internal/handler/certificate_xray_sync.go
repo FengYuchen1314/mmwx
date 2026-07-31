@@ -49,9 +49,9 @@ func managedXrayCertPaths(domain string) (string, string) {
 	return path.Join(managedXrayCertDir, name+".pem"), path.Join(managedXrayCertDir, name+".key")
 }
 
-// collectManagedXrayCertPaths 只收集由主控托管目录引用的 certificateFile/keyFile 对。
-// 其它手工路径不参与自动覆盖，避免把用户自己维护的证书误认成主控证书。
-func collectManagedXrayCertPaths(configJSON string) map[string]string {
+// collectXrayCertPaths 收集配置中所有 certificateFile/keyFile 对。
+// 历史快照可能引用老目录或用户曾配置的显式路径，恢复前同样需要先补文件。
+func collectXrayCertPaths(configJSON string) map[string]string {
 	out := make(map[string]string)
 	if strings.TrimSpace(configJSON) == "" {
 		return out
@@ -68,8 +68,7 @@ func collectManagedXrayCertPaths(configJSON string) map[string]string {
 			keyPath, _ := value["keyFile"].(string)
 			certPath = path.Clean(strings.TrimSpace(certPath))
 			keyPath = path.Clean(strings.TrimSpace(keyPath))
-			if strings.HasPrefix(certPath, managedXrayCertDir+"/") &&
-				strings.HasPrefix(keyPath, managedXrayCertDir+"/") {
+			if certPath != "." && keyPath != "." {
 				out[certPath] = keyPath
 			}
 			for _, child := range value {
@@ -83,6 +82,83 @@ func collectManagedXrayCertPaths(configJSON string) map[string]string {
 	}
 	walk(root)
 	return out
+}
+
+// collectManagedXrayCertPaths 只收集由主控托管目录引用的 certificateFile/keyFile 对。
+// 其它手工路径不参与自动覆盖，避免把用户自己维护的证书误认成主控证书。
+func collectManagedXrayCertPaths(configJSON string) map[string]string {
+	out := make(map[string]string)
+	for certPath, keyPath := range collectXrayCertPaths(configJSON) {
+		if strings.HasPrefix(certPath, managedXrayCertDir+"/") &&
+			strings.HasPrefix(keyPath, managedXrayCertDir+"/") {
+			out[certPath] = keyPath
+		}
+	}
+	return out
+}
+
+func certificateMatchesSnapshotPaths(cert *storage.Certificate, certPath, keyPath string) bool {
+	if cert == nil || strings.TrimSpace(cert.CertPEM) == "" || strings.TrimSpace(cert.KeyPEM) == "" {
+		return false
+	}
+	cleanCert := path.Clean(certPath)
+	cleanKey := path.Clean(keyPath)
+	managedCert, managedKey := managedXrayCertPaths(cert.Domain)
+	if cleanCert == managedCert && cleanKey == managedKey {
+		return true
+	}
+	if cert.DeployCertPath != "" && cert.DeployKeyPath != "" &&
+		cleanCert == path.Clean(cert.DeployCertPath) && cleanKey == path.Clean(cert.DeployKeyPath) {
+		return true
+	}
+	// 兼容旧 Xray 证书目录：目录可能变化，但主控生成的确定性文件名不变。
+	wantName := certDeployFilename(cert.Domain)
+	certBase := strings.TrimSuffix(path.Base(cleanCert), path.Ext(cleanCert))
+	keyBase := strings.TrimSuffix(path.Base(cleanKey), path.Ext(cleanKey))
+	return certBase == wantName && keyBase == wantName
+}
+
+// deploySnapshotCertificates 在历史配置 test/PUT 前，把它引用的证书同步到 Agent 的原路径。
+// 任一引用无法从证书库找到材料就失败，避免下发一个必然无法启动的配置。
+func (h *RemoteManageHandler) deploySnapshotCertificates(ctx context.Context, serverID int64, configJSON string) error {
+	refs := collectXrayCertPaths(configJSON)
+	if len(refs) == 0 {
+		return nil
+	}
+	if h.certHandler == nil {
+		return fmt.Errorf("配置引用了 %d 组证书，但证书处理器未初始化", len(refs))
+	}
+	certs, err := h.repo.ListCertificates(ctx)
+	if err != nil {
+		return fmt.Errorf("读取证书库失败: %w", err)
+	}
+	for certPath, keyPath := range refs {
+		var matched *storage.Certificate
+		for i := range certs {
+			if certificateMatchesSnapshotPaths(&certs[i], certPath, keyPath) {
+				matched = &certs[i]
+				break
+			}
+		}
+		if matched == nil {
+			return fmt.Errorf("历史配置引用证书 %s，但主控证书库中没有匹配的证书材料", certPath)
+		}
+		payload := WSCertDeployPayload{
+			Domain:   matched.Domain,
+			CertPEM:  matched.CertPEM,
+			KeyPEM:   matched.KeyPEM,
+			CertPath: certPath,
+			KeyPath:  keyPath,
+			Reload:   "none",
+		}
+		body, _ := json.Marshal(payload)
+		if _, err := h.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/cert/deploy", body); err != nil {
+			return fmt.Errorf("下发证书 %s 失败: %w", certPath, err)
+		}
+		h.certHandler.rememberXrayCertSync(serverID, matched)
+		log.Printf("[XraySnapshot] server=%d deployed certificate before config restore: %s", serverID, certPath)
+	}
+	return nil
 }
 
 func (h *CertificateHandler) managedXrayReferences(ctx context.Context, serverID int64) map[string]string {

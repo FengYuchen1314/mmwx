@@ -929,13 +929,17 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 	for _, id := range subscribeFile.SelectedNodeIDs {
 		selectedNodeIDsMap[id] = true
 	}
-	hasNodeFilter := len(selectedNodeIDsMap) > 0
+	// 普通套餐用户的可见范围已经由 pkg.Nodes 严格限定。这里不能再套订阅文件里保存的
+	// selected_node_ids 快照：套餐后续新增节点（Snell v4/v5 最先暴露了这个问题）不在旧快照里，
+	// 会在进入模板前被静默过滤，而管理员因不走套餐限制分支不会丢节点。
+	// 套餐模式以当前 pkg.Nodes 为唯一真源，使模板注入行为与管理员路径一致。
+	hasNodeFilter := !restrictToPackage && len(selectedNodeIDsMap) > 0
 
 	selectedTagsMap := make(map[string]bool)
 	for _, tag := range subscribeFile.SelectedTags {
 		selectedTagsMap[tag] = true
 	}
-	hasTagFilter := !hasNodeFilter && len(selectedTagsMap) > 0
+	hasTagFilter := !restrictToPackage && !hasNodeFilter && len(selectedTagsMap) > 0
 
 	nodeIDToName := make(map[int64]string, len(nodes))
 	for _, node := range nodes {

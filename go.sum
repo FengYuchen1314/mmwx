@@ -2,6 +2,8 @@ cloud.google.com/go v0.26.0/go.mod h1:aQUYkXzVsufM+DwF1aE+0xfcU+56JwCaLick0ClmMT
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/MMWOrg/mmwX-plugins/proxyparser v0.1.5 h1:I/Uhml1Oss1slW66KP2RP2zsm6wvTZQrVxi3znn1IeU=
 github.com/MMWOrg/mmwX-plugins/proxyparser v0.1.5/go.mod h1:miHawv/7rTDHml3wMs/iASCDpZGBoy+yStOZo8Kj4rM=
+github.com/MMWOrg/mmwX-plugins/proxyparser v0.1.7 h1:748Cm8HwQwR/VSrWkznPvYI7yHfUy0HZX1cm+6E6u1I=
+github.com/MMWOrg/mmwX-plugins/proxyparser v0.1.7/go.mod h1:miHawv/7rTDHml3wMs/iASCDpZGBoy+yStOZo8Kj4rM=
 github.com/Masterminds/semver/v3 v3.2.1 h1:RN9w6+7QoMeJVGyfmbcgs28Br8cvmnucEXnY0rYXWg0=
 github.com/Masterminds/semver/v3 v3.2.1/go.mod h1:qvl/7zhW3nngYb5+80sSMF+FG2BjYrf8m9wsX0PNOMQ=
 github.com/alibabacloud-go/alibabacloud-gateway-pop v0.0.6 h1:eIf+iGJxdU4U9ypaUfbtOWCsZSbTb8AUHvyPrxu6mAA=
