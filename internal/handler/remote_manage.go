@@ -1316,7 +1316,11 @@ func (h *RemoteManageHandler) SyncMasterURLOnReconnect(ctx context.Context, serv
 	}
 	masterURL, _ := h.repo.GetSystemSetting(ctx, "master_url")
 	masterURL = strings.TrimRight(strings.TrimSpace(masterURL), "/")
-	if masterURL != "" {
+	// connected 表示只是 WS 短暂重连或主控自身重启。此时 Agent 已在使用可连接的地址，
+	// 再调用旧版 Agent 的 update-master-url 会无条件退出进程，形成
+	// “认证→退出→embedded Xray 停止→重启→再认证”的循环。
+	// 真正离线期间错过地址广播的 Agent，其旧状态会是 offline，才需要在恢复时补发。
+	if masterURL != "" && prevStatus == storage.RemoteServerStatusOffline {
 		if err := h.syncMasterURLToAgent(ctx, server, masterURL); err != nil {
 			log.Printf("[MasterURLSync] Server %d (%s) reconnect sync failed: %v", server.ID, server.Name, err)
 		}

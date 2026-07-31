@@ -241,6 +241,11 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleBatchRename(w, r)
+	case path == "batch-disable-skip-cert" && r.Method == http.MethodPost:
+		if denyNonAdmin() {
+			return
+		}
+		h.handleBatchDisableSkipCert(w, r)
 	case path == "tags" && r.Method == http.MethodGet:
 		h.handleListTags(w, r)
 	case path == "user-imported" && r.Method == http.MethodGet:
@@ -2087,6 +2092,120 @@ func (h *nodesHandler) handleBatchRename(w http.ResponseWriter, r *http.Request)
 		"total":   len(req.Updates),
 		"nodes":   updatedNodes,
 	})
+}
+
+// handleBatchDisableSkipCert 批量关闭选定节点的 skip-cert-verify:把值改成 false(不删除键,保持兼容)。
+// 只对"当前为真"的节点生效;无该字段或已是 false 的节点跳过(skipped),避免给无关节点污染出 false。
+// 名称不变,YAML 同步走 BatchSyncNodes 的就地字段更新,把订阅文件里对应 proxy 的 skip-cert-verify 也改成 false。
+func (h *nodesHandler) handleBatchDisableSkipCert(w http.ResponseWriter, r *http.Request) {
+	username := auth.UsernameFromContext(r.Context())
+	if username == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("用户未认证"))
+		return
+	}
+
+	var req struct {
+		NodeIDs []int64 `json:"node_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBadRequest(w, "请求格式不正确")
+		return
+	}
+	if len(req.NodeIDs) == 0 {
+		writeBadRequest(w, "节点列表不能为空")
+		return
+	}
+
+	isAdmin := userIsAdmin(r.Context(), h.repo, username)
+
+	successCount := 0
+	failCount := 0
+	skippedCount := 0
+	var updatedNodes []nodeDTO
+	var yamlUpdates []NodeUpdate
+
+	for _, nodeID := range req.NodeIDs {
+		node, err := h.fetchNodeForAccess(r.Context(), nodeID, username, isAdmin)
+		if err != nil {
+			failCount++
+			continue
+		}
+
+		// ClashConfig 与 ParsedConfig 都可能带 skip-cert-verify,两者都处理。
+		clashChanged := disableSkipCertVerifyInJSON(&node.ClashConfig)
+		parsedChanged := disableSkipCertVerifyInJSON(&node.ParsedConfig)
+		if !clashChanged && !parsedChanged {
+			skippedCount++
+			continue
+		}
+
+		updated, err := h.repo.UpdateNode(r.Context(), node)
+		if err != nil {
+			failCount++
+			continue
+		}
+
+		// 名称不变,BatchSyncNodes 就地更新 YAML 里已存在的 skip-cert-verify 值 → false。
+		if updated.ClashConfig != "" {
+			yamlUpdates = append(yamlUpdates, NodeUpdate{
+				OldName:         updated.NodeName,
+				NewName:         updated.NodeName,
+				ClashConfigJSON: updated.ClashConfig,
+			})
+		}
+
+		successCount++
+		updatedNodes = append(updatedNodes, convertNode(updated))
+	}
+
+	if len(yamlUpdates) > 0 {
+		if err := h.yamlSyncManager.BatchSyncNodes(yamlUpdates); err != nil {
+			logger.Info("[批量关闭skip-cert-verify] YAML 同步失败", "error", err)
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"status":  "disabled",
+		"success": successCount,
+		"failed":  failCount,
+		"skipped": skippedCount,
+		"total":   len(req.NodeIDs),
+		"nodes":   updatedNodes,
+	})
+}
+
+// disableSkipCertVerifyInJSON 解析 clash proxy JSON,若 skip-cert-verify 为真则改成 false 并回写 *s,返回是否发生改动。
+// 无该字段 / 已是 false / 空串 / 解析失败 → 不改动、返回 false。
+func disableSkipCertVerifyInJSON(s *string) bool {
+	if s == nil || strings.TrimSpace(*s) == "" {
+		return false
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(*s), &m); err != nil {
+		return false
+	}
+	if v, ok := m["skip-cert-verify"]; !ok || !isTruthySkipCert(v) {
+		return false
+	}
+	m["skip-cert-verify"] = false
+	b, err := json.Marshal(m)
+	if err != nil {
+		return false
+	}
+	*s = string(b)
+	return true
+}
+
+// isTruthySkipCert 判定 skip-cert-verify 是否为真:JSON 里通常是 bool true,兼容字符串 "true"。
+func isTruthySkipCert(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return strings.EqualFold(strings.TrimSpace(t), "true")
+	default:
+		return false
+	}
 }
 
 type nodeRequest struct {
