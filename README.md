@@ -170,6 +170,13 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.1 (2026-07-31)
+- 🌈 增加批量关闭跳过证书验证按钮
+- 🛠️ fix: surge snellv6 版本号转换错误
+- 🛠️ fix: 修改服务器地址没有成功更新节点server
+- 🛠️ fix: 偷自己部署失败没有重试
+- 🛠️ fix: 更新主控域名时，重新下发到agent
+- 🛠️ fix: 用户流量详情显示套餐周期内的
 ### v0.4.0 (2026-07-30)
 - 🌈 套餐支持配置默认surge模板
 - 🛠️ fix: 模板重复配置tiktok
