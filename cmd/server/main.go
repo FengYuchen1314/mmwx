@@ -452,7 +452,6 @@ func main() {
 	mux.Handle("/api/admin/remote-servers/traffic-stats-selection", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.SetTrafficStatsServers)))
 	mux.Handle("/api/admin/remote-servers/delete", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.DeleteRemoteServer)))
 	mux.Handle("/api/admin/remote-servers/sync-node-address", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.SyncNodeAddress)))
-	mux.Handle("/api/admin/check-same-ip", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayServerHandler.CheckSameIP)))
 
 	// 远程服务器公共端点（无管理员身份验证，基于令牌）
 	mux.Handle("/api/remote/heartbeat", http.HandlerFunc(xrayServerHandler.RemoteHeartbeat))
@@ -661,7 +660,6 @@ func main() {
 	mux.Handle("/api/admin/remote/xray/config/files", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleXrayConfigFiles)))
 	mux.Handle("/api/admin/remote/nginx/install", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxInstall)))
 	mux.Handle("/api/admin/remote/nginx/remove", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxRemove)))
-	mux.Handle("/api/admin/remote/proxy-master", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleProxyMaster)))
 	// Cloudflare WARP — 每个 agent 各自注册 + 注入 warp-v4 / warp-v6 双 outbound
 	mux.Handle("/api/admin/remote/warp/install", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleWarpInstall)))
 	mux.Handle("/api/admin/remote/warp/status", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleWarpStatus)))
@@ -1189,7 +1187,6 @@ func main() {
 	remoteManageHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
 	remoteWSHandler.SetScanResultHandler(remoteManageHandler.HandleScanResult)
 	remoteWSHandler.SetStealSelfDeployer(remoteManageHandler.DeployStealSelfConfig)
-	remoteWSHandler.SetMasterProxyDeployer(remoteManageHandler.DeployMasterProxyByID)
 	remoteWSHandler.SetMasterURLSyncCallback(remoteManageHandler.SyncMasterURLOnReconnect)
 	mux.Handle("/api/admin/certificates", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListCertificates)))
 	mux.Handle("/api/admin/certificates/valid", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.ListValidCertificates)))

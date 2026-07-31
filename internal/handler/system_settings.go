@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -116,10 +118,12 @@ func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 	localOnly, _ := h.repo.GetSystemSetting(r.Context(), "master_local_only")
+	subscriptionURL, _ := h.repo.GetSystemSetting(r.Context(), "subscription_url")
 	json.NewEncoder(w).Encode(map[string]any{
-		"success":    true,
-		"master_url": value,
-		"local_only": localOnly == "1",
+		"success":          true,
+		"master_url":       value,
+		"subscription_url": subscriptionURL,
+		"local_only":       localOnly == "1",
 	})
 }
 
@@ -131,8 +135,9 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 	}
 
 	var req struct {
-		MasterURL *string `json:"master_url"`
-		LocalOnly *bool   `json:"local_only"`
+		MasterURL       *string `json:"master_url"`
+		SubscriptionURL *string `json:"subscription_url"`
+		LocalOnly       *bool   `json:"local_only"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -141,11 +146,27 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if req.MasterURL == nil && req.LocalOnly == nil {
+	if req.MasterURL == nil && req.SubscriptionURL == nil && req.LocalOnly == nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "未提供需要更新的设置"})
 		return
+	}
+	if req.SubscriptionURL != nil {
+		value := strings.TrimRight(strings.TrimSpace(*req.SubscriptionURL), "/")
+		if value != "" {
+			parsed, err := url.ParseRequestURI(value)
+			if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+				parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+				writeError(w, http.StatusBadRequest, errors.New("订阅域名必须是有效的 HTTP 或 HTTPS 地址"))
+				return
+			}
+			value = parsed.Scheme + "://" + parsed.Host
+		}
+		if err := h.repo.SetSystemSetting(r.Context(), "subscription_url", value); err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("保存订阅域名失败"))
+			return
+		}
 	}
 
 	if req.MasterURL != nil {

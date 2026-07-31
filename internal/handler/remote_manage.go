@@ -1268,8 +1268,7 @@ func (h *RemoteManageHandler) ForwardToServer(ctx context.Context, serverID int6
 // syncMasterURLToAgent 校准单台 Agent 的回连地址。同机 Agent 必须保留
 // 127.0.0.1:主控端口，联邦服务器则属于其它主控，两者都不能改写。
 func (h *RemoteManageHandler) syncMasterURLToAgent(ctx context.Context, server *storage.RemoteServer, newMasterURL string) error {
-	if server == nil || server.IsFederated || server.SameHostAsMaster ||
-		server.IPAddress == "127.0.0.1" || server.IPAddress == "::1" {
+	if server == nil || server.IsFederated {
 		return nil
 	}
 	payload, _ := json.Marshal(map[string]string{"master_url": newMasterURL})
@@ -1279,32 +1278,6 @@ func (h *RemoteManageHandler) syncMasterURLToAgent(ctx context.Context, server *
 	}
 	log.Printf("[MasterURLSync] Server %d (%s): %s", server.ID, server.Name, string(resp))
 	return nil
-}
-
-// redeployMasterDomainOnSameHost 重建同机偷自己服务器的 Xray 高优先级路由、
-// 新主控域名证书与 Nginx 反代。两步分别执行，便于日志精确呈现缺证书等问题。
-//
-// 这是自动路径(域名广播 / agent 重连触发),不是用户主动点击。fallback/tunnel 模式的
-// steal-self 配置与主控域名强绑定,切域名后必须重下发;但 default/空模式 DeployStealSelfConfig
-// dispatch 到的是**无保护强制覆盖** deployDefaultConfigManual,会把 agent 已有的业务配置
-// (inbound/outbound/routing)覆盖成内嵌默认模板。故 default 模式下先探测 agent 是否已有用户内容,
-// 有则跳过配置下发、只重建反代——避免"切换主控域名后 agent 已有配置被默认配置覆盖"。
-// 全新装机 agent 无用户内容 → serverHasXrayContent 返回 false → 仍会正常下发默认模板初始化。
-func (h *RemoteManageHandler) redeployMasterDomainOnSameHost(ctx context.Context, server *storage.RemoteServer) {
-	if server == nil || server.IsFederated || !server.SameHostAsMaster || !server.Use443 {
-		return
-	}
-	isDefaultMode := server.StealMode == "" || server.StealMode == "default"
-	if isDefaultMode && h.serverHasXrayContent(ctx, server.ID) {
-		log.Printf("[MasterURLSync] Server %d (%s): default steal mode & agent already has xray content, skip config redeploy (only refresh proxy)", server.ID, server.Name)
-	} else if err := h.DeployStealSelfConfig(ctx, server.ID); err != nil {
-		log.Printf("[MasterURLSync] Server %d (%s): refresh steal-self/Xray config failed: %v", server.ID, server.Name, err)
-	}
-	if err := h.DeployMasterProxyByID(ctx, server.ID); err != nil {
-		log.Printf("[MasterURLSync] Server %d (%s): deploy master domain proxy failed: %v", server.ID, server.Name, err)
-		return
-	}
-	log.Printf("[MasterURLSync] Server %d (%s): master domain proxy refreshed", server.ID, server.Name)
 }
 
 // SyncMasterURLOnReconnect 在 Agent 每次认证后补发最新地址。pending 首连的
@@ -1325,13 +1298,9 @@ func (h *RemoteManageHandler) SyncMasterURLOnReconnect(ctx context.Context, serv
 			log.Printf("[MasterURLSync] Server %d (%s) reconnect sync failed: %v", server.ID, server.Name, err)
 		}
 	}
-	if prevStatus != "pending" {
-		h.redeployMasterDomainOnSameHost(ctx, server)
-	}
 }
 
-// BroadcastMasterURLUpdate 向所有已连接的 agent 推送新的 master_url，并重建
-// 同机偷自己服务器上的新主控域名反代。离线服务器由重连回调补发。
+// BroadcastMasterURLUpdate 向所有已连接的 agent 推送新的 master_url。
 func (h *RemoteManageHandler) BroadcastMasterURLUpdate(ctx context.Context, newMasterURL string) {
 	servers, err := h.repo.ListRemoteServers(ctx)
 	if err != nil {
@@ -1347,7 +1316,6 @@ func (h *RemoteManageHandler) BroadcastMasterURLUpdate(ctx context.Context, newM
 		if err := h.syncMasterURLToAgent(ctx, &server, newMasterURL); err != nil {
 			log.Printf("[BroadcastMasterURL] Server %d (%s): failed: %v", s.ID, s.Name, err)
 		}
-		h.redeployMasterDomainOnSameHost(ctx, &server)
 	}
 }
 

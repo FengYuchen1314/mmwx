@@ -36,6 +36,7 @@ type userConfigRequest struct {
 }
 
 type userConfigResponse struct {
+	SubscriptionURL         string  `json:"subscription_url"`
 	ForceSyncExternal       bool    `json:"force_sync_external"`
 	MatchRule               string  `json:"match_rule"`
 	SyncScope               string  `json:"sync_scope"`
@@ -87,12 +88,14 @@ func handleGetUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.T
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("get system config: %w", err))
 		return
 	}
+	subscriptionURL, _ := repo.GetSystemSetting(r.Context(), "subscription_url")
 
 	settings, err := repo.GetUserSettings(r.Context(), username)
 	if err != nil {
 		if errors.Is(err, storage.ErrUserSettingsNotFound) {
 			// 如果找不到则返回默认设置(NodeOrder 用 admin 排序作 fallback)
 			resp := userConfigResponse{
+				SubscriptionURL:         subscriptionURL,
 				ForceSyncExternal:       false,
 				MatchRule:               "node_name",
 				SyncScope:               "saved_only",
@@ -130,6 +133,7 @@ func handleGetUserConfig(w http.ResponseWriter, r *http.Request, repo *storage.T
 	}
 
 	resp := userConfigResponse{
+		SubscriptionURL:         subscriptionURL,
 		ForceSyncExternal:       settings.ForceSyncExternal,
 		MatchRule:               settings.MatchRule,
 		SyncScope:               settings.SyncScope,

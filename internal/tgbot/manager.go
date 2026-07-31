@@ -130,8 +130,13 @@ func (m *Manager) Restart(parent context.Context) error {
 		m.tokens.Revoke(token)
 		return errors.New("请先配置主控公网地址，再启用 TGBot")
 	}
+	subscriptionURL, _ := m.repo.GetSystemSetting(parent, "subscription_url")
+	subscriptionURL = strings.TrimRight(strings.TrimSpace(subscriptionURL), "/")
+	if subscriptionURL == "" {
+		subscriptionURL = masterURL
+	}
 	cfg := config.Config{
-		Enabled: true, PublicBaseURL: masterURL, TGBotToken: s.BotToken,
+		Enabled: true, PublicBaseURL: masterURL, SubscriptionBaseURL: subscriptionURL, TGBotToken: s.BotToken,
 		AdminTGIDs: s.AdminTGIDs, HTTPTimeoutSeconds: 30,
 		WebAppURL: masterURL + "/tg-app", WebAppDevPreview: s.WebDevPreview,
 	}

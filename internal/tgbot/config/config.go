@@ -5,14 +5,15 @@ package config
 
 type Config struct {
 	Enabled bool
-	// PublicBaseURL is derived from the master's existing public URL setting and
-	// is used only when rendering subscription links in Telegram messages.
-	PublicBaseURL      string
-	TGBotToken         string
-	AdminTGIDs         []int64
-	HTTPTimeoutSeconds int
-	WebAppURL          string
-	WebAppDevPreview   bool
+	// PublicBaseURL is the master UI address. SubscriptionBaseURL is used for
+	// subscription links and falls back to PublicBaseURL when it is empty.
+	PublicBaseURL       string
+	SubscriptionBaseURL string
+	TGBotToken          string
+	AdminTGIDs          []int64
+	HTTPTimeoutSeconds  int
+	WebAppURL           string
+	WebAppDevPreview    bool
 }
 
 func (c Config) IsAdmin(tgID int64) bool {

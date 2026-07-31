@@ -59,8 +59,11 @@ func (s *Service) handleSub(ctx context.Context, b *bot.Bot, update *models.Upda
 		return
 	}
 
-	// 订阅基址复用主控公网地址 + /x(短链路由)，不再单独配置。
-	base := strings.TrimRight(s.cfg.PublicBaseURL, "/") + "/x"
+	baseURL := strings.TrimSpace(s.cfg.SubscriptionBaseURL)
+	if baseURL == "" {
+		baseURL = s.cfg.PublicBaseURL
+	}
+	base := strings.TrimRight(baseURL, "/") + "/x"
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("你的订阅(%d 个):\n\n", len(items)))
 	for i, it := range items {

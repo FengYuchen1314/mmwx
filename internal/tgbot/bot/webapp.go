@@ -229,7 +229,11 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	resp["node_status"] = nodeStatus
 
 	// 订阅(默认订阅在前)
-	base := strings.TrimRight(s.cfg.PublicBaseURL, "/") + "/x"
+	baseURL := strings.TrimSpace(s.cfg.SubscriptionBaseURL)
+	if baseURL == "" {
+		baseURL = s.cfg.PublicBaseURL
+	}
+	base := strings.TrimRight(baseURL, "/") + "/x"
 	subs := []map[string]any{}
 	if sr, err := s.client.UserSubscriptions(ctx, username); err == nil {
 		if sr.DefaultSubscription != nil {

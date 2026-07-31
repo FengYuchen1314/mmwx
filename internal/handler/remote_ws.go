@@ -73,8 +73,6 @@ type WSAuthPayload struct {
 	// WarpInstalled agent 本机是否已注册 Cloudflare WARP(成功跑过 EnsureRegistered 且 warp.json 存在)。
 	// 老 agent 不发 = false → server 卡片 W badge 不显示,完全向后兼容。
 	WarpInstalled bool `json:"warp_installed,omitempty"`
-	// SameHostAsMaster agent 与主控同机(反代主控前提)。auth + heartbeat 都带。
-	SameHostAsMaster bool `json:"same_host_as_master,omitempty"`
 	// AgentVersion agent 自身版本号(随 auth 上报)。master 据此显示版本/判断可升级,
 	// 不再反向 HTTP 拉 /api/child/system/info —— 端口隐身(HidePortOnWS)关闭入站后仍可拿到。
 	// 老 agent 不发该字段 = 空串 → fallback 反向 HTTP(向后兼容)。
@@ -182,8 +180,6 @@ type WSHeartbeatPayload struct {
 	PublicIPv6 string `json:"public_ipv6,omitempty"`
 	// WarpInstalled 心跳里也带一份(同 WSAuthPayload),让 master 跟踪 agent 主动 install/remove 后的状态变化。
 	WarpInstalled bool `json:"warp_installed,omitempty"`
-	// SameHostAsMaster agent 与主控同机(反代主控前提)。auth + heartbeat 都带。
-	SameHostAsMaster bool `json:"same_host_as_master,omitempty"`
 }
 
 // WSSpeedPayload 表示实时速度数据负载
@@ -329,20 +325,19 @@ func IsServerUpgrading(serverID int64) bool {
 
 // RemoteWSHandler 处理来自远程（子）服务器的 WebSocket 连接
 type RemoteWSHandler struct {
-	repo                *storage.TrafficRepository
-	collector           *traffic.Collector
-	upgrader            websocket.Upgrader
-	conns               sync.Map // 令牌 -> *RemoteWSConnection
-	stealSelfDeployer   func(ctx context.Context, serverID int64) error
-	masterProxyDeployer func(ctx context.Context, serverID int64) error
-	pendingProbes       sync.Map // 详见上下文
-	pendingRPC          sync.Map // map[requestID]chan WSRPCReplyPayload — WS RPC 反向调用响应路由,详见 ws_rpc.go
-	pendingStream       sync.Map // map[requestID]chan wsStreamFrame — 流式 RPC (SSE 替代)
-	limiterPusher       *LimiterConfigPusher
-	licenseManager      *license.Manager
-	crypto              *CryptoConfig
-	probeStore          *ProbeMetricsStore // 伪装探针真数据 ring(可选,SetProbeStore 注入)
-	userSpeedCache      sync.Map           // key: "serverID:email" -> int64 (Bytes/s)
+	repo              *storage.TrafficRepository
+	collector         *traffic.Collector
+	upgrader          websocket.Upgrader
+	conns             sync.Map // 令牌 -> *RemoteWSConnection
+	stealSelfDeployer func(ctx context.Context, serverID int64) error
+	pendingProbes     sync.Map // 详见上下文
+	pendingRPC        sync.Map // map[requestID]chan WSRPCReplyPayload — WS RPC 反向调用响应路由,详见 ws_rpc.go
+	pendingStream     sync.Map // map[requestID]chan wsStreamFrame — 流式 RPC (SSE 替代)
+	limiterPusher     *LimiterConfigPusher
+	licenseManager    *license.Manager
+	crypto            *CryptoConfig
+	probeStore        *ProbeMetricsStore // 伪装探针真数据 ring(可选,SetProbeStore 注入)
+	userSpeedCache    sync.Map           // key: "serverID:email" -> int64 (Bytes/s)
 	// xrayConfigSyncCallback 在 auth 成功后异步触发(args: serverID + 上次 server.status),
 	// 实现见 RemoteManageHandler.SyncXrayConfigOnReconnect — 跨 handler 用 callback 注入避免循环依赖。
 	xrayConfigSyncCallback func(ctx context.Context, serverID int64, prevStatus string)
@@ -1112,9 +1107,6 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	if err := h.repo.UpdateRemoteServerWarpInstalled(updateCtx, authPayload.Token, authPayload.WarpInstalled); err != nil {
 		log.Printf("[Remote WS] Failed to update warp_installed for %s: %v", server.Name, err)
 	}
-	if err := h.repo.UpdateRemoteServerSameHost(updateCtx, authPayload.Token, authPayload.SameHostAsMaster); err != nil {
-		log.Printf("[Remote WS] Failed to update same_host_as_master for %s: %v", server.Name, err)
-	}
 
 	// 通知策略:
 	//   - 抢占式重连(hadPrev=true):**不通知**。这是 supervise-daemon 双开 race / agent 升级 /
@@ -1252,16 +1244,6 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 				return
 			}
 
-			masterDomain := getDomainFromMasterURL(h.repo, context.Background())
-			if shouldAutoProxyMaster(server, authPayload.SameHostAsMaster, masterDomain) && h.masterProxyDeployer != nil {
-				deployCtx, deployCancel := context.WithTimeout(context.Background(), 60*time.Second)
-				defer deployCancel()
-				if err := h.masterProxyDeployer(deployCtx, server.ID); err != nil {
-					log.Printf("[Remote WS] Failed to auto-deploy master proxy for server %s (%d): %v", server.Name, server.ID, err)
-				} else {
-					log.Printf("[Remote WS] Auto-deployed master proxy for server %s (%d)", server.Name, server.ID)
-				}
-			}
 		}()
 	}
 
@@ -1421,9 +1403,6 @@ func (h *RemoteWSHandler) handleHeartbeat(wsConn *RemoteWSConnection, payload js
 	// 心跳里也带 warp_installed,跟踪 agent 主动 install/remove 后的状态变化
 	if err := h.repo.UpdateRemoteServerWarpInstalled(ctx, wsConn.Token, hbPayload.WarpInstalled); err != nil {
 		log.Printf("[Remote WS] Failed to update warp_installed for server %s: %v", wsConn.ServerName, err)
-	}
-	if err := h.repo.UpdateRemoteServerSameHost(ctx, wsConn.Token, hbPayload.SameHostAsMaster); err != nil {
-		log.Printf("[Remote WS] Failed to update same_host_as_master for server %s: %v", wsConn.ServerName, err)
 	}
 
 	ackPayload, _ := json.Marshal(map[string]int64{"server_time": time.Now().Unix()})
@@ -1784,20 +1763,9 @@ func (h *RemoteWSHandler) SetStealSelfDeployer(deployer func(ctx context.Context
 	h.stealSelfDeployer = deployer
 }
 
-// SetMasterProxyDeployer 注入同机 Agent 的主控反代部署器。
-func (h *RemoteWSHandler) SetMasterProxyDeployer(deployer func(ctx context.Context, serverID int64) error) {
-	h.masterProxyDeployer = deployer
-}
-
 // SetMasterURLSyncCallback 注入 Agent 上线时的主控地址闭环同步。
 func (h *RemoteWSHandler) SetMasterURLSyncCallback(cb func(ctx context.Context, serverID int64, prevStatus string)) {
 	h.masterURLSyncCallback = cb
-}
-
-func shouldAutoProxyMaster(server *storage.RemoteServer, sameHostAsMaster bool, masterDomain string) bool {
-	return server != nil && sameHostAsMaster && server.Use443 &&
-		strings.EqualFold(strings.TrimSpace(server.Domain), strings.TrimSpace(masterDomain)) &&
-		strings.TrimSpace(masterDomain) != ""
 }
 
 // 处理来自远程服务器的扫描结果消息

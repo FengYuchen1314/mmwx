@@ -34,11 +34,12 @@ import (
 type hostEnforcer struct {
 	repo *storage.TrafficRepository
 
-	mu            sync.RWMutex
-	cachedMasterURL string
-	cachedHost      string // master_url 的 host(不含端口)
-	cachedHTTPS     bool
-	lastRefresh     time.Time
+	mu                     sync.RWMutex
+	cachedMasterURL        string
+	cachedHost             string // master_url 的 host(不含端口)
+	cachedSubscriptionHost string // subscription_url 的 host,仅订阅请求放行
+	cachedHTTPS            bool
+	lastRefresh            time.Time
 	// pendingRefresh 用于避免雷暴 — 多请求同时发现缓存过期时只有一个去查 db
 	pendingRefresh atomic.Bool
 }
@@ -68,7 +69,7 @@ func EnforceHTTPSHost(next http.Handler, repo *storage.TrafficRepository) http.H
 
 // shouldBlock 返回 true 表示该请求被拦截 + 重定向。
 func (e *hostEnforcer) shouldBlock(r *http.Request) bool {
-	host, https := e.snapshot()
+	host, subscriptionHost, https := e.snapshot()
 	if !https || host == "" {
 		return false
 	}
@@ -81,15 +82,25 @@ func (e *hostEnforcer) shouldBlock(r *http.Request) bool {
 	if strings.EqualFold(got, host) {
 		return false
 	}
+	if subscriptionHost != "" && strings.EqualFold(got, subscriptionHost) && isSubscriptionPath(r.URL.Path) {
+		return false
+	}
 	return true
+}
+
+func isSubscriptionPath(path string) bool {
+	return strings.HasPrefix(path, "/x/") ||
+		path == "/api/clash/subscribe" ||
+		path == "/api/user/package-subscribe" ||
+		path == "/api/subscribe"
 }
 
 // snapshot 返回缓存的 (期望 host, 是否启用 https)。过期就异步刷新 + 同步用旧值
 // (启动后第一次请求会同步拉一次以保证立刻可用)。
-func (e *hostEnforcer) snapshot() (string, bool) {
+func (e *hostEnforcer) snapshot() (string, string, bool) {
 	e.mu.RLock()
 	expired := time.Since(e.lastRefresh) > masterURLCacheTTL
-	host, https := e.cachedHost, e.cachedHTTPS
+	host, subscriptionHost, https := e.cachedHost, e.cachedSubscriptionHost, e.cachedHTTPS
 	firstTime := e.lastRefresh.IsZero()
 	e.mu.RUnlock()
 
@@ -97,9 +108,9 @@ func (e *hostEnforcer) snapshot() (string, bool) {
 		// 同步刷一次,避免启动后短暂"全放行"
 		e.refresh()
 		e.mu.RLock()
-		host, https = e.cachedHost, e.cachedHTTPS
+		host, subscriptionHost, https = e.cachedHost, e.cachedSubscriptionHost, e.cachedHTTPS
 		e.mu.RUnlock()
-		return host, https
+		return host, subscriptionHost, https
 	}
 	if expired && e.pendingRefresh.CompareAndSwap(false, true) {
 		go func() {
@@ -107,7 +118,7 @@ func (e *hostEnforcer) snapshot() (string, bool) {
 			e.refresh()
 		}()
 	}
-	return host, https
+	return host, subscriptionHost, https
 }
 
 func (e *hostEnforcer) refresh() {
@@ -119,12 +130,14 @@ func (e *hostEnforcer) refresh() {
 		e.mu.Lock()
 		e.cachedMasterURL = ""
 		e.cachedHost = ""
+		e.cachedSubscriptionHost = ""
 		e.cachedHTTPS = false
 		e.lastRefresh = time.Now()
 		e.mu.Unlock()
 		return
 	}
 	masterURL := strings.TrimSpace(raw)
+	subscriptionURL, _ := e.repo.GetSystemSetting(ctx, "subscription_url")
 	https := strings.HasPrefix(masterURL, "https://")
 	var host string
 	if https {
@@ -132,12 +145,17 @@ func (e *hostEnforcer) refresh() {
 			host = stripPort(u.Host)
 		}
 	}
+	var subscriptionHost string
+	if u, perr := url.Parse(strings.TrimSpace(subscriptionURL)); perr == nil {
+		subscriptionHost = stripPort(u.Host)
+	}
 	e.mu.Lock()
 	if e.cachedMasterURL != masterURL {
 		log.Printf("[HostEnforcement] master_url=%q https=%v host=%q", masterURL, https, host)
 	}
 	e.cachedMasterURL = masterURL
 	e.cachedHost = host
+	e.cachedSubscriptionHost = subscriptionHost
 	e.cachedHTTPS = https
 	e.lastRefresh = time.Now()
 	e.mu.Unlock()

@@ -68,11 +68,6 @@ func registerServerTools(s *server.MCPServer, b *bridge) {
 			return b.getWithQuery(ctx, "/api/admin/remote/reality-domains", argsBody(req))
 		})
 
-	s.AddTool(readTool("server_check_same_ip", "检测当前服务器列表中存在哪些相同 IP 的服务器(诊断「重复服务器」问题)。"),
-		func(ctx context.Context, _ mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-			return b.get(ctx, "/api/admin/check-same-ip")
-		})
-
 	// 写
 	s.AddTool(writeTool("server_create", "新增一台远程服务器(主控登记;真正接入需在该机器上跑 mmw-agent 并提供 token)。", false,
 		mcpgo.WithString("name", mcpgo.Required(), mcpgo.Description("服务器名称")),
@@ -176,10 +171,10 @@ func registerServerTools(s *server.MCPServer, b *bridge) {
 			}
 			// 3) 返回 apply 结果 + 生成的凭据(客户端连接要用)
 			out, _ := json.Marshal(map[string]any{
-				"success":     true,
+				"success":      true,
 				"apply_result": json.RawMessage(applyBody),
-				"credentials": built.Credentials,
-				"tip":         "credentials 里是自动生成的连接凭据;reality 客户端必须用 reality_public_key。",
+				"credentials":  built.Credentials,
+				"tip":          "credentials 里是自动生成的连接凭据;reality 客户端必须用 reality_public_key。",
 			})
 			return mcpgo.NewToolResultText(string(out)), nil
 		})
