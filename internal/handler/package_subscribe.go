@@ -268,7 +268,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		result = string(filterSnellV6FromClashYAML([]byte(result)))
 		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
 		// 显式带 t=clash/clashmeta 通常是浏览器/调试预览,不想被强制下载;只有完全不带 t(典型 Clash 客户端拉取)才下发 attachment
-		setSubscriptionName(w, pkg.Name, ".yaml")
+		setSubscriptionName(w, pkg.Name, "")
 		h.writeTrafficHeader(r.Context(), w, user, pkg)
 		w.Write([]byte(result))
 		return
