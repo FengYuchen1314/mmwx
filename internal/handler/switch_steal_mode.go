@@ -39,6 +39,10 @@ func (h *RemoteManageHandler) HandleSwitchStealMode(w http.ResponseWriter, r *ht
 		remoteWriteError(w, http.StatusNotFound, "server not found")
 		return
 	}
+	if req.StealMode != "default" && forbidMasterHTTPSSteal(ctx, h.repo, server) {
+		remoteWriteError(w, http.StatusConflict, masterHTTPSStealMessage)
+		return
+	}
 
 	oldMode := server.StealMode
 	if oldMode == "" {
