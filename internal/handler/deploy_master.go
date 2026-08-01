@@ -233,6 +233,18 @@ func ensureNginxRunning(nginxBin string) error {
 	return exec.Command("systemctl", "start", "nginx").Run()
 }
 
+const dockerNginxEnabledMarker = "/app/data/nginx/enabled"
+
+func markDockerNginxEnabled() error {
+	if !isDocker() {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dockerNginxEnabledMarker), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dockerNginxEnabledMarker, []byte("1\n"), 0o644)
+}
+
 func isPort443InUse() bool {
 	ln, err := net.Listen("tcp", ":443")
 	if err != nil {
@@ -347,6 +359,10 @@ func (h *CertificateHandler) EnableHTTPS(w http.ResponseWriter, r *http.Request)
 		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("Nginx 启动失败: %v", err)})
 		return
 	}
+	if err := markDockerNginxEnabled(); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("保存 Docker HTTPS 启用状态失败: %v", err)})
+		return
+	}
 
 	newMasterURL := "https://" + domain
 	_ = h.repo.SetSystemSetting(ctx, "master_url", newMasterURL)
@@ -362,11 +378,14 @@ func (h *CertificateHandler) EnableHTTPS(w http.ResponseWriter, r *http.Request)
 		"new_master_url": newMasterURL,
 	})
 
-	// 延迟重启服务，使其重新绑定到 127.0.0.1（响应已发送）
-	go func() {
-		time.Sleep(2 * time.Second)
-		log.Printf("[EnableHTTPS] Restarting service to bind 127.0.0.1 only")
-		p, _ := os.FindProcess(os.Getpid())
-		_ = p.Signal(syscall.SIGTERM)
-	}()
+	// Docker 端口映射要求主控继续监听容器内 0.0.0.0，且主控是 PID 1；此处若发送
+	// SIGTERM 会连同刚启动的 Nginx 一起结束。裸机才通过服务重启切换到回环监听。
+	if !isDocker() {
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Printf("[EnableHTTPS] Restarting service to bind 127.0.0.1 only")
+			p, _ := os.FindProcess(os.Getpid())
+			_ = p.Signal(syscall.SIGTERM)
+		}()
+	}
 }

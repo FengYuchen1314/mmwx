@@ -447,7 +447,9 @@ func (h *RemoteWSHandler) buildProbeConfigUpdates(ctx context.Context, serverID 
 
 	updates := map[string]string{}
 	if recoveryURL := get(settingRecoveryURL); recoveryURL != "" {
-		updates["recovery_url"] = recoveryURL
+		if normalized, err := normalizeRecoveryURL(recoveryURL, masterListenPort()); err == nil {
+			updates["recovery_url"] = normalized
+		}
 	}
 	active := enabled && selected
 	b := func(key string) string {

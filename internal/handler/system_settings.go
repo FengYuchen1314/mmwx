@@ -181,7 +181,7 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 		value := strings.TrimSpace(*req.RecoveryURL)
 		if value != "" {
 			var err error
-			value, err = normalizeRecoveryURL(value, "12889")
+			value, err = normalizeRecoveryURL(value, masterListenPort())
 			if err != nil {
 				writeError(w, http.StatusBadRequest, errors.New("恢复地址必须是可公网访问的 HTTP 地址"))
 				return

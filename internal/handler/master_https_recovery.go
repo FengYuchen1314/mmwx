@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"syscall"
@@ -122,6 +123,20 @@ func normalizeRecoveryURL(raw, port string) (string, error) {
 	}
 	u.Path = ""
 	return strings.TrimRight(u.String(), "/"), nil
+}
+
+// masterListenPort returns the actual HTTP port used by the master process.
+// Recovery URLs must not assume the historical 12889 default because PORT is
+// configurable in both native and container deployments.
+func masterListenPort() string {
+	port := strings.TrimSpace(os.Getenv("PORT"))
+	if port == "" {
+		return "12889"
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return "12889"
+	}
+	return port
 }
 
 func (m *MasterHTTPSRecoveryMonitor) check(ctx context.Context) {

@@ -23,6 +23,28 @@ fi
 # Create and fix permissions for mounted data directories
 mkdir -p /app/data /app/subscribes /app/rule_templates
 
+# Nginx 的配置和证书必须跟随 /app/data 持久化，否则镜像更新或容器重建后 HTTPS 会丢失。
+NGINX_STATE_DIR=/app/data/nginx
+mkdir -p "$NGINX_STATE_DIR/cert" "$NGINX_STATE_DIR/servers" "$NGINX_STATE_DIR/stream_servers" "$NGINX_STATE_DIR/html"
+if [ ! -f "$NGINX_STATE_DIR/nginx.conf" ]; then
+    cp /etc/nginx/nginx.conf "$NGINX_STATE_DIR/nginx.conf"
+fi
+ln -sfn "$NGINX_STATE_DIR/nginx.conf" /etc/nginx/nginx.conf
+persist_nginx_dir() {
+    name=$1
+    source_dir=/etc/nginx/$name
+    state_dir=$NGINX_STATE_DIR/$name
+    if [ -d "$source_dir" ] && [ ! -L "$source_dir" ]; then
+        cp -a "$source_dir/." "$state_dir/" 2>/dev/null || true
+        rm -rf "$source_dir"
+    fi
+    ln -sfn "$state_dir" "$source_dir"
+}
+persist_nginx_dir cert
+persist_nginx_dir servers
+persist_nginx_dir stream_servers
+persist_nginx_dir html
+
 echo "Fixing permissions for mounted volumes..."
 chown -R appuser:appuser /app/data /app/subscribes /app/rule_templates
 
@@ -40,6 +62,17 @@ fi
 
 # Set DOCKER environment variable for in-app update detection
 export DOCKER=1
+
+# 开启过 HTTPS 的容器在重启后自动恢复 Nginx。配置损坏时保留主控 HTTP 后端可用，
+# 并把 nginx -t 的错误打印到容器日志，避免因反代配置错误拖死整个容器。
+if [ -f "$NGINX_STATE_DIR/enabled" ]; then
+    if nginx -t; then
+        echo "Persistent HTTPS configuration detected, starting nginx..."
+        nginx
+    else
+        echo "WARNING: persisted nginx configuration is invalid; starting MMWX without nginx" >&2
+    fi
+fi
 
 # 权限策略:默认以 root 跑 — mmwx 业务路径(/usr/local/nginx/cert 证书部署、
 # /usr/local/etc/xray/ xray 配置、ACME HTTP-01 起 80/443、systemctl 控服务)

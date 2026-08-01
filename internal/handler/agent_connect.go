@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -548,11 +547,13 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 		}
 	}
 	scriptRecoveryURL, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryURL)
-	if strings.TrimSpace(scriptRecoveryURL) == "" {
-		port := strings.TrimSpace(os.Getenv("PORT"))
-		if port == "" {
-			port = "12889"
+	if strings.TrimSpace(scriptRecoveryURL) != "" {
+		if normalized, err := normalizeRecoveryURL(scriptRecoveryURL, masterListenPort()); err == nil {
+			scriptRecoveryURL = normalized
 		}
+	}
+	if strings.TrimSpace(scriptRecoveryURL) == "" {
+		port := masterListenPort()
 		host := scriptServer
 		if parsed, err := url.Parse("//" + scriptServer); err == nil && parsed.Hostname() != "" {
 			host = parsed.Hostname()

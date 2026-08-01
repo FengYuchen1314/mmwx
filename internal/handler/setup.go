@@ -353,6 +353,9 @@ func deployLocalNginx(domain string, repo *storage.TrafficRepository) error {
 	if err := ensureNginxRunning(nginxBin); err != nil {
 		return fmt.Errorf("nginx 启动失败: %w", err)
 	}
+	if err := markDockerNginxEnabled(); err != nil {
+		return fmt.Errorf("保存 Docker HTTPS 启用状态失败: %w", err)
+	}
 
 	// 确保 nginx 开机自启 — 裸机部署一键脚本可能跳过 enable,服务器重启后 nginx 不起会让主控反代失效。
 	// 失败只 warn 不阻塞:enable 是补防御,主流程已经把 nginx 跑起来了。Docker 容器内没 systemd,跳过。
@@ -410,7 +413,10 @@ func deployLocalNginxWithCert(domain string, cert *storage.Certificate) error {
 	}
 	// 统一走 ensureNginxRunning:先 reload,失败时 Docker 用裸 nginx 拉起、裸机才 systemctl。
 	// 之前这里直接 fallback systemctl,Docker 容器无 systemd → 报「systemctl 不在 $PATH」。
-	return ensureNginxRunning(nginxBin)
+	if err := ensureNginxRunning(nginxBin); err != nil {
+		return err
+	}
+	return markDockerNginxEnabled()
 }
 
 func deployCertToLocal(domain string, repo *storage.TrafficRepository) {

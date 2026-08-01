@@ -117,8 +117,8 @@ VOLUME ["/app/data", "/app/subscribes"]
 # is preserved.
 ENV BIND_HOST=0.0.0.0
 
-# Expose port
-EXPOSE 12889
+# 主控 HTTP 后端以及容器内托管的 Nginx HTTP/HTTPS 入口。
+EXPOSE 80 443 12889
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

@@ -1271,7 +1271,22 @@ func (h *RemoteManageHandler) syncMasterURLToAgent(ctx context.Context, server *
 	if server == nil || server.IsFederated {
 		return nil
 	}
-	payload, _ := json.Marshal(map[string]string{"master_url": newMasterURL})
+	// During automatic HTTPS recovery, agents whose existing transport still
+	// works (notably Docker-network/loopback agents) must keep that address.
+	// Agents that actually lost contact switch themselves through recovery_url.
+	recovering, _ := h.repo.GetSystemSetting(ctx, settingForcePublicHTTP)
+	if recovering == "1" && !strings.HasPrefix(strings.ToLower(newMasterURL), "https://") {
+		log.Printf("[MasterURLSync] Server %d (%s): keep existing URL during HTTP recovery", server.ID, server.Name)
+		return nil
+	}
+	payloadData := map[string]interface{}{"master_url": newMasterURL}
+	// When HTTPS is restored, only agents that really switched to recovery_url
+	// should switch back. Internal/loopback agents remained healthy and must not
+	// have their transport address replaced by the public URL.
+	if recovering == "1" {
+		payloadData["only_if_recovery"] = true
+	}
+	payload, _ := json.Marshal(payloadData)
 	resp, err := h.forwardToRemoteServer(ctx, server.ID, http.MethodPost, "/api/child/agent/update-master-url", payload)
 	if err != nil {
 		return err
@@ -1315,6 +1330,11 @@ func (h *RemoteManageHandler) BroadcastMasterURLUpdate(ctx context.Context, newM
 		server := s
 		if err := h.syncMasterURLToAgent(ctx, &server, newMasterURL); err != nil {
 			log.Printf("[BroadcastMasterURL] Server %d (%s): failed: %v", s.ID, s.Name, err)
+		}
+	}
+	if recovering, _ := h.repo.GetSystemSetting(ctx, settingForcePublicHTTP); recovering == "1" && strings.HasPrefix(strings.ToLower(newMasterURL), "https://") {
+		if err := h.repo.SetSystemSetting(ctx, settingForcePublicHTTP, "0"); err != nil {
+			log.Printf("[BroadcastMasterURL] Failed to finish HTTP recovery state: %v", err)
 		}
 	}
 }
