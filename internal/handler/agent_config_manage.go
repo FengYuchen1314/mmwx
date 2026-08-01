@@ -477,6 +477,14 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			stealMode = "default"
 		}
 	}
+	if (req.StealSelf || stealMode == "tunnel" || stealMode == "fallback") &&
+		masterHTTPSEnabled(ctx, h.repo) &&
+		serverTargetsMasterHost(ctx, h.repo, req.PullAddress, req.IPAddress, req.Domain) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(stdhttp.StatusConflict)
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: masterHTTPSStealMessage})
+		return
+	}
 
 	xrayMode := req.XrayMode
 	if xrayMode != "embedded" {

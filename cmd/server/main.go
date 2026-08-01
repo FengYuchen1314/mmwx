@@ -676,6 +676,7 @@ func main() {
 	mux.Handle("/api/admin/remote/nginx/config", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxConfig)))
 	mux.Handle("/api/admin/remote/nginx/config/files", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxConfigFiles)))
 	mux.Handle("/api/admin/remote/nginx/servers-list", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxServersList)))
+	mux.Handle("/api/admin/remote/nginx/websites", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleNginxWebsites)))
 	mux.Handle("/api/admin/remote/system/info", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleSystemInfo)))
 	// 出站 sendThrough 用:列服务器网卡地址。server_id 省略=主控本机。
 	mux.Handle("/api/admin/server-nics", auth.RequireAdmin(tokenStore, userRepo, handler.NewServerNICsHandler(remoteManageHandler)))

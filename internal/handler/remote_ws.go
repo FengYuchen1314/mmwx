@@ -72,7 +72,8 @@ type WSAuthPayload struct {
 	Capabilities AgentCapabilities `json:"capabilities,omitempty"`
 	// WarpInstalled agent 本机是否已注册 Cloudflare WARP(成功跑过 EnsureRegistered 且 warp.json 存在)。
 	// 老 agent 不发 = false → server 卡片 W badge 不显示,完全向后兼容。
-	WarpInstalled bool `json:"warp_installed,omitempty"`
+	WarpInstalled    bool  `json:"warp_installed,omitempty"`
+	SameHostAsMaster *bool `json:"same_host_as_master,omitempty"`
 	// AgentVersion agent 自身版本号(随 auth 上报)。master 据此显示版本/判断可升级,
 	// 不再反向 HTTP 拉 /api/child/system/info —— 端口隐身(HidePortOnWS)关闭入站后仍可拿到。
 	// 老 agent 不发该字段 = 空串 → fallback 反向 HTTP(向后兼容)。
@@ -179,7 +180,8 @@ type WSHeartbeatPayload struct {
 	// 每次心跳重发可让 master 跟随服务器 v6 地址变化(动态 prefix / 重新 detect)。
 	PublicIPv6 string `json:"public_ipv6,omitempty"`
 	// WarpInstalled 心跳里也带一份(同 WSAuthPayload),让 master 跟踪 agent 主动 install/remove 后的状态变化。
-	WarpInstalled bool `json:"warp_installed,omitempty"`
+	WarpInstalled    bool  `json:"warp_installed,omitempty"`
+	SameHostAsMaster *bool `json:"same_host_as_master,omitempty"`
 }
 
 // WSSpeedPayload 表示实时速度数据负载
@@ -1076,6 +1078,20 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	}
 
 	h.conns.Store(authPayload.Token, wsConn)
+	blockedMasterSteal := (server.StealMode == "tunnel" || server.StealMode == "fallback") &&
+		(forbidMasterHTTPSSteal(context.Background(), h.repo, server) ||
+			(authPayload.SameHostAsMaster != nil && *authPayload.SameHostAsMaster && masterHTTPSEnabled(context.Background(), h.repo)))
+	if blockedMasterSteal {
+		if err := h.repo.UpdateRemoteServerStealMode(context.Background(), server.ID, "default"); err != nil {
+			log.Printf("[Remote WS] Failed to disable steal-self for same-host HTTPS master %s: %v", server.Name, err)
+		} else {
+			server.StealMode = "default"
+			log.Printf("[Remote WS] Disabled steal-self for same-host HTTPS master %s to protect port 443", server.Name)
+		}
+		go func(id int64) {
+			_ = h.SendConfigUpdate(id, map[string]string{"steal_mode": ""})
+		}(server.ID)
+	}
 
 	updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer updateCancel()
@@ -1111,6 +1127,11 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	// 同步 WARP 安装状态 — 跟 IP 字段分开 update 是为了不破坏 UpdateRemoteServerHeartbeat 签名
 	if err := h.repo.UpdateRemoteServerWarpInstalled(updateCtx, authPayload.Token, authPayload.WarpInstalled); err != nil {
 		log.Printf("[Remote WS] Failed to update warp_installed for %s: %v", server.Name, err)
+	}
+	if authPayload.SameHostAsMaster != nil {
+		if err := h.repo.UpdateRemoteServerSameHost(updateCtx, authPayload.Token, *authPayload.SameHostAsMaster); err != nil {
+			log.Printf("[Remote WS] Failed to update same_host_as_master for %s: %v", server.Name, err)
+		}
 	}
 
 	// 通知策略:
@@ -1224,7 +1245,8 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	// 在第一次连接时自动部署窃取配置（服务器处于挂起状态）。同机 Agent 使用的域名
 	// 就是主控域名时，再顺序部署主控反代。必须等偷自己配置完成后再做，二者都会写
 	// servers/{domain}.conf，并发下发会让最后完成的一方随机覆盖另一方。
-	if server.Use443 && server.Domain != "" && server.Status == "pending" && h.stealSelfDeployer != nil {
+	if server.Use443 && server.Domain != "" && server.Status == "pending" && h.stealSelfDeployer != nil && !blockedMasterSteal &&
+		!(authPayload.SameHostAsMaster != nil && *authPayload.SameHostAsMaster && masterHTTPSEnabled(context.Background(), h.repo)) {
 		go func() {
 			// Agent 首次认证发生在安装脚本尚未结束时很常见。旧逻辑只等 5 秒并尝试一次：
 			// Nginx 未装完或证书尚未就绪就永久错过自动部署（状态随后已变 connected）。
@@ -1408,6 +1430,11 @@ func (h *RemoteWSHandler) handleHeartbeat(wsConn *RemoteWSConnection, payload js
 	// 心跳里也带 warp_installed,跟踪 agent 主动 install/remove 后的状态变化
 	if err := h.repo.UpdateRemoteServerWarpInstalled(ctx, wsConn.Token, hbPayload.WarpInstalled); err != nil {
 		log.Printf("[Remote WS] Failed to update warp_installed for server %s: %v", wsConn.ServerName, err)
+	}
+	if hbPayload.SameHostAsMaster != nil {
+		if err := h.repo.UpdateRemoteServerSameHost(ctx, wsConn.Token, *hbPayload.SameHostAsMaster); err != nil {
+			log.Printf("[Remote WS] Failed to update same_host_as_master for server %s: %v", wsConn.ServerName, err)
+		}
 	}
 
 	ackPayload, _ := json.Marshal(map[string]int64{"server_time": time.Now().Unix()})

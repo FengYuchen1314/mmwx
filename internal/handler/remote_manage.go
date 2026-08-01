@@ -1853,6 +1853,143 @@ func (h *RemoteManageHandler) HandleNginxServersList(w http.ResponseWriter, r *h
 	w.Write(result)
 }
 
+// HandleNginxWebsites exposes the agent-side website inventory and safe delete
+// operation. The agent owns filesystem validation and nginx rollback; the
+// master additionally protects the server's primary domain and cleans routing.
+func (h *RemoteManageHandler) HandleNginxWebsites(w http.ResponseWriter, r *http.Request) {
+	serverID := r.URL.Query().Get("server_id")
+	id, err := strconv.ParseInt(serverID, 10, 64)
+	if err != nil || id <= 0 {
+		remoteWriteError(w, http.StatusBadRequest, "invalid server_id")
+		return
+	}
+	server, err := h.repo.GetRemoteServer(r.Context(), id)
+	if err != nil {
+		remoteWriteError(w, http.StatusNotFound, "server not found")
+		return
+	}
+	var body []byte
+	if r.Method == http.MethodDelete {
+		var req struct {
+			Domain string `json:"domain"`
+		}
+		if json.NewDecoder(r.Body).Decode(&req) != nil {
+			remoteWriteError(w, http.StatusBadRequest, "invalid body")
+			return
+		}
+		domain := strings.ToLower(strings.TrimSpace(req.Domain))
+		if domain == "" {
+			remoteWriteError(w, http.StatusBadRequest, "domain required")
+			return
+		}
+		if strings.EqualFold(domain, strings.TrimSpace(server.Domain)) {
+			remoteWriteError(w, http.StatusConflict, "服务器主域名配置受保护，不能从网站管理删除")
+			return
+		}
+		body, _ = json.Marshal(map[string]string{"domain": domain})
+	} else if r.Method != http.MethodGet {
+		remoteWriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/nginx/websites", body)
+	if err != nil {
+		remoteWriteError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if r.Method == http.MethodGet && strings.TrimSpace(server.Domain) != "" {
+		var inventory map[string]any
+		if json.Unmarshal(result, &inventory) == nil {
+			if websites, ok := inventory["websites"].([]any); ok {
+				for _, raw := range websites {
+					website, _ := raw.(map[string]any)
+					domain, _ := website["domain"].(string)
+					if strings.EqualFold(domain, strings.TrimSpace(server.Domain)) {
+						website["protected"] = true
+						website["reason"] = "服务器主域名配置"
+					}
+				}
+				if encoded, marshalErr := json.Marshal(inventory); marshalErr == nil {
+					result = encoded
+				}
+			}
+		}
+	}
+	if r.Method == http.MethodDelete {
+		var req struct {
+			Domain string `json:"domain"`
+		}
+		_ = json.Unmarshal(body, &req)
+		h.cleanupWebsiteRouting(r.Context(), id, server.StealMode, req.Domain)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(result)
+}
+
+func (h *RemoteManageHandler) cleanupWebsiteRouting(ctx context.Context, serverID int64, stealMode, domain string) {
+	resp, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/xray/config", nil)
+	if err != nil {
+		log.Printf("[WebsiteDelete] read xray config failed for server %d: %v", serverID, err)
+		return
+	}
+	var envelope struct {
+		Config string `json:"config"`
+	}
+	if json.Unmarshal(resp, &envelope) != nil || envelope.Config == "" {
+		return
+	}
+	var config map[string]any
+	if json.Unmarshal([]byte(envelope.Config), &config) != nil {
+		return
+	}
+	changed := false
+	if stealMode == "fallback" {
+		changed = removeWebsiteFallbackDomain(config, domain)
+	} else {
+		changed = h.removeDomainsFromTunnelNginxRoute(config, []string{domain})
+	}
+	if !changed {
+		return
+	}
+	updated, _ := json.MarshalIndent(config, "", "    ")
+	payload, _ := json.Marshal(map[string]string{"config": string(updated)})
+	if _, err := h.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/xray/config", payload); err != nil {
+		log.Printf("[WebsiteDelete] write xray config failed for server %d: %v", serverID, err)
+		return
+	}
+	if err := h.restartXrayWithRecovery(ctx, serverID, "DeleteWebsite"); err != nil {
+		log.Printf("[WebsiteDelete] restart xray failed for server %d: %v", serverID, err)
+	}
+}
+
+func removeWebsiteFallbackDomain(config map[string]any, domain string) bool {
+	inbounds, _ := config["inbounds"].([]any)
+	for _, raw := range inbounds {
+		inbound, _ := raw.(map[string]any)
+		settings, _ := inbound["settings"].(map[string]any)
+		reality, _ := settings["realitySettings"].(map[string]any)
+		names, _ := reality["serverNames"].([]any)
+		if len(names) == 0 {
+			continue
+		}
+		remaining := make([]any, 0, len(names))
+		removed := false
+		for _, rawName := range names {
+			name, _ := rawName.(string)
+			if strings.EqualFold(name, domain) {
+				removed = true
+				continue
+			}
+			remaining = append(remaining, rawName)
+		}
+		if removed {
+			reality["serverNames"] = remaining
+			return true
+		}
+	}
+	return false
+}
+
 // getRemoteServerPort 提取或确定远程服务器的端口
 // 现在，我们假设子服务器在配置中指定的同一端口上运行
 func (h *RemoteManageHandler) getRemoteServerPort(server *storage.RemoteServer) string {
@@ -4731,6 +4868,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 		Domain    string `json:"domain"`
 		SiteType  string `json:"site_type"`
 		SiteValue string `json:"site_value"`
+		EntryMode string `json:"entry_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ServerID == 0 || req.Domain == "" {
 		remoteWriteError(w, http.StatusBadRequest, "server_id and domain are required")
@@ -4752,11 +4890,82 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
 	rootDomain := extractRootDomain(domain)
 
-	certName := "_." + rootDomain
-	if h.certHandler != nil {
-		if cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, req.ServerID); certErr == nil && cert != nil {
-			certName = certDeployFilename(cert.Domain)
+	var environment struct {
+		Nginx struct {
+			Installed bool   `json:"installed"`
+			CanManage bool   `json:"can_manage"`
+			Reason    string `json:"reason"`
+		} `json:"nginx"`
+		Ports map[string]string `json:"ports"`
+	}
+	if raw, envErr := h.forwardToRemoteServer(ctx, req.ServerID, http.MethodGet, "/api/child/nginx/websites", nil); envErr != nil || json.Unmarshal(raw, &environment) != nil {
+		remoteWriteError(w, http.StatusBadGateway, "无法检查 Agent Nginx 环境，请先升级 Agent")
+		return
+	}
+	if !environment.Nginx.Installed {
+		remoteWriteError(w, http.StatusConflict, "Agent 尚未安装 Nginx，请先在网站管理中安装")
+		return
+	}
+	if !environment.Nginx.CanManage {
+		reason := environment.Nginx.Reason
+		if reason == "" {
+			reason = "现有 Nginx 配置不支持 MMWX websites 目录"
 		}
+		remoteWriteError(w, http.StatusConflict, reason)
+		return
+	}
+
+	effectiveMode := strings.ToLower(strings.TrimSpace(req.EntryMode))
+	if effectiveMode == "" || effectiveMode == "auto" {
+		if server.StealMode == "tunnel" || server.StealMode == "fallback" {
+			effectiveMode = server.StealMode
+		} else {
+			switch environment.Ports["443"] {
+			case "", "nginx":
+				effectiveMode = "direct"
+			case "xray":
+				remoteWriteError(w, http.StatusConflict, "443 已被 Xray 占用，请选择 Xray fallback 或 tunnel 网站入口")
+				return
+			case "unknown":
+				remoteWriteError(w, http.StatusConflict, "Agent 缺少 ss/netstat，无法安全确认 443 端口占用")
+				return
+			default:
+				remoteWriteError(w, http.StatusConflict, fmt.Sprintf("443 已被其他程序占用: %s", environment.Ports["443"]))
+				return
+			}
+		}
+	}
+	if effectiveMode != "direct" && effectiveMode != "tunnel" && effectiveMode != "fallback" {
+		remoteWriteError(w, http.StatusBadRequest, "entry_mode must be auto, direct, tunnel or fallback")
+		return
+	}
+	if (effectiveMode == "tunnel" || effectiveMode == "fallback") && server.StealMode != effectiveMode {
+		remoteWriteError(w, http.StatusConflict, fmt.Sprintf("服务器尚未建立 %s 入口；为避免覆盖现有 Xray 配置，请先在隧道/偷自己配置中创建该入口", effectiveMode))
+		return
+	}
+	if effectiveMode == "direct" && environment.Ports["443"] != "" && environment.Ports["443"] != "nginx" {
+		remoteWriteError(w, http.StatusConflict, "直接 Nginx 模式要求 443 空闲或已由 Nginx 使用")
+		return
+	}
+
+	if h.certHandler == nil {
+		remoteWriteError(w, http.StatusInternalServerError, "证书服务不可用")
+		return
+	}
+	cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, req.ServerID)
+	if certErr != nil || cert == nil || cert.CertPEM == "" || cert.KeyPEM == "" {
+		remoteWriteError(w, http.StatusConflict, fmt.Sprintf("未找到覆盖 %s 的有效证书，请先申请或部署证书", domain))
+		return
+	}
+	certName := certDeployFilename(cert.Domain)
+	certPayload, _ := json.Marshal(WSCertDeployPayload{
+		Domain: cert.Domain, CertPEM: cert.CertPEM, KeyPEM: cert.KeyPEM,
+		CertPath: "/usr/local/nginx/cert/" + certName + ".pem",
+		KeyPath:  "/usr/local/nginx/cert/" + certName + ".key", Reload: "none",
+	})
+	if _, err := h.forwardToRemoteServer(ctx, req.ServerID, http.MethodPost, "/api/child/cert/deploy", certPayload); err != nil {
+		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("证书下发失败: %v", err))
+		return
 	}
 	// 1. 生成 nginx domain config(统一渲染:伪装站 location / + ws location)。
 	// ws 入站走主域名 fallback,故仅当添加的正是 server 主域名时才聚合 ws location;额外网站域名不带 ws。
@@ -4764,11 +4973,17 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 	if strings.EqualFold(domain, strings.ToLower(strings.TrimSpace(server.Domain))) {
 		wssForDomain = h.fetchWSSInbounds(ctx, req.ServerID)
 	}
-	domainConf, err := renderStealSelfDomainConf(server.StealMode, req.SiteType, req.SiteValue, domain, certName, wssForDomain)
+	var domainConf string
+	if effectiveMode == "direct" {
+		domainConf, err = renderDirectWebsiteConf(req.SiteType, req.SiteValue, domain, certName)
+	} else {
+		domainConf, err = renderStealSelfDomainConf(effectiveMode, req.SiteType, req.SiteValue, domain, certName, wssForDomain)
+	}
 	if err != nil {
 		remoteWriteError(w, http.StatusInternalServerError, fmt.Sprintf("渲染 domain.conf 失败: %v", err))
 		return
 	}
+	domainConf = fmt.Sprintf("# MMWX-WEBSITE v1\n# mmwx-site-type: %s\n# mmwx-site-value-b64: %s\n%s", req.SiteType, base64.StdEncoding.EncodeToString([]byte(req.SiteValue)), domainConf)
 
 	// 2. 部署 nginx domain config（不覆盖 nginx.conf）
 	sslPayload, _ := json.Marshal(map[string]any{
@@ -4777,6 +4992,10 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 	})
 	if _, err := h.forwardNginxSetupSSL(ctx, req.ServerID, sslPayload); err != nil {
 		remoteWriteError(w, http.StatusBadGateway, fmt.Sprintf("部署 nginx 配置失败: %v", err))
+		return
+	}
+	if effectiveMode == "direct" {
+		remoteWriteJSON(w, http.StatusOK, map[string]any{"success": true, "message": fmt.Sprintf("网站 %s 添加成功", domain), "entry_mode": effectiveMode})
 		return
 	}
 
@@ -4798,7 +5017,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 	}
 
 	// 4. 修改 xray 配置
-	if server.StealMode == "fallback" {
+	if effectiveMode == "fallback" {
 		h.addWebsiteFallbackConfig(xrayConfig, domain)
 	} else {
 		h.addWebsiteTunnelConfig(xrayConfig, domain)
@@ -4813,31 +5032,33 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// 5. 部署证书
-	if h.certHandler != nil {
-		cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, req.ServerID)
-		if certErr == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
-			payload := WSCertDeployPayload{
-				Domain:   rootDomain,
-				CertPEM:  cert.CertPEM,
-				KeyPEM:   cert.KeyPEM,
-				CertPath: fmt.Sprintf("/usr/local/nginx/cert/%s.pem", certDeployFilename(cert.Domain)),
-				KeyPath:  fmt.Sprintf("/usr/local/nginx/cert/%s.key", certDeployFilename(cert.Domain)),
-				Reload:   "nginx",
-			}
-			h.certHandler.deployToRemoteServer(server, payload)
-		}
-	}
-
-	// 6. 重启 xray
+	// 5. 重启 xray
 	if err := h.restartXrayWithRecovery(ctx, req.ServerID, "AddWebsite"); err != nil {
 		log.Printf("[AddWebsite] %v", err)
 	}
 
 	remoteWriteJSON(w, http.StatusOK, map[string]any{
-		"success": true,
-		"message": fmt.Sprintf("网站 %s 添加成功", domain),
+		"success":    true,
+		"message":    fmt.Sprintf("网站 %s 添加成功", domain),
+		"entry_mode": effectiveMode,
 	})
+}
+
+func renderDirectWebsiteConf(siteType, siteValue, domain, certName string) (string, error) {
+	name := "website/direct_static.conf"
+	placeholder := "{static_root_path}"
+	if siteType == "proxy" {
+		name = "website/direct_proxy.conf"
+		placeholder = "{proxy_pass_server}"
+	}
+	tpl, err := templates.ReadFile(name)
+	if err != nil {
+		return "", err
+	}
+	result := strings.ReplaceAll(string(tpl), "{domain}", domain)
+	result = strings.ReplaceAll(result, "{cert_name}", certName)
+	result = strings.ReplaceAll(result, placeholder, siteValue)
+	return result, nil
 }
 
 func (h *RemoteManageHandler) addWebsiteTunnelConfig(config map[string]any, domain string) {

@@ -488,6 +488,17 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 		return
 	}
 	stealSelf := r.URL.Query().Get("steal_self") == "1"
+	if stealSelf {
+		server, err := h.repo.GetRemoteServerByToken(r.Context(), token)
+		if err != nil {
+			http.Error(w, "server not found", http.StatusNotFound)
+			return
+		}
+		if forbidMasterHTTPSSteal(r.Context(), h.repo, server) {
+			http.Error(w, masterHTTPSStealMessage, http.StatusConflict)
+			return
+		}
+	}
 	xrayMode := r.URL.Query().Get("xray_mode")
 	if xrayMode != "embedded" {
 		xrayMode = "external"
@@ -594,6 +605,15 @@ if [ -n "$MMWX_PROTOCOL" ]; then
 fi
 
 MASTER_URL="${PROTOCOL}://${SERVER}"
+
+# 最后一层本机保护：主控已使用 HTTPS 时，在主控机器上安装 Agent 绝不能
+# 启用偷自己抢占 443。兼容直装主控和常见 Docker 挂载目录。
+if [ "$AUTO_STEAL_SELF" = "1" ] && [ "$PROTOCOL" = "https" ]; then
+    if pgrep -x mmwx >/dev/null 2>&1 || [ -d /etc/mmwx ] || [ -d /var/lib/mmwx ]; then
+        echo "ERROR: ` + masterHTTPSStealMessage + `" >&2
+        exit 1
+    fi
+fi
 
 echo "=========================================="
 echo "  MMWX Remote Server Installation"
