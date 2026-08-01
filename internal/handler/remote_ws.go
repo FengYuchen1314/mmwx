@@ -58,6 +58,9 @@ type WSMessage struct {
 // WSAuthPayload 表示身份验证消息负载
 type WSAuthPayload struct {
 	Token string `json:"token"`
+	// Probe validates a migration candidate without registering/replacing the
+	// live Agent connection or triggering reconnect synchronization callbacks.
+	Probe bool `json:"probe,omitempty"`
 	// PublicIPv4 由 agent 在 detect 后随 auth 一起上报。master 优先用它写 db.IPAddress,
 	// 避免 master 重启 → preferV4DialContext 偶尔 fallback v6 → auth 用 WS 源 IP (v6) 写 db
 	// → 立刻反向请求 agent (HTTP) 用 v6 → 失败。心跳里也会上报,但 auth 早于第一次 heartbeat
@@ -984,6 +987,11 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 			log.Printf("[Remote WS] Invalid token from %s", remoteAddr)
 		}
 		h.sendAuthResult(conn, false, "Invalid token")
+		return nil, false
+	}
+	if authPayload.Probe {
+		h.markAuthSuccess(remoteAddr)
+		h.sendAuthResult(conn, true, "migration candidate authenticated")
 		return nil, false
 	}
 	// auth 通过 → 清掉该 IP 的失败记录,合法 agent 永远不进 cooldown

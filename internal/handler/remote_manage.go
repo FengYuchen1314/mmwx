@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +42,136 @@ type RemoteManageHandler struct {
 	stealSelfDeployer func(ctx context.Context, serverID int64) error
 	licenseManager    *license.Manager // 同步入站时检查 routed 节点 license 上限,setter 注入
 	inboundCache      *InboundCache    // 从 xray config snapshot 派生,套餐绑/换绑 cred 计算用,setter 注入
+	onMasterMigrated  func(context.Context, string)
+}
+
+func (h *RemoteManageHandler) SetOnMasterMigrated(fn func(context.Context, string)) {
+	h.onMasterMigrated = fn
+}
+
+type masterMigrationRequest struct {
+	Action       string `json:"action"`
+	NewMasterURL string `json:"new_master_url"`
+	ChangeDomain bool   `json:"change_domain"`
+	MoveHost     bool   `json:"move_host"`
+	Force        bool   `json:"force"`
+}
+
+type masterMigrationAgentResult struct {
+	ServerID  int64  `json:"server_id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	Message   string `json:"message,omitempty"`
+	LatencyMS int64  `json:"latency_ms,omitempty"`
+	Protected bool   `json:"protected_transport,omitempty"`
+}
+
+// HandleMasterMigration implements a two-phase migration. Preview probes the
+// candidate from every connected Agent; commit probes again before changing any
+// Agent config. Same-host transports are preserved unless the master moves host.
+func (h *RemoteManageHandler) HandleMasterMigration(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		remoteWriteError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req masterMigrationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		remoteWriteError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	req.NewMasterURL = strings.TrimRight(strings.TrimSpace(req.NewMasterURL), "/")
+	candidate, err := url.ParseRequestURI(req.NewMasterURL)
+	if err != nil || candidate.Host == "" || (candidate.Scheme != "http" && candidate.Scheme != "https") || candidate.RawQuery != "" || candidate.Fragment != "" {
+		remoteWriteError(w, http.StatusBadRequest, "new_master_url must be a clean HTTP(S) origin")
+		return
+	}
+	currentRaw, _ := h.repo.GetSystemSetting(r.Context(), "master_url")
+	current, _ := url.Parse(strings.TrimSpace(currentRaw))
+	if !req.ChangeDomain && current != nil && !strings.EqualFold(current.Hostname(), candidate.Hostname()) {
+		remoteWriteError(w, http.StatusBadRequest, "未选择更换域名，新地址必须使用当前主控域名")
+		return
+	}
+	if req.ChangeDomain && current != nil && strings.EqualFold(current.Hostname(), candidate.Hostname()) {
+		remoteWriteError(w, http.StatusBadRequest, "已选择更换域名，但新旧主控域名相同")
+		return
+	}
+	servers, err := h.repo.ListRemoteServers(r.Context())
+	if err != nil {
+		remoteWriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	results := make([]masterMigrationAgentResult, 0, len(servers))
+	ready := true
+	for i := range servers {
+		s := &servers[i]
+		result := masterMigrationAgentResult{ServerID: s.ID, Name: s.Name}
+		if s.IsFederated {
+			result.Status, result.Message = "skipped", "联邦服务器不由当前主控改写"
+			results = append(results, result)
+			continue
+		}
+		if s.SameHostAsMaster && !req.MoveHost {
+			result.Status, result.Message, result.Protected = "preserved", "保留本机/容器内网连接地址", true
+			results = append(results, result)
+			continue
+		}
+		if s.Status != storage.RemoteServerStatusConnected {
+			result.Status, result.Message = "offline", "Agent 离线，无法预下发迁移地址"
+			ready = false
+			results = append(results, result)
+			continue
+		}
+		payload, _ := json.Marshal(map[string]string{"master_url": req.NewMasterURL})
+		resp, probeErr := h.forwardToRemoteServer(r.Context(), s.ID, http.MethodPost, "/api/child/agent/probe-master-url", payload)
+		if probeErr != nil {
+			result.Status, result.Message = "failed", probeErr.Error()
+			ready = false
+		} else {
+			var probe struct {
+				Success   bool   `json:"success"`
+				Message   string `json:"message"`
+				LatencyMS int64  `json:"latency_ms"`
+			}
+			if json.Unmarshal(resp, &probe) != nil || !probe.Success {
+				result.Status, result.Message = "failed", probe.Message
+				if result.Message == "" {
+					result.Message = "Agent 无法访问新主控"
+				}
+				ready = false
+			} else {
+				result.Status, result.LatencyMS = "ready", probe.LatencyMS
+			}
+		}
+		results = append(results, result)
+	}
+	if req.Action == "commit" {
+		if !ready && !req.Force {
+			remoteWriteJSON(w, http.StatusConflict, map[string]interface{}{"success": false, "ready": false, "agents": results, "message": "仍有 Agent 未通过迁移检查"})
+			return
+		}
+		for i, result := range results {
+			if result.Status != "ready" {
+				continue
+			}
+			s := &servers[i]
+			if err := h.syncMasterURLToAgent(r.Context(), s, req.NewMasterURL); err != nil {
+				results[i].Status, results[i].Message = "failed", err.Error()
+				ready = false
+			}
+		}
+		if !ready && !req.Force {
+			remoteWriteJSON(w, http.StatusConflict, map[string]interface{}{"success": false, "ready": false, "agents": results, "message": "部分 Agent 地址写入失败，主控地址未切换"})
+			return
+		}
+		if err := h.repo.SetSystemSetting(r.Context(), "master_url", req.NewMasterURL); err != nil {
+			remoteWriteError(w, http.StatusInternalServerError, "保存主控地址失败")
+			return
+		}
+		if h.onMasterMigrated != nil {
+			go h.onMasterMigrated(context.Background(), req.NewMasterURL)
+		}
+	}
+	remoteWriteJSON(w, http.StatusOK, map[string]interface{}{"success": true, "ready": ready, "committed": req.Action == "commit", "agents": results})
 }
 
 // SetLicenseManager 注入 license 管理器供 syncInboundsToNodes 做节点数量上限检查。

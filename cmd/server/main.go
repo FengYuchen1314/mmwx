@@ -879,6 +879,11 @@ func main() {
 	// 自定义安全阈值(登录/暴力防护/订阅频率)— 写入后 handler 内部热更新 3 个 limiter 单例,无需重启
 	mux.Handle("/api/admin/security-settings", auth.RequireAdmin(tokenStore, userRepo, handler.NewSecuritySettingsHandler(repo)))
 	tgBotManager := inttgbot.NewManager(repo, tokenStore, mux)
+	remoteManageHandler.SetOnMasterMigrated(func(ctx context.Context, _ string) {
+		if err := tgBotManager.Restart(ctx); err != nil {
+			logger.Error("主控迁移后重启 TGBot 失败", "error", err.Error())
+		}
+	})
 	mux.Handle("/api/admin/system-settings/tgbot", auth.RequireAdmin(tokenStore, userRepo, handler.NewTGBotSettingsHandler(tgBotManager)))
 	mux.HandleFunc("/tg-app", tgBotManager.ServeWebApp)
 	mux.HandleFunc("/api/tg-webapp/", tgBotManager.ServeWebApp)
@@ -903,6 +908,7 @@ func main() {
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
 	})))
+	mux.Handle("/api/admin/system-settings/master-migration", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(remoteManageHandler.HandleMasterMigration)))
 	mux.Handle("/api/admin/system-settings/external-https", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
