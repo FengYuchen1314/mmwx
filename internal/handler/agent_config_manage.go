@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +27,13 @@ var randReader io.Reader = rand.Reader
 
 // base64URLEncoding 用于 URL 安全的 base64 编码
 var base64URLEncoding = base64.URLEncoding
+
+type countingDiscardWriter struct{ n int64 }
+
+func (w *countingDiscardWriter) Write(p []byte) (int, error) {
+	w.n += int64(len(p))
+	return len(p), nil
+}
 
 type XrayServerHandler struct {
 	repo           *storage.TrafficRepository
@@ -752,14 +760,27 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			return
 		}
 		uninstallCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_, uninstallErr := h.remoteManager.forwardToRemoteServer(
-			uninstallCtx,
-			req.ID,
-			stdhttp.MethodPost,
-			"/api/child/agent/uninstall-stream",
-			nil,
-		)
+		var uninstallErr error
+		streamOutput := &countingDiscardWriter{}
+		if h.wsHandler != nil {
+			uninstallErr = h.wsHandler.CallAgentStream(uninstallCtx, req.ID, stdhttp.MethodPost, "/api/child/agent/uninstall-stream", "", nil, streamOutput, nil, 25*time.Second)
+		} else {
+			uninstallErr = fmt.Errorf("%w: ws handler unavailable", ErrWSRPCUnavailable)
+		}
 		cancel()
+		// 卸载脚本先输出“已调度”，两秒后才停止 Agent。此后 WS 被关闭属于预期，
+		// 只要已经收到流数据就视为 Agent 接受了卸载，继续删除数据库记录。
+		if uninstallErr != nil && streamOutput.n > 0 {
+			log.Printf("[Remote Server] uninstall stream for %s ended after acceptance: %v", serverName, uninstallErr)
+			uninstallErr = nil
+		}
+		if errors.Is(uninstallErr, ErrWSRPCUnavailable) {
+			// WS 流式通道不可用时使用全新的 context 走 HTTP。不能复用上面的
+			// 超时 context，也不能再次进入普通 WS RPC（SSE 文本不是 JSON）。
+			fallbackCtx, fallbackCancel := context.WithTimeout(withoutWSRPC(ctx), 30*time.Second)
+			_, uninstallErr = h.remoteManager.forwardToRemoteServer(fallbackCtx, req.ID, stdhttp.MethodPost, "/api/child/agent/uninstall-stream", nil)
+			fallbackCancel()
+		}
 		if uninstallErr != nil {
 			log.Printf("[Remote Server] uninstall agent before deleting %s failed: %v", serverName, uninstallErr)
 			w.Header().Set("Content-Type", "application/json")

@@ -531,6 +531,9 @@ func isDocker() bool {
 	return false
 }
 
+// IsDockerEnvironment exposes the shared container detection to startup wiring.
+func IsDockerEnvironment() bool { return isDocker() }
+
 // ReplaceBinary 将目标替换为新的二进制文件
 func replaceBinary(src, dst string) error {
 	// 在 Linux 上，我们可以删除正在运行的二进制文件（它保留在内存中）

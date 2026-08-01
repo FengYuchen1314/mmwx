@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-acme/lego/v4/certcrypto"
@@ -34,15 +35,16 @@ type CertResult struct {
 
 // CertRequest 包含证书请求的所有参数。
 type CertRequest struct {
-	Email          string
-	Domain         string
-	Provider       string // CA 提供商名称（letsencrypt、zerossl、buypass）
-	ChallengeMode  string // 独立、webroot、dns
-	WebrootPath    string
-	DNSProvider    string            // DNS-01 的 DNS 提供商类型（cloudflare、alidns 等）
-	DNSCredentials map[string]string // DNS API 凭据
-	EABKid         string            // 外部帐户绑定密钥 ID（用于 ZeroSSL 等）
-	EABHmacKey     string            // 外部账户绑定HMAC密钥
+	Email             string
+	Domain            string
+	Provider          string // CA 提供商名称（letsencrypt、zerossl、buypass）
+	ChallengeMode     string // 独立、webroot、dns
+	WebrootPath       string
+	DNSProvider       string            // DNS-01 的 DNS 提供商类型（cloudflare、alidns 等）
+	DNSCredentials    map[string]string // DNS API 凭据
+	EABKid            string            // 外部帐户绑定密钥 ID（用于 ZeroSSL 等）
+	EABHmacKey        string            // 外部账户绑定HMAC密钥
+	IncludeRootDomain bool              // 泛域名证书同时包含根域名 SAN（仅 DNS-01）
 }
 
 // User 实现了乐高的 acme.User 接口。
@@ -130,8 +132,9 @@ func (c *Client) ObtainCertificateV2(ctx context.Context, req CertRequest) (*Cer
 	}
 
 	// 索取证书
+	domains := certificateDomains(req)
 	obtainReq := certificate.ObtainRequest{
-		Domains: []string{req.Domain},
+		Domains: domains,
 		Bundle:  true,
 	}
 
@@ -141,6 +144,14 @@ func (c *Client) ObtainCertificateV2(ctx context.Context, req CertRequest) (*Cer
 	}
 
 	return c.ProcessCertResult(req.Domain, certificates.Certificate, certificates.PrivateKey)
+}
+
+func certificateDomains(req CertRequest) []string {
+	domains := []string{req.Domain}
+	if req.IncludeRootDomain && req.ChallengeMode == "dns" && strings.HasPrefix(req.Domain, "*.") {
+		domains = append(domains, strings.TrimPrefix(req.Domain, "*."))
+	}
+	return domains
 }
 
 // 续订现有证书（向后兼容）。

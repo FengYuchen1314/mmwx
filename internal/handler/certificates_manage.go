@@ -1,9 +1,13 @@
 package handler
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -72,43 +76,46 @@ func NewCertificateHandler(repo *storage.TrafficRepository, wsHandler *RemoteWSH
 
 // CertificateRequest 表示创建或更新证书的请求。
 type CertificateRequest struct {
-	Domain         string `json:"domain"`
-	Email          string `json:"email"`
-	RemoteServerID int64  `json:"remote_server_id"` // 0 = 主控
-	Provider       string `json:"provider"`         // 详见上下文
-	ChallengeMode  string `json:"challenge_mode"`   // 独立 |网站根目录 |域名系统
-	WebrootPath    string `json:"webroot_path"`     // 仅适用于 webroot 模式
-	AutoRenew      bool   `json:"auto_renew"`
-	DNSProviderID  int64  `json:"dns_provider_id"` // 参考 dns_providers 表
-	DeployTarget   string `json:"deploy_target"`   // 无、nginx、xray、两者
-	DeployCertPath string `json:"deploy_cert_path"`
-	DeployKeyPath  string `json:"deploy_key_path"`
-	AutoDeploy     bool   `json:"auto_deploy"`
+	Domain            string `json:"domain"`
+	Email             string `json:"email"`
+	RemoteServerID    int64  `json:"remote_server_id"` // 0 = 主控
+	Provider          string `json:"provider"`         // 详见上下文
+	ChallengeMode     string `json:"challenge_mode"`   // 独立 |网站根目录 |域名系统
+	WebrootPath       string `json:"webroot_path"`     // 仅适用于 webroot 模式
+	AutoRenew         bool   `json:"auto_renew"`
+	DNSProviderID     int64  `json:"dns_provider_id"` // 参考 dns_providers 表
+	DeployTarget      string `json:"deploy_target"`   // 无、nginx、xray、两者
+	DeployCertPath    string `json:"deploy_cert_path"`
+	DeployKeyPath     string `json:"deploy_key_path"`
+	AutoDeploy        bool   `json:"auto_deploy"`
+	IncludeRootDomain bool   `json:"include_root_domain"`
 }
 
 // CertificateResponse 表示 API 响应中的证书。
 type CertificateResponse struct {
-	ID               int64   `json:"id"`
-	Domain           string  `json:"domain"`
-	Email            string  `json:"email"`
-	Provider         string  `json:"provider"`
-	CertPath         string  `json:"cert_path"`
-	KeyPath          string  `json:"key_path"`
-	Status           string  `json:"status"`
-	ExpiryDate       *string `json:"expiry_date"`
-	IssueDate        *string `json:"issue_date"`
-	AutoRenew        bool    `json:"auto_renew"`
-	ChallengeMode    string  `json:"challenge_mode"`
-	RemoteServerID   int64   `json:"remote_server_id"`
-	RemoteServerName string  `json:"remote_server_name,omitempty"`
-	Message          string  `json:"message,omitempty"`
-	DNSProviderID    int64   `json:"dns_provider_id"`
-	DeployTarget     string  `json:"deploy_target"`
-	DeployCertPath   string  `json:"deploy_cert_path,omitempty"`
-	DeployKeyPath    string  `json:"deploy_key_path,omitempty"`
-	AutoDeploy       bool    `json:"auto_deploy"`
-	CreatedAt        string  `json:"created_at"`
-	UpdatedAt        string  `json:"updated_at"`
+	ID               int64    `json:"id"`
+	Domain           string   `json:"domain"`
+	Domains          []string `json:"domains"`
+	Email            string   `json:"email"`
+	Provider         string   `json:"provider"`
+	CertPath         string   `json:"cert_path"`
+	KeyPath          string   `json:"key_path"`
+	Status           string   `json:"status"`
+	ExpiryDate       *string  `json:"expiry_date"`
+	IssueDate        *string  `json:"issue_date"`
+	AutoRenew        bool     `json:"auto_renew"`
+	ChallengeMode    string   `json:"challenge_mode"`
+	RemoteServerID   int64    `json:"remote_server_id"`
+	RemoteServerName string   `json:"remote_server_name,omitempty"`
+	Message          string   `json:"message,omitempty"`
+	DNSProviderID    int64    `json:"dns_provider_id"`
+	DeployTarget     string   `json:"deploy_target"`
+	DeployCertPath   string   `json:"deploy_cert_path,omitempty"`
+	DeployKeyPath    string   `json:"deploy_key_path,omitempty"`
+	AutoDeploy       bool     `json:"auto_deploy"`
+	HasMaterial      bool     `json:"has_material"`
+	CreatedAt        string   `json:"created_at"`
+	UpdatedAt        string   `json:"updated_at"`
 }
 
 // ListCertificatesResponse 表示列出证书的响应。
@@ -129,6 +136,7 @@ func certificateToResponse(cert *storage.Certificate) CertificateResponse {
 	resp := CertificateResponse{
 		ID:             cert.ID,
 		Domain:         cert.Domain,
+		Domains:        certificateDNSNames(cert),
 		Email:          cert.Email,
 		Provider:       cert.Provider,
 		CertPath:       cert.CertPath,
@@ -143,6 +151,7 @@ func certificateToResponse(cert *storage.Certificate) CertificateResponse {
 		DeployCertPath: cert.DeployCertPath,
 		DeployKeyPath:  cert.DeployKeyPath,
 		AutoDeploy:     cert.AutoDeploy,
+		HasMaterial:    strings.TrimSpace(cert.CertPEM) != "" && strings.TrimSpace(cert.KeyPEM) != "",
 		CreatedAt:      cert.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:      cert.UpdatedAt.Format(time.RFC3339),
 	}
@@ -155,6 +164,93 @@ func certificateToResponse(cert *storage.Certificate) CertificateResponse {
 		resp.IssueDate = &t
 	}
 	return resp
+}
+
+func certificateDNSNames(cert *storage.Certificate) []string {
+	if cert == nil {
+		return nil
+	}
+	names := make([]string, 0, 2)
+	seen := make(map[string]struct{})
+	add := func(name string) {
+		name = strings.TrimSpace(strings.ToLower(name))
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	add(cert.Domain)
+	block, _ := pem.Decode([]byte(cert.CertPEM))
+	if block == nil {
+		return names
+	}
+	x, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return names
+	}
+	for _, name := range x.DNSNames {
+		add(name)
+	}
+	return names
+}
+
+// DownloadCertificate 从数据库中的证书副本生成压缩包，避免依赖主控本地文件仍然存在。
+func (h *CertificateHandler) DownloadCertificate(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(r) {
+		respondJSON(w, http.StatusForbidden, map[string]any{"success": false, "message": "管理员权限不足"})
+		return
+	}
+	id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+	if err != nil || id <= 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "无效的证书ID"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	cert, err := h.repo.GetCertificate(ctx, id)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if err == storage.ErrCertificateNotFound {
+			status = http.StatusNotFound
+		}
+		respondJSON(w, status, map[string]any{"success": false, "message": "获取证书失败"})
+		return
+	}
+	if strings.TrimSpace(cert.CertPEM) == "" || strings.TrimSpace(cert.KeyPEM) == "" {
+		respondJSON(w, http.StatusConflict, map[string]any{"success": false, "message": "数据库中没有可下载的证书副本"})
+		return
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range map[string]string{
+		"fullchain.pem": cert.CertPEM,
+		"privkey.pem":   cert.KeyPEM,
+	} {
+		entry, createErr := zw.Create(name)
+		if createErr != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "生成证书压缩包失败"})
+			return
+		}
+		if _, writeErr := entry.Write([]byte(content)); writeErr != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "生成证书压缩包失败"})
+			return
+		}
+	}
+	if err := zw.Close(); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "生成证书压缩包失败"})
+		return
+	}
+	filename := strings.NewReplacer("*", "wildcard", "/", "_", "\\", "_").Replace(cert.Domain) + "-certificate.zip"
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
 }
 
 // 检查当前用户是否是管理员
@@ -336,6 +432,14 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 		DeployCertPath: req.DeployCertPath,
 		DeployKeyPath:  req.DeployKeyPath,
 		AutoDeploy:     req.AutoDeploy,
+	}
+	if req.IncludeRootDomain {
+		if req.ChallengeMode != storage.CertChallengeDNS || !strings.HasPrefix(req.Domain, "*.") {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "同时包含根域名仅支持 DNS 验证的泛域名证书"})
+			return
+		}
+		// 不新增数据库列：签发后的证书 SAN 会被 lego 在续期时读取并原样保留。
+		cert.IncludeRootDomain = true
 	}
 
 	if err := h.repo.CreateCertificate(ctx, cert); err != nil {
@@ -795,11 +899,12 @@ func (h *CertificateHandler) HandleCertUpdate(serverID int64, payload WSCertUpda
 // 从数据库解析 DNS 提供商凭据。
 func (h *CertificateHandler) buildCertRequest(ctx context.Context, cert *storage.Certificate) (acme.CertRequest, error) {
 	req := acme.CertRequest{
-		Email:         cert.Email,
-		Domain:        cert.Domain,
-		Provider:      cert.Provider,
-		ChallengeMode: cert.ChallengeMode,
-		WebrootPath:   cert.WebrootPath,
+		Email:             cert.Email,
+		Domain:            cert.Domain,
+		Provider:          cert.Provider,
+		ChallengeMode:     cert.ChallengeMode,
+		WebrootPath:       cert.WebrootPath,
+		IncludeRootDomain: cert.IncludeRootDomain || certificateCoversRoot(cert),
 	}
 
 	// 如果使用 DNS-01，则解析 DNS 提供商凭据
@@ -819,6 +924,18 @@ func (h *CertificateHandler) buildCertRequest(ctx context.Context, cert *storage
 	}
 
 	return req, nil
+}
+
+func certificateCoversRoot(cert *storage.Certificate) bool {
+	if cert == nil || !strings.HasPrefix(cert.Domain, "*.") || strings.TrimSpace(cert.CertPEM) == "" {
+		return false
+	}
+	block, _ := pem.Decode([]byte(cert.CertPEM))
+	if block == nil {
+		return false
+	}
+	x, err := x509.ParseCertificate(block.Bytes)
+	return err == nil && x.VerifyHostname(strings.TrimPrefix(cert.Domain, "*.")) == nil
 }
 
 // deployAfterMaterialUpdate 是签发、续期和覆盖上传后的统一部署入口。

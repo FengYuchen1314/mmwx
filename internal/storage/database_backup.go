@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	modernsqlite "modernc.org/sqlite"
 )
 
 // QuickCheck 对当前数据库执行轻量完整性检查。返回 nil 才允许生成/替换备份。
@@ -44,7 +46,8 @@ func quickCheckDB(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
-// BackupDatabase 使用 VACUUM INTO 创建包含 WAL 已提交内容的一致性快照。快照通过
+// BackupDatabase 使用 SQLite Online Backup API 创建包含 WAL 已提交内容的一致性
+// 快照。复制按小批页面执行，避免 VACUUM INTO 长时间占用主库；快照通过
 // quick_check 后才替换唯一正式备份，失败时保留上一次可用备份。
 func (r *TrafficRepository) BackupDatabase(ctx context.Context, backupPath string) error {
 	if strings.TrimSpace(backupPath) == "" {
@@ -62,10 +65,9 @@ func (r *TrafficRepository) BackupDatabase(ctx context.Context, backupPath strin
 	}
 	tmp := abs + ".tmp"
 	_ = os.Remove(tmp)
-	quoted := strings.ReplaceAll(tmp, "'", "''")
-	if _, err := r.db.ExecContext(ctx, "VACUUM INTO '"+quoted+"'"); err != nil {
+	if err := onlineBackup(ctx, r.db, tmp); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("vacuum into backup: %w", err)
+		return fmt.Errorf("online database backup: %w", err)
 	}
 	if err := quickCheckSQLiteFile(ctx, tmp); err != nil {
 		_ = os.Remove(tmp)
@@ -80,6 +82,57 @@ func (r *TrafficRepository) BackupDatabase(ctx context.Context, backupPath strin
 		return fmt.Errorf("publish database backup: %w", err)
 	}
 	return nil
+}
+
+func onlineBackup(ctx context.Context, db *sql.DB, dstPath string) error {
+	type backuper interface {
+		NewBackup(string) (*modernsqlite.Backup, error)
+	}
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire source connection: %w", err)
+	}
+	defer conn.Close()
+
+	return conn.Raw(func(driverConn any) error {
+		backupDriver, ok := driverConn.(backuper)
+		if !ok {
+			return fmt.Errorf("sqlite driver does not support online backup")
+		}
+		backup, err := backupDriver.NewBackup(dstPath)
+		if err != nil {
+			return fmt.Errorf("initialize backup: %w", err)
+		}
+		finished := false
+		defer func() {
+			if !finished {
+				_ = backup.Finish()
+			}
+		}()
+
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			more, err := backup.Step(256)
+			if err != nil {
+				return fmt.Errorf("copy backup pages: %w", err)
+			}
+			if !more {
+				finished = true
+				if err := backup.Finish(); err != nil {
+					return fmt.Errorf("finish backup: %w", err)
+				}
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+	})
 }
 
 func quickCheckSQLiteFile(ctx context.Context, path string) error {

@@ -136,6 +136,7 @@ func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Requ
 		"recovery_startup_grace_minutes": parsePositiveInt(recoveryGrace, 10),
 		"recovery_pending":               recoveryPending == "1",
 		"recovery_reason":                recoveryReason,
+		"is_docker":                      isDocker(),
 	})
 }
 
@@ -255,6 +256,10 @@ func (h *SystemSettingsHandler) SetMasterURL(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	if req.LocalOnly != nil {
+		if *req.LocalOnly && isDocker() {
+			writeError(w, http.StatusBadRequest, errors.New("Docker 环境不支持禁止公网访问，请通过 Docker 端口映射或宿主机防火墙限制访问"))
+			return
+		}
 		value := "0"
 		if *req.LocalOnly {
 			value = "1"

@@ -3,8 +3,10 @@ package storage
 import (
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -12352,29 +12354,30 @@ const (
 
 // 证书表示由 ACME 管理的 SSL/TLS 证书
 type Certificate struct {
-	ID             int64
-	Domain         string
-	Email          string
-	Provider       string
-	CertPath       string
-	KeyPath        string
-	CertPEM        string
-	KeyPEM         string
-	Status         string
-	ExpiryDate     *time.Time
-	IssueDate      *time.Time
-	AutoRenew      bool
-	ChallengeMode  string
-	WebrootPath    string
-	RemoteServerID int64
-	Message        string
-	DNSProviderID  int64
-	DeployTarget   string
-	DeployCertPath string
-	DeployKeyPath  string
-	AutoDeploy     bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                int64
+	Domain            string
+	Email             string
+	Provider          string
+	CertPath          string
+	KeyPath           string
+	CertPEM           string
+	KeyPEM            string
+	Status            string
+	ExpiryDate        *time.Time
+	IssueDate         *time.Time
+	AutoRenew         bool
+	ChallengeMode     string
+	WebrootPath       string
+	RemoteServerID    int64
+	Message           string
+	DNSProviderID     int64
+	DeployTarget      string
+	DeployCertPath    string
+	DeployKeyPath     string
+	AutoDeploy        bool
+	IncludeRootDomain bool // transient request option; renewals infer it from the issued SAN
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 // DNSProvider 代表可重用的 DNS API 凭证集
@@ -12537,6 +12540,15 @@ func (r *TrafficRepository) GetCertificate(ctx context.Context, id int64) (*Cert
 	return &cert, nil
 }
 
+func certificatePEMCoversHost(certPEM, host string) bool {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	return err == nil && cert.VerifyHostname(host) == nil
+}
+
 // 按域和服务器 ID 返回证书。
 func (r *TrafficRepository) GetCertificateByDomain(ctx context.Context, domain string, serverID int64) (*Certificate, error) {
 	if r == nil || r.db == nil {
@@ -12641,6 +12653,11 @@ func (r *TrafficRepository) FindCertificateForDomain(ctx context.Context, fqdn s
 	cert, err := scanCertificate(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			wildQuery := strings.Replace(query, "domain IN ("+placeholders+")", "domain = ?", 1)
+			wildRow := r.db.QueryRowContext(ctx, wildQuery, "*."+fqdn, fqdn)
+			if wildcard, scanErr := scanCertificate(wildRow); scanErr == nil && certificatePEMCoversHost(wildcard.CertPEM, fqdn) {
+				return &wildcard, nil
+			}
 			return nil, ErrCertificateNotFound
 		}
 		return nil, fmt.Errorf("find certificate for domain: %w", err)
@@ -12922,6 +12939,9 @@ func (r *TrafficRepository) AppendCertificateLog(ctx context.Context, id int64, 
 func (r *TrafficRepository) UpdateCertificateIssued(ctx context.Context, id int64, certPath, keyPath, certPEM, keyPEM string, issueDate, expiryDate time.Time) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
+	}
+	if strings.TrimSpace(certPEM) == "" || strings.TrimSpace(keyPEM) == "" {
+		return errors.New("certificate and private key PEM are required")
 	}
 
 	result, err := r.db.ExecContext(ctx, `

@@ -1197,6 +1197,7 @@ func main() {
 	mux.Handle("/api/admin/certificates/auto-deploy", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.SetAutoDeploy)))
 	mux.Handle("/api/admin/certificates/deploy", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.DeployCertificate)))
 	mux.Handle("/api/admin/certificates/upload", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.UploadCertificate)))
+	mux.Handle("/api/admin/certificates/download", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.DownloadCertificate)))
 	mux.Handle("/api/admin/certificates/delete", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.DeleteCertificate)))
 	mux.Handle("/api/admin/certificates/", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.GetCertificate)))
 	mux.Handle("/api/admin/master-cert-status", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(certHandler.GetMasterCertStatus)))
@@ -1354,8 +1355,6 @@ func main() {
 	go startDailySnapshotTask(collectorCtx, trafficHandler, trafficCollector)
 	// WAL 巡检:每 5 分钟 wal_checkpoint(TRUNCATE),把 -wal 抽干并截断,防止长跑容器里 mmwx.db-wal 无界膨胀。
 	go startWALCheckpointTask(collectorCtx, repo)
-	// 每小时创建一个经 quick_check 验证的一致性数据库快照，只保留最新副本。
-	go startDatabaseBackupTask(collectorCtx, repo, databaseBackupPath)
 	// 每分钟检查数据库健康；一旦损坏或底层 I/O 失败，停止所有后台采集/写入任务并只告警一次。
 	go startDatabaseHealthTask(collectorCtx, repo, stopCollector)
 	// 一次性补:上一轮已切到 traffic_source='system' 但 daily snapshot baseline 缺失的 server。
@@ -1521,6 +1520,10 @@ func getAddr(config *ServerConfig, repo *storage.TrafficRepository) string {
 		localOnly, err := repo.GetSystemSetting(context.Background(), "master_local_only")
 		if err != nil {
 			log.Printf("[Main] Failed to read master access setting, using %s: %v", host, err)
+		} else if localOnly == "1" && handler.IsDockerEnvironment() {
+			log.Printf("[Main] Docker environment ignores master_local_only; use Docker port publishing or host firewall instead")
+			_ = repo.SetSystemSetting(context.Background(), "master_local_only", "0")
+			host = "0.0.0.0"
 		} else if localOnly == "1" && forcePublic != "1" {
 			host = "127.0.0.1"
 		} else if forcePublic == "1" {
@@ -1642,30 +1645,6 @@ func startWALCheckpointTask(ctx context.Context, repo *storage.TrafficRepository
 				// TRUNCATE 抢不到窗口(有长读/写事务持 WAL mark)已降级 PASSIVE 尽力抽干,-wal 不会无界
 				log.Printf("[WAL] checkpoint 未能截断(WAL 仍剩 %d 帧,已降级 PASSIVE 尽力抽干,不影响可用)", remaining)
 			}
-		}
-	}
-}
-
-func startDatabaseBackupTask(ctx context.Context, repo *storage.TrafficRepository, backupPath string) {
-	backup := func() {
-		backupCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-		defer cancel()
-		if err := repo.BackupDatabase(backupCtx, backupPath); err != nil {
-			logger.Error("数据库定时备份失败，已保留上一次有效备份", "error", err)
-			return
-		}
-		logger.Info("数据库定时备份完成", "path", backupPath)
-	}
-	// 启动后立即建立首份备份，随后每小时覆盖更新。
-	backup()
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			backup()
 		}
 	}
 }

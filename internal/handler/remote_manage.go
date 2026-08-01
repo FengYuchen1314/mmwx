@@ -1342,6 +1342,12 @@ func isSessionInvalidErr(err error) bool {
 		strings.Contains(s, "decrypt")
 }
 
+type skipWSRPCContextKey struct{}
+
+func withoutWSRPC(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipWSRPCContextKey{}, true)
+}
+
 func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverID int64, method, path string, body []byte) (respBody []byte, err error) {
 	// 写操作成功 + path 命中 xray 配置修改清单 → 异步 refresh snapshot
 	// (用 defer + named return 统一处理所有 return 分支,无需在每个 return 点重复)
@@ -1362,8 +1368,10 @@ func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverI
 	//   - agent 老二进制不支持 RPC(Capabilities.RPC=false)→ tryWSRPC 直接 return nil,false
 	//   - WS 临时断开 / RPC 调用超时 → tryWSRPC 返回 ErrWSRPCUnavailable
 	//   - 业务级错误(handler 返回非 2xx)直接透传,**不** fallback(语义错就是错)
-	if respBody, ok, err := h.tryWSRPC(ctx, serverID, method, path, body); ok {
-		return respBody, err
+	if ctx.Value(skipWSRPCContextKey{}) == nil {
+		if respBody, ok, err := h.tryWSRPC(ctx, serverID, method, path, body); ok {
+			return respBody, err
+		}
 	}
 
 	server, err := h.repo.GetRemoteServer(ctx, serverID)
