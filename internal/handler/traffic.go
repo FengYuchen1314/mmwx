@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"miaomiaowux/internal/storage"
 	"miaomiaowux/internal/traffic"
@@ -51,6 +52,8 @@ func (h *TrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleUserSnapshots(w, r)
 	case path == "server-system-snapshots":
 		h.handleServerSystemSnapshots(w, r)
+	case path == "server-period-totals":
+		h.handleServerPeriodTotals(w, r)
 	case path == "user-nodes":
 		h.handleUserNodes(w, r)
 	case path == "node-users":
@@ -62,6 +65,92 @@ func (h *TrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// handleServerPeriodTotals 返回从 date 当日 00:00 到当前的服务器流量。
+// 当前值与服务管理共用 GetServerTrafficUsed；历史基线则按同一台服务器的
+// traffic_source 和 traffic_stats_mode 从对应快照计算，避免前端重复实现统计口径。
+func (h *TrafficHandler) handleServerPeriodTotals(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	date := strings.TrimSpace(r.URL.Query().Get("date"))
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		h.writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": "date must be YYYY-MM-DD"})
+		return
+	}
+
+	ctx := r.Context()
+	servers, err := h.repo.ListRemoteServers(ctx)
+	if err != nil {
+		h.writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	nodeSnapshots, err := h.repo.GetNodeTrafficSnapshots(ctx, date)
+	if err != nil {
+		h.writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+	systemSnapshots, err := h.repo.GetServerSystemTrafficSnapshots(ctx, date)
+	if err != nil {
+		h.writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	type directions struct{ up, down int64 }
+	nodeBase := make(map[int64]directions)
+	for _, snap := range nodeSnapshots {
+		base := nodeBase[snap.ServerID]
+		base.up += snap.Uplink
+		base.down += snap.Downlink
+		nodeBase[snap.ServerID] = base
+	}
+	systemBase := make(map[int64]directions)
+	for _, snap := range systemSnapshots {
+		systemBase[snap.ServerID] = directions{up: snap.TxCycle, down: snap.RxCycle}
+	}
+
+	applyMode := func(value directions, mode string) int64 {
+		switch mode {
+		case "upload":
+			return value.up
+		case "download":
+			return value.down
+		case "max":
+			if value.up > value.down {
+				return value.up
+			}
+			return value.down
+		default:
+			return value.up + value.down
+		}
+	}
+
+	type periodTotal struct {
+		ServerID   int64  `json:"server_id"`
+		ServerName string `json:"server_name"`
+		Used       int64  `json:"used"`
+	}
+	items := make([]periodTotal, 0, len(servers))
+	for _, server := range servers {
+		current, currentErr := h.repo.GetServerTrafficUsed(ctx, server.ID)
+		if currentErr != nil {
+			log.Printf("[Traffic API] server-period-totals: current server=%d: %v", server.ID, currentErr)
+			continue
+		}
+		base := nodeBase[server.ID]
+		if server.TrafficSource == "system" {
+			base = systemBase[server.ID]
+		}
+		used := current - applyMode(base, server.TrafficStatsMode)
+		if used < 0 {
+			// 快照可能来自旧统计源或服务器计数器重建；不能向前端返回负流量。
+			used = 0
+		}
+		items = append(items, periodTotal{ServerID: server.ID, ServerName: server.Name, Used: used})
+	}
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "date": date, "items": items})
 }
 
 // handleUserNodes 返回某用户在每个节点上的流量(细分到 routed 子账号 / 普通 inbound),
