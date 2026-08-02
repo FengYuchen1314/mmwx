@@ -363,7 +363,12 @@ type RemoteWSHandler struct {
 	tokenConflicts sync.Map // map[string]*tokenConflictRecord
 	// ddnsManager 心跳检测到 IP 漂移时触发 DNS provider API 更新域名 A/AAAA 记录。
 	// 用 setter 注入避免循环依赖(ddns 包不能依赖 handler 包)。
-	ddnsManager *ddns.Manager
+	ddnsManager                 *ddns.Manager
+	serverAddressChangeCallback func(ctx context.Context, before, after *storage.RemoteServer)
+}
+
+func (h *RemoteWSHandler) SetServerAddressChangeCallback(fn func(ctx context.Context, before, after *storage.RemoteServer)) {
+	h.serverAddressChangeCallback = fn
 }
 
 // SetDDNSManager 注入 DDNS 管理器,main.go 启动时调一次。
@@ -1110,22 +1115,9 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	if err != nil {
 		log.Printf("[Remote WS] Failed to update server status for %s: %v", server.Name, err)
 	} else if ipChanged && latest != nil {
-		// agent 换 IP 后,把已存在节点的 clash_config.server 也跟着刷成新的 effective host
-		if newHost := chooseClashServerHost(latest); newHost != "" {
-			if n, e := h.repo.RefreshNodesServerAddress(updateCtx, latest.Name, newHost); e != nil {
-				log.Printf("[Remote WS] auth: refresh nodes server address for %s failed: %v", latest.Name, e)
-			} else if n > 0 {
-				log.Printf("[Remote WS] auth: refreshed %d node(s) clash.server → %s for %s", n, newHost, latest.Name)
-			}
-		}
-		// v6 节点单独刷新(只动 ip_family='v6' 的节点)。
-		// 锁定入口 IP 时用手填地址(v6RefreshTarget),避免动态出口 IPv6 覆盖锁定值。
-		if v6 := v6RefreshTarget(latest); v6 != "" {
-			if n, e := h.repo.RefreshNodesServerAddressV6(updateCtx, latest.Name, v6); e != nil {
-				log.Printf("[Remote WS] auth: refresh v6 nodes for %s failed: %v", latest.Name, e)
-			} else if n > 0 {
-				log.Printf("[Remote WS] auth: refreshed %d v6 node(s) clash.server → %s for %s", n, v6, latest.Name)
-			}
+		if h.serverAddressChangeCallback != nil {
+			before, after := *server, *latest
+			go h.serverAddressChangeCallback(context.Background(), &before, &after)
 		}
 		// DDNS:agent 换 IP 后把新 IP 同步到 pull_address 域名的 A/AAAA 记录
 		if h.ddnsManager != nil && latest.DDNSEnabled {
@@ -1413,22 +1405,9 @@ func (h *RemoteWSHandler) handleHeartbeat(wsConn *RemoteWSConnection, payload js
 	if hbResult, err := h.repo.UpdateRemoteServerHeartbeatWithRestart(ctx, update); err != nil {
 		log.Printf("[Remote WS] Failed to update heartbeat for server %s: %v", wsConn.ServerName, err)
 	} else if hbResult != nil && hbResult.IPChanged && hbResult.Server != nil {
-		// agent 换 IP 后,把已存在节点的 clash_config.server 跟着刷成新的 effective host
-		if newHost := chooseClashServerHost(hbResult.Server); newHost != "" {
-			if n, e := h.repo.RefreshNodesServerAddress(ctx, hbResult.Server.Name, newHost); e != nil {
-				log.Printf("[Remote WS] heartbeat: refresh nodes server address for %s failed: %v", hbResult.Server.Name, e)
-			} else if n > 0 {
-				log.Printf("[Remote WS] heartbeat: refreshed %d node(s) clash.server → %s for %s", n, newHost, hbResult.Server.Name)
-			}
-		}
-		// v6 节点单独刷新(只动 ip_family='v6' 的节点)。
-		// 锁定入口 IP 时用手填地址(v6RefreshTarget),避免动态出口 IPv6 覆盖锁定值。
-		if v6 := v6RefreshTarget(hbResult.Server); v6 != "" {
-			if n, e := h.repo.RefreshNodesServerAddressV6(ctx, hbResult.Server.Name, v6); e != nil {
-				log.Printf("[Remote WS] heartbeat: refresh v6 nodes for %s failed: %v", hbResult.Server.Name, e)
-			} else if n > 0 {
-				log.Printf("[Remote WS] heartbeat: refreshed %d v6 node(s) clash.server → %s for %s", n, v6, hbResult.Server.Name)
-			}
+		if h.serverAddressChangeCallback != nil && hbResult.PreviousServer != nil {
+			before, after := *hbResult.PreviousServer, *hbResult.Server
+			go h.serverAddressChangeCallback(context.Background(), &before, &after)
 		}
 		// DDNS:同步新 IP 到域名 A/AAAA 记录
 		if h.ddnsManager != nil && hbResult.Server.DDNSEnabled {

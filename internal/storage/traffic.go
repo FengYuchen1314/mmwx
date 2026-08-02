@@ -8530,6 +8530,105 @@ func (r *TrafficRepository) SaveUserOutbound(ctx context.Context, uo UserOutboun
 	return err
 }
 
+// RewriteStoredOutboundAddresses updates the master-side copies of outbound
+// definitions. Live Agent configs are updated separately by the handler; keeping
+// these copies aligned prevents a later restore/re-provision from reviving old IPs.
+func (r *TrafficRepository) RewriteStoredOutboundAddresses(ctx context.Context, replacements map[string]string) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	if len(replacements) == 0 {
+		return 0, nil
+	}
+	type record struct {
+		table string
+		id    int64
+		raw   string
+	}
+	var records []record
+	for _, spec := range []struct {
+		table string
+		query string
+	}{
+		{"nodes", `SELECT id, routed_outbound_json FROM nodes WHERE COALESCE(routed_outbound_json, '') != ''`},
+		{"user_outbounds", `SELECT id, outbound_json FROM user_outbounds WHERE COALESCE(outbound_json, '') != ''`},
+	} {
+		rows, err := r.db.QueryContext(ctx, spec.query)
+		if err != nil {
+			return 0, fmt.Errorf("list %s outbound records: %w", spec.table, err)
+		}
+		for rows.Next() {
+			var rec record
+			rec.table = spec.table
+			if err := rows.Scan(&rec.id, &rec.raw); err != nil {
+				rows.Close()
+				return 0, fmt.Errorf("scan %s outbound record: %w", spec.table, err)
+			}
+			records = append(records, rec)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("iterate %s outbound records: %w", spec.table, err)
+		}
+		rows.Close()
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var updated int64
+	for _, rec := range records {
+		var outbound map[string]any
+		if json.Unmarshal([]byte(rec.raw), &outbound) != nil || !rewriteStoredOutboundAddress(outbound, replacements) {
+			continue
+		}
+		encoded, err := json.Marshal(outbound)
+		if err != nil {
+			return updated, err
+		}
+		var result sql.Result
+		if rec.table == "nodes" {
+			result, err = tx.ExecContext(ctx, `UPDATE nodes SET routed_outbound_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, string(encoded), rec.id)
+		} else {
+			result, err = tx.ExecContext(ctx, `UPDATE user_outbounds SET outbound_json = ? WHERE id = ?`, string(encoded), rec.id)
+		}
+		if err != nil {
+			return updated, fmt.Errorf("update %s outbound record %d: %w", rec.table, rec.id, err)
+		}
+		n, _ := result.RowsAffected()
+		updated += n
+	}
+	if err := tx.Commit(); err != nil {
+		return updated, err
+	}
+	return updated, nil
+}
+
+func rewriteStoredOutboundAddress(outbound map[string]any, replacements map[string]string) bool {
+	settings, _ := outbound["settings"].(map[string]any)
+	if settings == nil {
+		return false
+	}
+	changed := false
+	for _, key := range []string{"vnext", "servers"} {
+		entries, _ := settings[key].([]interface{})
+		for _, entry := range entries {
+			item, _ := entry.(map[string]any)
+			if item == nil {
+				continue
+			}
+			old, _ := item["address"].(string)
+			if replacement, ok := replacements[strings.TrimSpace(old)]; ok {
+				item["address"] = replacement
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
 func (r *TrafficRepository) GetUserOutbounds(ctx context.Context, username string) ([]UserOutbound, error) {
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT id, username, server_id, inbound_tag, outbound_tag, outbound_json, created_at FROM user_outbounds WHERE username = ?`, username)
@@ -10438,6 +10537,8 @@ type HeartbeatResult struct {
 	// Server:UPDATE 后的最新 RemoteServer(IP/PullAddress 已应用 update)。
 	// IPChanged=true 时非 nil;调用方拿它喂给 chooseClashServerHost 算最新的 effective host。
 	Server *RemoteServer
+	// PreviousServer 是本次更新前的服务器地址状态，供节点和出站精确替换旧 IP。
+	PreviousServer *RemoteServer
 }
 
 // UpdateRemoteServerWarpInstalled 单独同步 warp_installed 字段(auth/heartbeat 上报后调)。
@@ -10735,6 +10836,7 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 	v4Changed := update.IPAddress != "" && update.IPAddress != server.IPAddress
 	v6Changed := update.IPAddressV6 != "" && update.IPAddressV6 != server.IPAddressV6
 	if v4Changed || v6Changed {
+		before := *server
 		latest := *server
 		if v4Changed {
 			latest.IPAddress = update.IPAddress
@@ -10745,6 +10847,7 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 		latest.PullAddress = pullAddress
 		result.IPChanged = true
 		result.Server = &latest
+		result.PreviousServer = &before
 	}
 
 	return result, nil

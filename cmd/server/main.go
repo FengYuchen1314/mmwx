@@ -515,6 +515,8 @@ func main() {
 
 	// 远程服务器管理代理（将命令转发到子服务器）
 	remoteManageHandler := handler.NewRemoteManageHandler(repo, remoteWSHandler)
+	remoteManageHandler.SetSubscribeDir(subscribeDir)
+	remoteWSHandler.SetServerAddressChangeCallback(remoteManageHandler.SyncServerAddressChange)
 	remoteManageHandler.SetCrypto(cryptoConfig)
 	remoteManageHandler.SetLicenseManager(licenseManager) // syncInboundsToNodes 路径里 license budget 检查需要
 	// inbound cache: 套餐绑/换绑时 in-memory 算 cred 用,从 xray config snapshot 派生。
@@ -1188,6 +1190,9 @@ func main() {
 	remoteManageHandler.SetCertificateHandler(certHandler)
 	// agent 重连先同步实际 Xray 配置快照，再按快照补发其中引用的主控托管证书。
 	remoteWSHandler.SetXrayConfigSyncCallback(func(ctx context.Context, serverID int64, prevStatus string) {
+		// 离线期间错过的服务器 IP 变更必须先修到 Agent 配置，再读取快照；
+		// 否则 pending_recovery 会保存带旧 IP 的配置，用户恢复时又把旧地址写回来。
+		remoteManageHandler.SyncPendingOutboundAddressChanges(ctx, serverID)
 		remoteManageHandler.SyncXrayConfigOnReconnect(ctx, serverID, prevStatus)
 		certHandler.SyncManagedXrayCertificatesOnReconnect(ctx, serverID)
 	})

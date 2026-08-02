@@ -32,17 +32,25 @@ import (
 
 // RemoteManageHandler 处理需要转发到子服务器的管理请求
 type RemoteManageHandler struct {
-	repo              *storage.TrafficRepository
-	wsHandler         *RemoteWSHandler
-	httpClient        *http.Client
-	certHandler       *CertificateHandler
-	crypto            *CryptoConfig
-	pullSessions      sync.Map // serverID (int64) → *securechan.Session
-	fedSessions       sync.Map // serverID (int64) → *securechan.Session (联邦:消费方↔拥有方)
-	stealSelfDeployer func(ctx context.Context, serverID int64) error
-	licenseManager    *license.Manager // 同步入站时检查 routed 节点 license 上限,setter 注入
-	inboundCache      *InboundCache    // 从 xray config snapshot 派生,套餐绑/换绑 cred 计算用,setter 注入
-	onMasterMigrated  func(context.Context, string)
+	repo                *storage.TrafficRepository
+	wsHandler           *RemoteWSHandler
+	httpClient          *http.Client
+	certHandler         *CertificateHandler
+	crypto              *CryptoConfig
+	pullSessions        sync.Map // serverID (int64) → *securechan.Session
+	fedSessions         sync.Map // serverID (int64) → *securechan.Session (联邦:消费方↔拥有方)
+	stealSelfDeployer   func(ctx context.Context, serverID int64) error
+	licenseManager      *license.Manager // 同步入站时检查 routed 节点 license 上限,setter 注入
+	inboundCache        *InboundCache    // 从 xray config snapshot 派生,套餐绑/换绑 cred 计算用,setter 注入
+	onMasterMigrated    func(context.Context, string)
+	yamlSyncManager     *YAMLSyncManager
+	serverAddressSyncMu sync.Mutex
+}
+
+// SetSubscribeDir enables synchronization of persisted YAML subscriptions when
+// server addresses change.
+func (h *RemoteManageHandler) SetSubscribeDir(dir string) {
+	h.yamlSyncManager = NewYAMLSyncManager(dir)
 }
 
 func (h *RemoteManageHandler) SetOnMasterMigrated(fn func(context.Context, string)) {

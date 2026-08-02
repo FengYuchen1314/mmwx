@@ -1027,23 +1027,13 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 	}
 
-	// 后端权威比较修改前后的“实际节点入口”，不再依赖旧前端是否顺带
-	// lock_entry_ip。pull_address / domain / lock 任一改变了有效入口，都立即刷新关联节点。
+	// 后端权威比较修改前后的服务器入口。统一同步器会同时更新节点数据库、
+	// 已保存订阅 YAML、其它 Agent 上的 outbound 以及主控保存的 outbound 副本。
 	if latest, gerr := h.repo.GetRemoteServer(ctx, req.ID); gerr != nil {
 		log.Printf("[Remote Server] reload server %d for node address refresh failed: %v", req.ID, gerr)
-	} else if newNodeHost := chooseClashServerHost(latest); newNodeHost != "" && newNodeHost != oldNodeHost {
-		if n, e := h.repo.RefreshNodesServerAddress(ctx, latest.Name, newNodeHost); e != nil {
-			log.Printf("[Remote Server] refresh node address for %s failed: %v", latest.Name, e)
-		} else {
-			log.Printf("[Remote Server] refreshed %d node(s) clash.server: %s → %s for %s", n, oldNodeHost, newNodeHost, latest.Name)
-		}
-		if v6 := v6RefreshTarget(latest); v6 != "" {
-			if n, e := h.repo.RefreshNodesServerAddressV6(ctx, latest.Name, v6); e != nil {
-				log.Printf("[Remote Server] refresh v6 nodes for %s failed: %v", latest.Name, e)
-			} else if n > 0 {
-				log.Printf("[Remote Server] refreshed %d v6 node(s) clash.server → %s for %s", n, v6, latest.Name)
-			}
-		}
+	} else if h.remoteManager != nil && (chooseClashServerHost(latest) != oldNodeHost || latest.IPAddress != oldServer.IPAddress || latest.IPAddressV6 != oldServer.IPAddressV6 || latest.Name != oldServer.Name) {
+		before, after := *oldServer, *latest
+		go h.remoteManager.SyncServerAddressChange(context.Background(), &before, &after)
 	}
 
 	// DDNS 配置变更:校验后 + 单独更新(UpdateRemoteServer 不带 DDNS 字段)
