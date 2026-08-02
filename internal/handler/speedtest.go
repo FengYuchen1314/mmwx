@@ -61,6 +61,10 @@ func (h *SpeedTestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleTesterRevoke(w, r)
 	case r.URL.Path == "/api/admin/speedtest/testers/rotate-token" && r.Method == http.MethodPost:
 		h.handleTesterRotateToken(w, r)
+	case r.URL.Path == "/api/admin/speedtest/testers/update-info" && r.Method == http.MethodGet:
+		h.handleTesterUpdateInfo(w, r)
+	case r.URL.Path == "/api/admin/speedtest/testers/update-all" && r.Method == http.MethodPost:
+		h.handleTesterUpdateAll(w, r)
 	default:
 		writeError(w, http.StatusNotFound, errors.New("not found"))
 	}

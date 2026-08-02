@@ -39,11 +39,15 @@ type stWSMsg struct {
 	Name        string  `json:"name,omitempty"`
 
 	// ---- 可达性探测(被墙判定)。字段名与测速端客户端 wsMsg 逐一对齐。
-	Version   string              `json:"version,omitempty"` // hello 携带
-	Caps      []string            `json:"caps,omitempty"`    // hello 携带;老版本无此字段
-	Targets   []string            `json:"targets,omitempty"` // master→tester
-	TimeoutMS int                 `json:"timeout_ms,omitempty"`
-	Results   []TesterProbeResult `json:"results,omitempty"` // tester→master
+	Version       string              `json:"version,omitempty"` // hello 携带
+	Caps          []string            `json:"caps,omitempty"`    // hello 携带;老版本无此字段
+	Targets       []string            `json:"targets,omitempty"` // master→tester
+	TimeoutMS     int                 `json:"timeout_ms,omitempty"`
+	Results       []TesterProbeResult `json:"results,omitempty"` // tester→master
+	TargetVersion string              `json:"target_version,omitempty"`
+	DownloadURL   string              `json:"download_url,omitempty"`
+	SHA256        string              `json:"sha256,omitempty"`
+	Progress      int                 `json:"progress,omitempty"`
 }
 
 // TesterProbeResult 单个目标的拨测结果(测速端回传)。
@@ -138,7 +142,7 @@ func (h *SpeedTesterWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		switch msg.Type {
-		case "result", "probe_result":
+		case "result", "probe_result", "update_progress":
 			// 两类任务共用 pending 通道:jobID 全局唯一,不会串。
 			if ch, ok := tc.pending.Load(msg.JobID); ok {
 				select {
@@ -155,6 +159,38 @@ func (h *SpeedTesterWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 				}
 			}
 			_ = tc.send(stWSMsg{Type: "pong"})
+		}
+	}
+}
+
+// DispatchUpdate 下发一次固定版本更新。测速端在替换前回 restarting，随后连接会断开；
+// 调用方再以重新 hello 的版本作为最终成功依据，不能把“下载完成”误报为升级成功。
+func (h *SpeedTesterWSHandler) DispatchUpdate(ctx context.Context, testerID int64, targetVersion, downloadURL, checksum string) error {
+	v, ok := h.conns.Load(testerID)
+	if !ok {
+		return errors.New("测速端不在线")
+	}
+	tc := v.(*testerConn)
+	jobID := uuid.New().String()
+	ch := make(chan stWSMsg, 8)
+	tc.pending.Store(jobID, ch)
+	defer tc.pending.Delete(jobID)
+	if err := tc.send(stWSMsg{Type: "update", JobID: jobID, TargetVersion: targetVersion, DownloadURL: downloadURL, SHA256: checksum}); err != nil {
+		return errors.New("下发更新失败: " + err.Error())
+	}
+	for {
+		select {
+		case msg := <-ch:
+			if msg.Status == "failed" {
+				return errors.New(msg.Error)
+			}
+			if msg.Status == "restarting" {
+				return nil
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Minute):
+			return errors.New("测速端更新响应超时")
 		}
 	}
 }
