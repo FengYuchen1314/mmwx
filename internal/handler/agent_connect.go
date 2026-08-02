@@ -545,13 +545,8 @@ func (h *XrayServerHandler) GetRemoteInstallScript(w http.ResponseWriter, r *htt
 			}
 		}
 	}
-	scriptRecoveryURL, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryURL)
-	if strings.TrimSpace(scriptRecoveryURL) != "" {
-		if normalized, err := normalizeRecoveryURL(scriptRecoveryURL, masterListenPort()); err == nil {
-			scriptRecoveryURL = normalized
-		}
-	}
-	if strings.TrimSpace(scriptRecoveryURL) == "" {
+	scriptRecoveryURL, _, recoveryErr := effectiveRecoveryURL(r.Context(), h.repo, masterListenPort())
+	if recoveryErr != nil {
 		port := masterListenPort()
 		host := scriptServer
 		if parsed, err := url.Parse("//" + scriptServer); err == nil && parsed.Hostname() != "" {

@@ -120,7 +120,8 @@ func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Requ
 	localOnly, _ := h.repo.GetSystemSetting(r.Context(), "master_local_only")
 	subscriptionURL, _ := h.repo.GetSystemSetting(r.Context(), "subscription_url")
 	recoveryEnabled, _ := h.repo.GetSystemSetting(r.Context(), settingHTTPSRecoveryEnabled)
-	recoveryURL, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryURL)
+	recoveryURLCustom, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryURL)
+	recoveryURL, recoveryURLIsCustom, _ := effectiveRecoveryURL(r.Context(), h.repo, masterListenPort())
 	recoveryFailure, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryFailureMin)
 	recoveryGrace, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryGraceMin)
 	recoveryPending, _ := h.repo.GetSystemSetting(r.Context(), settingRecoveryPending)
@@ -132,6 +133,8 @@ func (h *SystemSettingsHandler) GetMasterURL(w http.ResponseWriter, r *http.Requ
 		"local_only":                     localOnly == "1",
 		"https_recovery_enabled":         recoveryEnabled == "1",
 		"recovery_url":                   recoveryURL,
+		"recovery_url_custom":            recoveryURLCustom,
+		"recovery_url_auto":              !recoveryURLIsCustom,
 		"recovery_failure_minutes":       parsePositiveInt(recoveryFailure, 5),
 		"recovery_startup_grace_minutes": parsePositiveInt(recoveryGrace, 10),
 		"recovery_pending":               recoveryPending == "1",

@@ -124,6 +124,27 @@ func normalizeRecoveryURL(raw, port string) (string, error) {
 	return strings.TrimRight(u.String(), "/"), nil
 }
 
+func deriveRecoveryURL(masterURL, port string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(masterURL))
+	if err != nil || u.Hostname() == "" {
+		return "", fmt.Errorf("无法从主控地址推导 HTTP 恢复地址")
+	}
+	return "http://" + net.JoinHostPort(u.Hostname(), port), nil
+}
+
+// effectiveRecoveryURL keeps recovery automatic for normal deployments while
+// retaining an optional override for CDN/NAT/split-DNS environments.
+func effectiveRecoveryURL(ctx context.Context, repo *storage.TrafficRepository, port string) (string, bool, error) {
+	custom, _ := repo.GetSystemSetting(ctx, settingRecoveryURL)
+	if strings.TrimSpace(custom) != "" {
+		normalized, err := normalizeRecoveryURL(custom, port)
+		return normalized, true, err
+	}
+	masterURL, _ := repo.GetSystemSetting(ctx, "master_url")
+	derived, err := deriveRecoveryURL(masterURL, port)
+	return derived, false, err
+}
+
 // masterListenPort returns the actual HTTP port used by the master process.
 // Recovery URLs must not assume the historical 12889 default because PORT is
 // configurable in both native and container deployments.
@@ -167,8 +188,7 @@ func (m *MasterHTTPSRecoveryMonitor) check(ctx context.Context) {
 		return
 	}
 
-	recoveryRaw, _ := m.repo.GetSystemSetting(ctx, settingRecoveryURL)
-	recoveryURL, err := normalizeRecoveryURL(recoveryRaw, m.port)
+	recoveryURL, _, err := effectiveRecoveryURL(ctx, m.repo, m.port)
 	if err != nil {
 		log.Printf("[Master HTTPS Recovery] recovery cancelled: %v", err)
 		return
