@@ -118,7 +118,11 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		// routed 节点:克隆父 inbound 的 clash 模板,替换 uuid 为该用户子账号 uuid + 节点名
 		if node.NodeType == "routed" {
 			if proxyConfig, ok := buildRoutedProxyForUser(r.Context(), h.repo, node, username); ok {
-				recordRename(applyMultiplierPrefix(proxyConfig, node, pkg, &sysCfg))
+				oldName, _ := proxyConfig["name"].(string)
+				applyPackageNameOverride(proxyConfig, node, pkg)
+				applyMultiplierPrefix(proxyConfig, node, pkg, &sysCfg)
+				newName, _ := proxyConfig["name"].(string)
+				recordRename(oldName, newName, oldName != newName)
 				noteProxy(node, proxyConfig)
 				proxies = append(proxies, proxyConfig)
 			}
@@ -132,7 +136,11 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			continue
 		}
 		applyUserCredentials(proxyConfig, node, credMap)
-		recordRename(applyMultiplierPrefix(proxyConfig, node, pkg, &sysCfg))
+		oldName, _ := proxyConfig["name"].(string)
+		applyPackageNameOverride(proxyConfig, node, pkg)
+		applyMultiplierPrefix(proxyConfig, node, pkg, &sysCfg)
+		newName, _ := proxyConfig["name"].(string)
+		recordRename(oldName, newName, oldName != newName)
 		noteProxy(node, proxyConfig)
 		proxies = append(proxies, proxyConfig)
 	}
@@ -146,7 +154,11 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 				continue
 			}
 			if proxyConfig, ok := buildRoutedProxyForUser(r.Context(), h.repo, n.Node, username); ok {
-				recordRename(applyMultiplierPrefix(proxyConfig, n.Node, pkg, &sysCfg))
+				oldName, _ := proxyConfig["name"].(string)
+				applyPackageNameOverride(proxyConfig, n.Node, pkg)
+				applyMultiplierPrefix(proxyConfig, n.Node, pkg, &sysCfg)
+				newName, _ := proxyConfig["name"].(string)
+				recordRename(oldName, newName, oldName != newName)
 				noteProxy(n.Node, proxyConfig)
 				proxies = append(proxies, proxyConfig)
 			}
@@ -732,6 +744,19 @@ func applyMultiplierPrefix(proxy map[string]any, node storage.Node, pkg *storage
 	newName := left + multStr + right + name
 	proxy["name"] = newName
 	return name, newName, true
+}
+
+// applyPackageNameOverride 只根据稳定的节点 ID 应用套餐内名称，不依赖原名或列表顺序。
+func applyPackageNameOverride(proxy map[string]any, node storage.Node, pkg *storage.Package) bool {
+	if proxy == nil || pkg == nil || len(pkg.NodeNameOverrides) == 0 {
+		return false
+	}
+	name := strings.TrimSpace(pkg.NodeNameOverrides[node.ID])
+	if name == "" {
+		return false
+	}
+	proxy["name"] = name
+	return true
 }
 
 func applyUserCredentials(proxy map[string]any, node storage.Node, credMap map[credKey]string) {

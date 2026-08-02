@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"miaomiaowux/internal/license"
@@ -91,15 +92,46 @@ type createPackageRequest struct {
 	IsReset               bool                         `json:"is_reset"`
 	ResetDay              int                          `json:"reset_day"`
 	Nodes                 []int64                      `json:"nodes"`
-	NodeMultipliers       map[int64]float64            `json:"node_multipliers"`   // node_id → 倍率
-	NodeSpeedLimits       map[int64]float64            `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits      map[int64]int                `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	NodeMultipliers       map[int64]float64            `json:"node_multipliers"`    // node_id → 倍率
+	NodeNameOverrides     map[int64]string             `json:"node_name_overrides"` // node_id → 套餐内显示名
+	NodeSpeedLimits       map[int64]float64            `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeDeviceLimits      map[int64]int                `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
 	SpeedLimitMbps        float64                      `json:"speed_limit_mbps"`
 	DeviceLimit           int                          `json:"device_limit"`
 	AutoSpeedRules        []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
 	TrafficMode           string                       `json:"traffic_mode"`
 	TemplateFilename      string                       `json:"template_filename"`       // Clash 模板;空 = 走系统默认
 	SurgeTemplateFilename string                       `json:"surge_template_filename"` // Surge 模板;空 = 走系统默认
+}
+
+func normalizePackageNodeNames(names map[int64]string, nodes []int64) (map[int64]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	allowed := make(map[int64]bool, len(nodes))
+	for _, id := range nodes {
+		allowed[id] = true
+	}
+	out := make(map[int64]string, len(names))
+	seen := make(map[string]int64, len(names))
+	for id, value := range names {
+		if !allowed[id] {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if utf8.RuneCountInString(value) > 128 || strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("节点 %d 的套餐内名称无效", id)
+		}
+		if other, ok := seen[value]; ok && other != id {
+			return nil, fmt.Errorf("套餐内节点名称 %q 重复", value)
+		}
+		seen[value] = id
+		out[id] = value
+	}
+	return out, nil
 }
 
 // validatePackageTemplateFilename 非空时校验 rule_templates 下文件存在。空字符串直接通过(表示用系统默认)。
@@ -191,6 +223,11 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if nodes == nil {
 		nodes = []int64{}
 	}
+	nodeNames, err := normalizePackageNodeNames(req.NodeNameOverrides, nodes)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	trafficMode := req.TrafficMode
 	if trafficMode == "" {
@@ -207,6 +244,7 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		ResetDay:              req.ResetDay,
 		Nodes:                 nodes,
 		NodeMultipliers:       req.NodeMultipliers,
+		NodeNameOverrides:     nodeNames,
 		NodeSpeedLimits:       req.NodeSpeedLimits,
 		NodeDeviceLimits:      req.NodeDeviceLimits,
 		SpeedLimitMbps:        req.SpeedLimitMbps,
@@ -261,9 +299,10 @@ type updatePackageRequest struct {
 	IsReset               *bool                        `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
 	ResetDay              *int                         `json:"reset_day"` // 同上
 	Nodes                 []int64                      `json:"nodes"`
-	NodeMultipliers       map[int64]float64            `json:"node_multipliers"`   // node_id → 倍率
-	NodeSpeedLimits       map[int64]float64            `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits      map[int64]int                `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	NodeMultipliers       map[int64]float64            `json:"node_multipliers"`    // node_id → 倍率
+	NodeNameOverrides     map[int64]string             `json:"node_name_overrides"` // node_id → 套餐内显示名
+	NodeSpeedLimits       map[int64]float64            `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeDeviceLimits      map[int64]int                `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
 	SpeedLimitMbps        float64                      `json:"speed_limit_mbps"`
 	DeviceLimit           int                          `json:"device_limit"`
 	AutoSpeedRules        []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
@@ -325,6 +364,11 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if nodes == nil {
 		nodes = []int64{}
 	}
+	nodeNames, err := normalizePackageNodeNames(req.NodeNameOverrides, nodes)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// 获取旧套餐的节点列表，用于后续计算差异
 	var oldNodes []int64
@@ -367,6 +411,7 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		ResetDay:              resetDay,
 		Nodes:                 nodes,
 		NodeMultipliers:       req.NodeMultipliers,
+		NodeNameOverrides:     nodeNames,
 		NodeSpeedLimits:       req.NodeSpeedLimits,
 		NodeDeviceLimits:      req.NodeDeviceLimits,
 		SpeedLimitMbps:        req.SpeedLimitMbps,

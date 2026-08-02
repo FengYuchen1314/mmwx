@@ -1,6 +1,79 @@
 package handler
 
-import "testing"
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"miaomiaowux/internal/storage"
+)
+
+func TestPackageNodeNameOverridesPersistByNodeID(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "names.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	n1, err := repo.CreateNode(ctx, storage.Node{Username: "admin", NodeName: "same", Protocol: "ss", ClashConfig: `{"name":"same"}`, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, err := repo.CreateNode(ctx, storage.Node{Username: "admin", NodeName: "same", Protocol: "ss", ClashConfig: `{"name":"same"}`, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkgID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "named", TrafficLimitBytes: 1 << 30, Nodes: []int64{n1.ID, n2.ID},
+		NodeNameOverrides: map[int64]string{n1.ID: "Hong Kong", n2.ID: "Japan", 999999: "stale"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := repo.GetPackage(ctx, pkgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pkg.NodeNameOverrides[n1.ID] != "Hong Kong" || pkg.NodeNameOverrides[n2.ID] != "Japan" {
+		t.Fatalf("overrides crossed nodes: %#v", pkg.NodeNameOverrides)
+	}
+	if _, ok := pkg.NodeNameOverrides[999999]; ok {
+		t.Fatal("stale node override must not be persisted")
+	}
+	pkg.Nodes = []int64{n2.ID}
+	if err := repo.UpdatePackage(ctx, *pkg); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err = repo.GetPackage(ctx, pkgID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := pkg.NodeNameOverrides[n1.ID]; ok {
+		t.Fatal("removed node override must be cleaned")
+	}
+}
+
+func TestApplyPackageNameOverrideUsesNodeID(t *testing.T) {
+	pkg := &storage.Package{NodeNameOverrides: map[int64]string{11: "Hong Kong", 12: "Japan"}}
+	p1 := map[string]any{"name": "same"}
+	p2 := map[string]any{"name": "same"}
+	applyPackageNameOverride(p1, storage.Node{ID: 11}, pkg)
+	applyPackageNameOverride(p2, storage.Node{ID: 12}, pkg)
+	if p1["name"] != "Hong Kong" || p2["name"] != "Japan" {
+		t.Fatalf("overrides crossed nodes: %#v %#v", p1, p2)
+	}
+}
+
+func TestPackageNameOverridePrecedesMultiplierPrefix(t *testing.T) {
+	pkg := &storage.Package{NodeNameOverrides: map[int64]string{11: "Hong Kong"}, NodeMultipliers: map[int64]float64{11: 2}}
+	proxy := map[string]any{"name": "original"}
+	node := storage.Node{ID: 11, NodeName: "original"}
+	applyPackageNameOverride(proxy, node, pkg)
+	applyMultiplierPrefix(proxy, node, pkg, &storage.SystemConfig{NodeNameMultiplierPrefixEnabled: true})
+	if got := proxy["name"]; got != "「2」Hong Kong" {
+		t.Fatalf("final name = %q", got)
+	}
+}
 
 // 客户反馈:套餐短链接订阅里链式节点没注入 dialer-proxy,导致它跟原节点实际走同一条链路。
 // injectDialerProxyRefs 是套餐订阅 / serveAllNodes 两条路径共用的注入核心,这里钉住它的两个关键行为:
