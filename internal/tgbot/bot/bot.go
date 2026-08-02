@@ -3,8 +3,10 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -78,7 +80,12 @@ func (s *Service) Start(parent context.Context) error {
 	}
 
 	s.setMyCommands(ctx, b)
-	s.setMenuButton(ctx, b)
+	if err := s.setMenuButton(ctx, b); err != nil {
+		cancel()
+		s.b = nil
+		s.cancel = nil
+		return err
+	}
 
 	go func() {
 		log.Printf("[mmwX-tgbot] long-poll started")
@@ -91,17 +98,29 @@ func (s *Service) Start(parent context.Context) error {
 }
 
 // setMenuButton 把主控内置的 Mini App 地址设为聊天菜单按钮。
-func (s *Service) setMenuButton(ctx context.Context, b *bot.Bot) {
+func (s *Service) setMenuButton(ctx context.Context, b *bot.Bot) error {
 	if s.cfg.WebAppURL == "" {
-		return
+		return fmt.Errorf("Mini App 地址为空")
 	}
-	_, _ = b.SetChatMenuButton(ctx, &bot.SetChatMenuButtonParams{
+	parsed, err := url.Parse(s.cfg.WebAppURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
+		return fmt.Errorf("Mini App 地址必须是公网 HTTPS 地址，当前为 %q", s.cfg.WebAppURL)
+	}
+	ok, err := b.SetChatMenuButton(ctx, &bot.SetChatMenuButtonParams{
 		MenuButton: &models.MenuButtonWebApp{
 			Type:   models.MenuButtonTypeWebApp,
 			Text:   "📊 我的面板",
 			WebApp: models.WebAppInfo{URL: s.cfg.WebAppURL},
 		},
 	})
+	if err != nil {
+		return fmt.Errorf("Telegram 设置“我的面板”菜单失败: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("Telegram 未接受“我的面板”菜单地址 %s", s.cfg.WebAppURL)
+	}
+	log.Printf("[mmwX-tgbot] chat menu updated: %s", s.cfg.WebAppURL)
+	return nil
 }
 
 func (s *Service) Stop() {
