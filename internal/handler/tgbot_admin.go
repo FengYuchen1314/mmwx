@@ -39,8 +39,9 @@ import (
 //	GET    /api/admin/tgbot/user-subscriptions?username=  订阅列表 + short_code
 //	GET    /api/admin/tgbot/user-nodes?username=   套餐节点 + 服务器在线状态
 type TGBotAPIHandler struct {
-	repo   *storage.TrafficRepository
-	assign *PackageAssignHandler // 套餐绑定+下发(与 web /api/admin/packages/assign 共用),由 main.go 注入
+	repo    *storage.TrafficRepository
+	assign  *PackageAssignHandler // 套餐绑定+下发(与 web /api/admin/packages/assign 共用),由 main.go 注入
+	renewal *RenewalService
 	// licenseManager 用于 TG 注册时的用户数配额校验。为 nil 时不校验(未接许可证的自建部署)。
 	licenseManager *license.Manager
 }
@@ -58,6 +59,8 @@ func (h *TGBotAPIHandler) SetLicenseManager(m *license.Manager) {
 func (h *TGBotAPIHandler) SetPackageAssign(a *PackageAssignHandler) {
 	h.assign = a
 }
+
+func (h *TGBotAPIHandler) SetRenewalService(s *RenewalService) { h.renewal = s }
 
 // assignPackage 绑定套餐:有下发器走完整下发(同 web),否则回退到仅写记录(兜底,不应发生)。
 func (h *TGBotAPIHandler) assignPackage(ctx context.Context, username string, packageID int64, start, end time.Time, isReset bool, resetDay int) error {
@@ -110,6 +113,16 @@ func (h *TGBotAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.userDailyTraffic(w, r)
 	case path == "redeem" && r.Method == http.MethodPost:
 		h.redeem(w, r)
+	case path == "renewal-request" && r.Method == http.MethodPost:
+		h.createRenewalRequest(w, r)
+	case path == "renewal-request/status" && r.Method == http.MethodGet:
+		h.renewalRequestStatus(w, r)
+	case path == "renewal-request/approve" && r.Method == http.MethodPost:
+		h.reviewRenewalRequest(w, r, true)
+	case path == "renewal-request/reject" && r.Method == http.MethodPost:
+		h.reviewRenewalRequest(w, r, false)
+	case path == "renewal-request/fail" && r.Method == http.MethodPost:
+		h.failRenewalRequest(w, r)
 	case path == "admin-subview" && r.Method == http.MethodGet:
 		h.adminSubview(w, r)
 	// 公告(bot 轮询广播 + miniapp 横幅 + /announce 命令)
@@ -263,14 +276,14 @@ func (h *TGBotAPIHandler) postAnnouncement(w http.ResponseWriter, r *http.Reques
 // ============ 邀请码 CRUD ============
 
 type inviteOut struct {
-	Code         string `json:"code"`
-	Kind         string `json:"kind"`
-	BindUsername string `json:"bind_username,omitempty"`
-	CreatedBy    string `json:"created_by"`
-	PackageID    *int64 `json:"package_id,omitempty"`
-	MaxUses      int    `json:"max_uses"`
-	UsedCount    int    `json:"used_count"`
-	ExpiresAt    string `json:"expires_at,omitempty"`
+	Code           string `json:"code"`
+	Kind           string `json:"kind"`
+	BindUsername   string `json:"bind_username,omitempty"`
+	CreatedBy      string `json:"created_by"`
+	PackageID      *int64 `json:"package_id,omitempty"`
+	MaxUses        int    `json:"max_uses"`
+	UsedCount      int    `json:"used_count"`
+	ExpiresAt      string `json:"expires_at,omitempty"`
 	Revoked        bool   `json:"revoked"`
 	Remark         string `json:"remark,omitempty"`
 	CreatedAt      string `json:"created_at"`
@@ -875,15 +888,15 @@ func (h *TGBotAPIHandler) userNodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type nodeOut struct {
-		ID             int64  `json:"id"`
-		Name           string `json:"name"`
-		Protocol       string `json:"protocol"`
-		ServerName     string `json:"server_name"`
-		ServerStatus   string `json:"server_status"`
-		ServerOnline   bool   `json:"server_online"`
-		InboundTag     string `json:"inbound_tag,omitempty"`
-		NodeType       string `json:"node_type,omitempty"`
-		Enabled        bool   `json:"enabled"`
+		ID           int64  `json:"id"`
+		Name         string `json:"name"`
+		Protocol     string `json:"protocol"`
+		ServerName   string `json:"server_name"`
+		ServerStatus string `json:"server_status"`
+		ServerOnline bool   `json:"server_online"`
+		InboundTag   string `json:"inbound_tag,omitempty"`
+		NodeType     string `json:"node_type,omitempty"`
+		Enabled      bool   `json:"enabled"`
 	}
 	out := make([]nodeOut, 0, len(pkg.Nodes))
 	for _, nid := range pkg.Nodes {
@@ -1104,6 +1117,95 @@ func (h *TGBotAPIHandler) redeem(w http.ResponseWriter, r *http.Request) {
 		"success": true, "kind": "renew", "username": existing,
 		"package_name": pkg.Name, "end_date": end.Format("2006-01-02"),
 	})
+}
+
+func (h *TGBotAPIHandler) createRenewalRequest(w http.ResponseWriter, r *http.Request) {
+	if h.renewal == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "renewal service unavailable")
+		return
+	}
+	var body struct {
+		TelegramID int64  `json:"telegram_id"`
+		Passphrase string `json:"passphrase"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TelegramID == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	username, ok := h.repo.GetUsernameByTelegramID(r.Context(), body.TelegramID)
+	if !ok {
+		writeJSONError(w, http.StatusBadRequest, "Telegram 未绑定用户")
+		return
+	}
+	req, err := h.renewal.Submit(r.Context(), username, body.Passphrase, "tg-miniapp", body.TelegramID)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"request": req})
+}
+
+func (h *TGBotAPIHandler) renewalRequestStatus(w http.ResponseWriter, r *http.Request) {
+	if h.renewal == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "renewal service unavailable")
+		return
+	}
+	tgID, _ := strconv.ParseInt(r.URL.Query().Get("telegram_id"), 10, 64)
+	username, ok := h.repo.GetUsernameByTelegramID(r.Context(), tgID)
+	if !ok {
+		writeJSONError(w, http.StatusBadRequest, "Telegram 未绑定用户")
+		return
+	}
+	req, err := h.renewal.Latest(r.Context(), username)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"request": req})
+}
+
+func (h *TGBotAPIHandler) reviewRenewalRequest(w http.ResponseWriter, r *http.Request, approve bool) {
+	if h.renewal == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "renewal service unavailable")
+		return
+	}
+	var body struct {
+		Token           string `json:"token"`
+		AdminTelegramID int64  `json:"admin_telegram_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token == "" || body.AdminTelegramID == 0 {
+		writeJSONError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	var req *storage.RenewalRequest
+	var processed bool
+	var err error
+	if approve {
+		req, processed, err = h.renewal.Approve(r.Context(), body.Token, body.AdminTelegramID)
+	} else {
+		req, processed, err = h.renewal.Reject(r.Context(), body.Token, body.AdminTelegramID)
+	}
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"request": req, "processed": processed})
+}
+
+func (h *TGBotAPIHandler) failRenewalRequest(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token string `json:"token"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Token == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if err := h.repo.FinishRenewalRequest(r.Context(), body.Token, storage.RenewalFailed, nil, body.Error); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 
 // adminSubview GET /admin-subview?username= 返回「系统订阅列表第一个订阅」及其节点(名/协议/在线状态)。

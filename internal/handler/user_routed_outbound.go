@@ -492,62 +492,86 @@ func strOf(v interface{}) string {
 // 设计:rule 整条删除而不是 user[] 移除 email — 因为用户私有路由出站的 rule.user 只有
 // 创建者一个,移除后 user[] 为空会被 xray 视作"不限 user",意外命中其他用户。删整条 rule
 // 干净安全,恢复时根据 DB 元数据重建。
-func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string) {
-	if rm == nil {
-		return
-	}
+func suspendUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string) bool {
 	nodes, err := repo.ListUserRoutedOutbounds(ctx, username)
 	if err != nil {
 		log.Printf("[SuspendUserRouted] list %s failed: %v", username, err)
-		return
+		return false
 	}
+	if len(nodes) == 0 {
+		return true
+	}
+	if rm == nil {
+		return false
+	}
+	ok := true
 	for _, n := range nodes {
 		serverID, err := resolveServerIDByNameRepo(ctx, repo, n.OriginalServer)
 		if err != nil {
 			log.Printf("[SuspendUserRouted] resolve server for node %d failed (continue): %v", n.ID, err)
+			ok = false
 			continue
 		}
 		// 1. 删 rule
-		removeRuleByMarktag(ctx, rm, serverID, n.RoutedRuleMarktag)
+		if err := removeRuleByMarktag(ctx, rm, serverID, n.RoutedRuleMarktag); err != nil {
+			log.Printf("[SuspendUserRouted] remove rule for node %d failed: %v", n.ID, err)
+			ok = false
+		}
 		// 2. 删 client
 		sa, _ := repo.GetUserSubaccount(ctx, n.ID, username)
 		if sa != nil {
-			removeClientFromInbound(ctx, rm, serverID, n.InboundTag, sa.Email)
-			_ = repo.SetSubaccountActive(ctx, sa.ID, false)
+			if err := removeClientFromInbound(ctx, rm, serverID, n.InboundTag, sa.Email); err != nil {
+				log.Printf("[SuspendUserRouted] remove client for node %d failed: %v", n.ID, err)
+				ok = false
+				continue
+			}
+			if err := repo.SetSubaccountActive(ctx, sa.ID, false); err != nil {
+				log.Printf("[SuspendUserRouted] mark node %d inactive failed: %v", n.ID, err)
+				ok = false
+			}
 		}
 	}
+	return ok
 }
 
 // resumeUserPrivateRouted 用户续费/启用时调用:恢复该用户所有 routed_owner='user' 节点的
 // xray 配置 (重建 rule + 加回 client),凭据从 user_subaccounts 取。
-func resumeUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string) {
-	if rm == nil {
-		return
-	}
+func resumeUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, username string) bool {
 	nodes, err := repo.ListUserRoutedOutbounds(ctx, username)
 	if err != nil {
 		log.Printf("[ResumeUserRouted] list %s failed: %v", username, err)
-		return
+		return false
 	}
+	if len(nodes) == 0 {
+		return true
+	}
+	if rm == nil {
+		return false
+	}
+	ok := true
 	for _, n := range nodes {
 		serverID, err := resolveServerIDByNameRepo(ctx, repo, n.OriginalServer)
 		if err != nil {
 			log.Printf("[ResumeUserRouted] resolve server for node %d failed (continue): %v", n.ID, err)
+			ok = false
 			continue
 		}
 		sa, err := repo.GetUserSubaccount(ctx, n.ID, username)
 		if err != nil || sa == nil {
 			log.Printf("[ResumeUserRouted] node %d no subaccount for %s, skip", n.ID, username)
+			ok = false
 			continue
 		}
 		// 1. 加回 client(用保存的凭据)
 		var cred map[string]interface{}
 		if err := json.Unmarshal([]byte(sa.CredentialJSON), &cred); err != nil {
 			log.Printf("[ResumeUserRouted] parse credential for node %d failed: %v", n.ID, err)
+			ok = false
 			continue
 		}
 		if err := addClientToInbound(ctx, rm, serverID, n.InboundTag, cred); err != nil {
 			log.Printf("[ResumeUserRouted] addClient node %d failed (continue): %v", n.ID, err)
+			ok = false
 			continue
 		}
 		// 2. 重建 rule
@@ -563,10 +587,15 @@ func resumeUserPrivateRouted(ctx context.Context, rm *RemoteManageHandler, repo 
 			log.Printf("[ResumeUserRouted] add_rule node %d failed (continue): %v", n.ID, err)
 			// rollback client
 			removeClientFromInbound(ctx, rm, serverID, n.InboundTag, sa.Email)
+			ok = false
 			continue
 		}
-		_ = repo.SetSubaccountActive(ctx, sa.ID, true)
+		if err := repo.SetSubaccountActive(ctx, sa.ID, true); err != nil {
+			log.Printf("[ResumeUserRouted] mark node %d active failed: %v", n.ID, err)
+			ok = false
+		}
 	}
+	return ok
 }
 
 // deleteUserPrivateRoutedAll 用户账户删除时调用:清理该用户所有 routed_owner='user' 节点的

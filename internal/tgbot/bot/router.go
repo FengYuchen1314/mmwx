@@ -24,6 +24,7 @@ func registerCommands(b *bot.Bot, s *Service) {
 	b.RegisterHandler(bot.HandlerTypeMessageText, "announce", bot.MatchTypeCommand, s.withRateLimit(s.handleAnnounce))
 	// /admin_invite create 的按钮交互回调(类型/套餐/有效期)。
 	b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "iv:", bot.MatchTypePrefix, s.handleInviteCallback)
+	b.RegisterHandler(bot.HandlerTypeCallbackQueryData, "rr:", bot.MatchTypePrefix, s.handleRenewalCallback)
 }
 
 // setMyCommands 注册 Telegram 命令菜单(输入 / 时弹出提示)。

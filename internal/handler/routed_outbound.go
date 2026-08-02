@@ -86,9 +86,9 @@ func (h *RoutedOutboundHandler) list(w http.ResponseWriter, r *http.Request) {
 
 type createRoutedOutboundReq struct {
 	ParentNodeID int64                  `json:"parent_node_id"`
-	Label        string                 `json:"label"`            // 必填,如 "WTT" / "HK-T4"
-	Outbound     map[string]interface{} `json:"outbound"`         // xray outbound 完整定义(无 tag,由后端生成 namespacedTag)
-	NodeName     string                 `json:"node_name"`        // 订阅里展示用,可空,默认 "<parent>-<label>"
+	Label        string                 `json:"label"`     // 必填,如 "WTT" / "HK-T4"
+	Outbound     map[string]interface{} `json:"outbound"`  // xray outbound 完整定义(无 tag,由后端生成 namespacedTag)
+	NodeName     string                 `json:"node_name"` // 订阅里展示用,可空,默认 "<parent>-<label>"
 }
 
 // 创建路由出站节点。
@@ -1160,7 +1160,10 @@ func removeUserFromRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo
 		return fmt.Errorf("server %s not found", routed.OriginalServer)
 	}
 
-	// 1. 从 rule.user[] 移除(best-effort,失败也继续)。同 add 路径分两种 routed 节点处理
+	// 1. 从 rule.user[] 移除。同 add 路径分两种 routed 节点处理。
+	// 任一步失败都不能提前把 DB 标成 inactive，否则 enforcer 会误以为断流完成，
+	// Agent 恢复后也失去补偿重试依据。
+	var opErr error
 	if routed.RoutedRuleMarktag != "" {
 		body, _ := json.Marshal(map[string]interface{}{
 			"action":     "remove_user_from_rule",
@@ -1169,17 +1172,20 @@ func removeUserFromRoutedNode(ctx context.Context, rm *RemoteManageHandler, repo
 			"no_restart": true, // 主控 PackageUnbind 在末尾统一重启,见 packages.go restartXrayInParallel
 		})
 		if _, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/routing", body); err != nil {
-			log.Printf("[RoutedNode] remove_user_from_rule(marktag) 失败 (continue): %v", err)
+			opErr = errors.Join(opErr, fmt.Errorf("remove user from rule by marktag: %w", err))
 		}
 	} else if routed.RoutedOutboundTag != "" {
 		if err := mutateRoutingRuleUserByOutboundTag(ctx, rm, serverID, routed.RoutedOutboundTag, sa.Email, false); err != nil {
-			log.Printf("[RoutedNode] remove_user_from_rule(outboundTag) 失败 (continue): %v", err)
+			opErr = errors.Join(opErr, fmt.Errorf("remove user from rule by outbound tag: %w", err))
 		}
 	}
 
 	// 2. 从 inbound 移除 client
 	if err := removeClientFromInbound(ctx, rm, serverID, routed.InboundTag, sa.Email); err != nil {
-		log.Printf("[RoutedNode] removeClientFromInbound 失败 (continue): %v", err)
+		opErr = errors.Join(opErr, err)
+	}
+	if opErr != nil {
+		return opErr
 	}
 
 	// 3. DB 置 is_active=0(凭据保留)

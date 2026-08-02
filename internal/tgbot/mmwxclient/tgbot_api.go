@@ -43,6 +43,58 @@ type RedeemResult struct {
 	EndDate     string `json:"end_date"`
 }
 
+type RenewalRequest struct {
+	RequestToken    string `json:"request_token,omitempty"`
+	Username        string `json:"username"`
+	TelegramID      int64  `json:"telegram_id,omitempty"`
+	PackageName     string `json:"package_name"`
+	PreviousEndDate string `json:"previous_end_date,omitempty"`
+	RenewDays       int    `json:"renew_days"`
+	Source          string `json:"source"`
+	Status          string `json:"status"`
+	NewEndDate      string `json:"new_end_date,omitempty"`
+}
+
+func (c *Client) CreateRenewalRequest(ctx context.Context, tgID int64, passphrase string) (*RenewalRequest, error) {
+	var out struct {
+		Request RenewalRequest `json:"request"`
+	}
+	if err := c.post(ctx, "/api/admin/tgbot/renewal-request", map[string]any{"telegram_id": tgID, "passphrase": passphrase}, &out); err != nil {
+		return nil, err
+	}
+	return &out.Request, nil
+}
+
+func (c *Client) RenewalRequestStatus(ctx context.Context, tgID int64) (*RenewalRequest, error) {
+	var out struct {
+		Request *RenewalRequest `json:"request"`
+	}
+	q := url.Values{"telegram_id": []string{strconv.FormatInt(tgID, 10)}}
+	if err := c.get(ctx, "/api/admin/tgbot/renewal-request/status", q, &out); err != nil {
+		return nil, err
+	}
+	return out.Request, nil
+}
+
+func (c *Client) ReviewRenewalRequest(ctx context.Context, token string, adminTGID int64, approve bool) (*RenewalRequest, bool, error) {
+	action := "reject"
+	if approve {
+		action = "approve"
+	}
+	var out struct {
+		Request   RenewalRequest `json:"request"`
+		Processed bool           `json:"processed"`
+	}
+	if err := c.post(ctx, "/api/admin/tgbot/renewal-request/"+action, map[string]any{"token": token, "admin_telegram_id": adminTGID}, &out); err != nil {
+		return nil, false, err
+	}
+	return &out.Request, out.Processed, nil
+}
+
+func (c *Client) FailRenewalRequest(ctx context.Context, token, detail string) error {
+	return c.post(ctx, "/api/admin/tgbot/renewal-request/fail", map[string]any{"token": token, "error": detail}, nil)
+}
+
 // Redeem 已绑用户用兑换码续期(只延长到期时间)。
 func (c *Client) Redeem(ctx context.Context, code string, tgID int64) (*RedeemResult, error) {
 	var out RedeemResult

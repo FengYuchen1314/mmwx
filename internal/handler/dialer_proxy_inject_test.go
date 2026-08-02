@@ -2,11 +2,161 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"miaomiaowux/internal/storage"
 )
+
+func TestTrafficLimitEnforcerSuspendsSharedRoutedSubaccount(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer agent.Close()
+	u, err := url.Parse(agent.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "routed-limit.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	remote := &storage.RemoteServer{
+		Name: "test-agent", Token: "test-token", Status: storage.RemoteServerStatusConnected,
+		IPAddress: host, ListenPort: mustAtoi(t, port), ConnectionMode: storage.ConnectionModePull,
+	}
+	if err := repo.CreateRemoteServer(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", RawURL: "vless://example", NodeName: "parent", Protocol: "vless",
+		ClashConfig: `{"name":"parent"}`, Enabled: true, OriginalServer: remote.Name, InboundTag: "vless-443",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed, err := repo.CreateRoutedNode(ctx, storage.RoutedNodeDetail{
+		Node: storage.Node{
+			Username: "admin", RawURL: "vless://routed", NodeName: "routed", Protocol: "vless",
+			ClashConfig: `{"name":"routed"}`, Enabled: true, OriginalServer: remote.Name,
+			InboundTag: "vless-443", ParentNodeID: &parent.ID, RoutedOwner: "shared",
+		},
+		RoutedOutboundTag: "routed-out", RoutedRuleMarktag: "routed-rule", RoutedOutboundJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, _ := json.Marshal(map[string]any{"id": "uuid", "email": "alice-routed"})
+	if _, err := repo.UpsertUserSubaccount(ctx, storage.UserSubaccount{
+		Username: "alice", RoutedNodeID: routed.ID, Email: "alice-routed",
+		CredentialJSON: string(credential), IsActive: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	enforcer := NewTrafficLimitEnforcer(repo, NewRemoteManageHandler(repo, nil), nil)
+	if ok := enforcer.suspendUserRoutedAccess(ctx, "alice"); !ok {
+		t.Fatal("shared routed access was not fully suspended")
+	}
+	sa, err := repo.GetUserSubaccount(ctx, routed.ID, "alice")
+	if err != nil || sa == nil || sa.IsActive {
+		t.Fatalf("subaccount must be retained but inactive: %#v, %v", sa, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 2 || paths[0] != "/api/child/routing" || paths[1] != "/api/child/inbounds" {
+		t.Fatalf("unexpected agent calls: %v", paths)
+	}
+}
+
+func mustAtoi(t *testing.T, value string) int {
+	t.Helper()
+	var out int
+	if _, err := fmt.Sscanf(value, "%d", &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestRenewalRequestRestoresExpiredPackageIdentityAndClaimsOnce(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "renewal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	if err := repo.CreateUser(ctx, "alice", "a@example.com", "alice", "hash", storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.BindTelegram(ctx, "alice", 12345, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	pkgID, err := repo.CreatePackage(ctx, storage.Package{Name: "monthly", TrafficLimitBytes: 1 << 30, CycleDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := time.Now().Add(-time.Hour)
+	if err := repo.AssignPackageToUser(ctx, "alice", pkgID, end.AddDate(0, 0, -30), end, true, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.RemoveExpiredPackageFromUser(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	req, err := repo.CreateRenewalRequest(ctx, "alice", "PAY-123", "web", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.PackageID != pkgID || req.RenewDays != 30 || req.Passphrase != "PAY-123" {
+		t.Fatalf("expired package snapshot incorrect: %#v", req)
+	}
+	service := NewRenewalService(repo, NewPackageAssignHandler(repo, nil, nil))
+	approved, processed, err := service.Approve(ctx, req.RequestToken, 9001)
+	if err != nil || !processed || approved.Status != storage.RenewalApproved {
+		t.Fatalf("first approval = %#v, %v, %v", approved, processed, err)
+	}
+	_, processed, err = service.Approve(ctx, req.RequestToken, 9002)
+	if err != nil || processed {
+		t.Fatalf("second approval must be idempotent: %v, %v", processed, err)
+	}
+	user, err := repo.GetUser(ctx, "alice")
+	if err != nil || user.PackageID != pkgID || user.PackageEndDate == nil || !user.PackageEndDate.After(time.Now()) {
+		t.Fatalf("package was not restored: %#v, %v", user, err)
+	}
+	stored, err := repo.GetRenewalRequestByToken(ctx, req.RequestToken, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Passphrase != "" {
+		t.Fatal("passphrase must be cleared after review")
+	}
+	if err := repo.RemovePackageFromUser(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.CreateRenewalRequest(ctx, "alice", "PAY-456", "web", 0); err == nil {
+		t.Fatal("manual package removal must clear the renewable package snapshot")
+	}
+}
 
 func TestPackageNodeNameOverridesPersistByNodeID(t *testing.T) {
 	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "names.db"))

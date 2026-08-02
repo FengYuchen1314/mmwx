@@ -582,6 +582,8 @@ func main() {
 	mux.Handle("/api/admin/packages/update", auth.RequireAdmin(tokenStore, userRepo, packageUpdateHandler))
 	packageAssignHandler := handler.NewPackageAssignHandler(repo, remoteManageHandler, limiterPusher)
 	tgbotAPIHandler.SetPackageAssign(packageAssignHandler) // 让 TGBOT 注册/兑换的套餐走同一套下发
+	renewalService := handler.NewRenewalService(repo, packageAssignHandler)
+	tgbotAPIHandler.SetRenewalService(renewalService)
 	mux.Handle("/api/admin/packages/assign", auth.RequireAdmin(tokenStore, userRepo, packageAssignHandler))
 	// 快捷续期:复用 packageAssignHandler 的 AssignAndProvision(samePackage 快路径),只延长 package_end_date
 	mux.Handle("/api/admin/users/extend", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserExtendHandler(packageAssignHandler)))
@@ -881,6 +883,7 @@ func main() {
 	// 自定义安全阈值(登录/暴力防护/订阅频率)— 写入后 handler 内部热更新 3 个 limiter 单例,无需重启
 	mux.Handle("/api/admin/security-settings", auth.RequireAdmin(tokenStore, userRepo, handler.NewSecuritySettingsHandler(repo)))
 	tgBotManager := inttgbot.NewManager(repo, tokenStore, mux)
+	mux.Handle("/api/user/renewal-request", auth.RequireToken(tokenStore, userRepo, handler.NewUserRenewalHandler(renewalService, tgBotManager)))
 	remoteManageHandler.SetOnMasterMigrated(func(ctx context.Context, _ string) {
 		if err := tgBotManager.Restart(ctx); err != nil {
 			logger.Error("主控迁移后重启 TGBot 失败", "error", err.Error())

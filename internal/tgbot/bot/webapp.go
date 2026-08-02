@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -33,6 +34,7 @@ func (s *Service) newWebAppHandler() http.Handler {
 	mux.HandleFunc("/api/tg-webapp/me", webRL(s.webAppMe))
 	mux.HandleFunc("/api/tg-webapp/register", webRL(s.webAppRegister))
 	mux.HandleFunc("/api/tg-webapp/redeem", webRL(s.webAppRedeem))
+	mux.HandleFunc("/api/tg-webapp/renewal-request", webRL(s.webAppRenewalRequest))
 	mux.HandleFunc("/api/tg-webapp/admin/invites", webRL(s.webAppAdminInvites))
 	mux.HandleFunc("/api/tg-webapp/admin/invite-create", webRL(s.webAppAdminInviteCreate))
 	mux.HandleFunc("/api/tg-webapp/admin/invite-revoke", webRL(s.webAppAdminInviteRevoke))
@@ -156,6 +158,9 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	username := info.Username
 
 	resp := map[string]any{"bound": true, "is_admin": s.cfg.IsAdmin(tgID)}
+	if renewal, err := s.client.RenewalRequestStatus(ctx, tgID); err == nil && renewal != nil {
+		resp["renewal_request"] = renewal
+	}
 
 	// 账号 + 流量 + 套餐
 	if summary, err := s.client.UserSummary(ctx, username); err == nil {
@@ -401,6 +406,45 @@ func (s *Service) webAppRedeem(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, http.StatusOK, map[string]any{
 		"success": true, "username": res.Username, "end_date": res.EndDate, "package_name": res.PackageName,
 	})
+}
+
+func (s *Service) webAppRenewalRequest(w http.ResponseWriter, r *http.Request) {
+	tgID, _, err := s.validateInitData(r.Header.Get("X-Telegram-Init-Data"))
+	if err != nil {
+		writeJSONResp(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if r.Method == http.MethodGet {
+		req, err := s.client.RenewalRequestStatus(r.Context(), tgID)
+		if err != nil {
+			writeJSONResp(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSONResp(w, http.StatusOK, map[string]any{"request": req})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+		return
+	}
+	var body struct {
+		Passphrase string `json:"passphrase"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Passphrase) == "" {
+		writeJSONResp(w, http.StatusBadRequest, map[string]any{"error": "请输入续费口令"})
+		return
+	}
+	req, err := s.client.CreateRenewalRequest(r.Context(), tgID, body.Passphrase)
+	if err != nil {
+		writeJSONResp(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := s.NotifyRenewalRequest(context.WithoutCancel(r.Context()), renewalNoticeFromClient(req, strings.TrimSpace(body.Passphrase))); err != nil {
+		_ = s.client.FailRenewalRequest(context.WithoutCancel(r.Context()), req.RequestToken, err.Error())
+		writeJSONResp(w, http.StatusBadGateway, map[string]any{"error": "通知管理员失败：" + err.Error()})
+		return
+	}
+	writeJSONResp(w, http.StatusCreated, map[string]any{"request": req})
 }
 
 // adminTGID 校验 initData 且要求是管理员;失败时已写好响应并返回 ok=false。

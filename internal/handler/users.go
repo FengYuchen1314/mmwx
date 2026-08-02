@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -258,32 +259,49 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 		// 状态切换后,同步 xray inbound clients。
 		// 仅在 remoteManage 非空且用户有套餐绑定时才有 inbound 需要操作。
 		if remoteManage != nil {
+			accessSync := NewTrafficLimitEnforcer(repo, remoteManage, pusher)
 			configs, cfgErr := repo.GetUserInboundConfigs(ctx, username)
 			if cfgErr != nil {
 				log.Printf("[UserStatus] get inbound configs for %s failed: %v", username, cfgErr)
 			}
 			if !payload.IsActive {
+				plainOK := cfgErr == nil
 				// 禁用 → 从每个 inbound 移除 client (但保留 user_inbound_configs 行)
 				for _, cfg := range configs {
 					if err := removeUserFromInbound(ctx, remoteManage, cfg); err != nil {
 						log.Printf("[UserStatus] disable: remove %s from inbound %s on server %d failed: %v",
 							username, cfg.InboundTag, cfg.ServerID, err)
+						plainOK = false
 					}
 				}
-				// 用户私有路由出站(routed_owner='user'):拆 rule + client,outbound 保留
-				suspendUserPrivateRouted(ctx, remoteManage, repo, username)
+				// 同时摘除 shared + user 两类 routed 子账户。失败时保留 enforced=0，
+				// TrafficLimitEnforcer 会在后续周期继续重试。
+				routedOK := accessSync.suspendUserRoutedAccess(ctx, username)
+				if plainOK && routedOK {
+					_ = repo.UpdateUserDisabledAccessEnforced(ctx, username, true)
+				}
 			} else {
-				// 启用 → 用 saved credential 调 addUserToInbound 把 client 加回。
-				// addUserToInbound 内部会发现 GetUserInboundConfig 已有记录,自动复用 credential_json。
-				targetUserCopy, _ := repo.GetUser(ctx, username)
-				for _, cfg := range configs {
-					if err := addUserToInbound(ctx, remoteManage, repo, targetUserCopy, cfg.ServerID, cfg.InboundTag); err != nil {
-						log.Printf("[UserStatus] enable: add %s back to inbound %s on server %d failed: %v",
-							username, cfg.InboundTag, cfg.ServerID, err)
+				// 启用账号不等于绕过套餐状态：仍超流量或套餐已过期时只恢复登录，
+				// 不得把 Xray 凭据重新加回。
+				overLimit, _ := repo.IsUserOverLimit(ctx, username)
+				packageValid := targetUser.PackageID > 0 &&
+					(targetUser.PackageEndDate == nil || targetUser.PackageEndDate.After(time.Now()))
+				if overLimit || !packageValid {
+					log.Printf("[UserStatus] enable %s without restoring access (over_limit=%t package_valid=%t)",
+						username, overLimit, packageValid)
+				} else {
+					// 启用 → 用 saved credential 调 addUserToInbound 把 client 加回。
+					// addUserToInbound 内部会发现 GetUserInboundConfig 已有记录,自动复用 credential_json。
+					targetUserCopy, _ := repo.GetUser(ctx, username)
+					for _, cfg := range configs {
+						if err := addUserToInbound(ctx, remoteManage, repo, targetUserCopy, cfg.ServerID, cfg.InboundTag); err != nil {
+							log.Printf("[UserStatus] enable: add %s back to inbound %s on server %d failed: %v",
+								username, cfg.InboundTag, cfg.ServerID, err)
+						}
 					}
+					// 恢复 shared + user 两类 routed 子账户。
+					accessSync.resumeUserRoutedAccess(ctx, targetUserCopy)
 				}
-				// 用户私有路由出站:重建 rule + 加回 client
-				resumeUserPrivateRouted(ctx, remoteManage, repo, username)
 			}
 		}
 

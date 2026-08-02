@@ -197,6 +197,24 @@ func (m *Manager) ServeWebApp(w http.ResponseWriter, r *http.Request) {
 	service.ServeWebApp(w, r)
 }
 
+func (m *Manager) NotifyRenewalRequest(ctx context.Context, req *storage.RenewalRequest) error {
+	m.mu.Lock()
+	service := m.service
+	m.mu.Unlock()
+	if service == nil {
+		return errors.New("TGBot 未运行")
+	}
+	previous := ""
+	if req.PreviousEndDate != nil {
+		previous = req.PreviousEndDate.Format(time.RFC3339)
+	}
+	return service.NotifyRenewalRequest(ctx, bot.RenewalNotice{
+		Token: req.RequestToken, Username: req.Username, TelegramID: req.TelegramID,
+		PackageName: req.PackageName, PreviousEndDate: previous, RenewDays: req.RenewDays,
+		Source: req.Source, Passphrase: req.Passphrase,
+	})
+}
+
 func readBool(ctx context.Context, repo *storage.TrafficRepository, key string) bool {
 	v, _ := repo.GetSystemSetting(ctx, key)
 	b, _ := strconv.ParseBool(v)

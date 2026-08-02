@@ -1315,6 +1315,14 @@ CREATE TABLE IF NOT EXISTS users (
 	if err := r.ensureUserColumn("is_over_limit", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	// 额度状态与实际断流完成状态分开保存。Agent 暂时离线或部分 routed
+	// 子账户摘除失败时，enforcer 会根据此标记持续补偿，而不是只尝试一次。
+	if err := r.ensureUserColumn("over_limit_enforced", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureUserColumn("disabled_access_enforced", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	// 流量 80% 预警去重标记:发过预警置 1,掉回阈值以下 / 月度重置后由 enforcer 清 0,
 	// 保证同一次越线只发一条(与 is_over_limit 的边沿语义对称,且跨进程重启不重复打扰)。
 	if err := r.ensureUserColumn("traffic_warned_80", "INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -1340,6 +1348,13 @@ CREATE TABLE IF NOT EXISTS users (
 	// users 加 3 列:tg_id / tg_handle / 绑定时间。tg_id 用 INTEGER 是因为 TG userId 是 int64,
 	// 部分唯一索引(WHERE telegram_id IS NOT NULL)允许多用户都 NULL,但已绑必须唯一。
 	if err := r.ensureUserColumn("telegram_id", "INTEGER"); err != nil {
+		return err
+	}
+	// 套餐过期后 package_id 会清空；保留最近套餐，供用户自助申请续费时恢复。
+	if err := r.ensureUserColumn("last_package_id", "INTEGER"); err != nil {
+		return err
+	}
+	if err := r.ensureUserColumn("last_package_end_date", "TIMESTAMP"); err != nil {
 		return err
 	}
 	if err := r.ensureUserColumn("telegram_username", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -2146,6 +2161,33 @@ CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(name);
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_multipliers TEXT DEFAULT '{}'")
 	// 节点在套餐内的显示名:JSON {"<node_id>": "name"}。
 	_, _ = r.db.Exec("ALTER TABLE packages ADD COLUMN node_name_overrides TEXT DEFAULT '{}'")
+
+	const renewalRequestsSchema = `
+CREATE TABLE IF NOT EXISTS renewal_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_token TEXT NOT NULL UNIQUE,
+    username TEXT NOT NULL,
+    telegram_id INTEGER NOT NULL DEFAULT 0,
+    package_id INTEGER NOT NULL,
+    package_name TEXT NOT NULL DEFAULT '',
+    previous_end_date TIMESTAMP,
+    renew_days INTEGER NOT NULL,
+    passphrase TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'web',
+    status TEXT NOT NULL DEFAULT 'pending',
+    reviewed_by INTEGER NOT NULL DEFAULT 0,
+    reviewed_at TIMESTAMP,
+    new_end_date TIMESTAMP,
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_renewal_requests_user_created ON renewal_requests(username, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_renewal_requests_pending_user ON renewal_requests(username) WHERE status IN ('pending','processing');
+`
+	if _, err := r.db.Exec(renewalRequestsSchema); err != nil {
+		return fmt.Errorf("migrate renewal requests: %w", err)
+	}
 
 	// 为已有 package 补全短码
 	if err := r.generateMissingPackageShortCodes(); err != nil {
@@ -5193,7 +5235,7 @@ func (r *TrafficRepository) UpdateUserStatus(ctx context.Context, username strin
 		value = 1
 	}
 
-	res, err := r.db.ExecContext(ctx, `UPDATE users SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, value, username)
+	res, err := r.db.ExecContext(ctx, `UPDATE users SET is_active = ?, disabled_access_enforced = 0, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, value, username)
 	if err != nil {
 		return fmt.Errorf("update user status: %w", err)
 	}
@@ -8325,11 +8367,12 @@ func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username st
 	const query = `
 		UPDATE users
 		SET traffic_limit_override = CASE WHEN package_id IS NOT ? THEN NULL ELSE traffic_limit_override END,
-		    package_id = ?, package_start_date = ?, package_end_date = ?, is_reset = ?, reset_day = ?, updated_at = CURRENT_TIMESTAMP
+		    package_id = ?, package_start_date = ?, package_end_date = ?, last_package_id = ?, last_package_end_date = ?,
+		    is_reset = ?, reset_day = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query, packageID, packageID, startDate, endDate, isResetInt, resetDay, username)
+	result, err := r.db.ExecContext(ctx, query, packageID, packageID, startDate, endDate, packageID, endDate, isResetInt, resetDay, username)
 	if err != nil {
 		return fmt.Errorf("assign package to user: %w", err)
 	}
@@ -8348,6 +8391,16 @@ func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username st
 
 // 删除用户的包分配
 func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username string) error {
+	return r.removePackageFromUser(ctx, username, false)
+}
+
+// RemoveExpiredPackageFromUser removes an expired assignment while retaining
+// enough package identity for the user to submit a manual renewal request.
+func (r *TrafficRepository) RemoveExpiredPackageFromUser(ctx context.Context, username string) error {
+	return r.removePackageFromUser(ctx, username, true)
+}
+
+func (r *TrafficRepository) removePackageFromUser(ctx context.Context, username string, preserveForRenewal bool) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
@@ -8358,14 +8411,24 @@ func (r *TrafficRepository) RemovePackageFromUser(ctx context.Context, username 
 	}
 
 	// 一并清 traffic_limit_override:覆写只对"当前这次套餐绑定"有效。
-	// 三个调用方(enforcer 过期摘除 / 删套餐 / 手动解绑)语义一致。
+	// 管理员主动解绑或删除套餐时同时清除续费快照；只有自然过期路径
+	// RemoveExpiredPackageFromUser 会保留最近套餐身份。
 	// 不清的话覆写会变成孤儿:package_id 没了 → 前端流量条和入口都不显示 →
 	// 管理员看不见也删不掉 → 用户下次绑套餐时它又悄悄复活。
-	const query = `
+	query := `
 		UPDATE users
-		SET package_id = NULL, package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1, traffic_limit_override = NULL, updated_at = CURRENT_TIMESTAMP
+		SET last_package_id = NULL, last_package_end_date = NULL,
+		    package_id = NULL, package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1, traffic_limit_override = NULL, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
 	`
+	if preserveForRenewal {
+		query = `
+			UPDATE users
+			SET last_package_id = package_id, last_package_end_date = package_end_date,
+			    package_id = NULL, package_start_date = NULL, package_end_date = NULL, is_reset = 0, reset_day = 1, traffic_limit_override = NULL, updated_at = CURRENT_TIMESTAMP
+			WHERE username = ?
+		`
+	}
 
 	result, err := r.db.ExecContext(ctx, query, username)
 	if err != nil {
@@ -9299,20 +9362,22 @@ func (r *TrafficRepository) ListSubaccountsByRoutedNode(ctx context.Context, rou
 	return out, rows.Err()
 }
 
-// ListActiveSubaccountsByServerName 用于 limiter 下发:列出某 server 上所有 active 子账号
-// 以及其挂的 inbound_tag(继承自父物理节点)。需要 JOIN nodes 表拿 inbound 信息。
+// ListActiveSubaccountsByServerName 用于 limiter 全量同步：返回某 server 上全部子账号
+// （含 inactive）。调用方用 IsActive 决定是否加入用户，同时仍可为只剩 inactive
+// 子账号的 inbound 下发空列表，清除 Agent 内存里的旧 limiter 配置和存量连接。
 type ActiveSubaccountForLimiter struct {
 	Username   string
 	Email      string
 	InboundTag string
+	IsActive   bool
 }
 
 func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Context, serverName string) ([]ActiveSubaccountForLimiter, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT sa.username, sa.email, COALESCE(n.inbound_tag, '')
+		SELECT sa.username, sa.email, COALESCE(n.inbound_tag, ''), sa.is_active
 		FROM user_subaccounts sa
 		INNER JOIN nodes n ON sa.routed_node_id = n.id
-		WHERE sa.is_active = 1 AND n.original_server = ? AND n.node_type = 'routed'
+		WHERE n.original_server = ? AND n.node_type = 'routed'
 	`, serverName)
 	if err != nil {
 		return nil, err
@@ -9321,9 +9386,11 @@ func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Contex
 	var out []ActiveSubaccountForLimiter
 	for rows.Next() {
 		var a ActiveSubaccountForLimiter
-		if err := rows.Scan(&a.Username, &a.Email, &a.InboundTag); err != nil {
+		var active int
+		if err := rows.Scan(&a.Username, &a.Email, &a.InboundTag, &active); err != nil {
 			return nil, err
 		}
+		a.IsActive = active == 1
 		if a.InboundTag == "" {
 			continue
 		}
@@ -9332,7 +9399,7 @@ func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Contex
 	return out, rows.Err()
 }
 
-// ListServerIDsForUserSubaccounts 返回该用户所有 active routed 子账号所在的 remote_server id。
+// ListServerIDsForUserSubaccounts 返回该用户所有 routed 子账号所在的 remote_server id。
 // 限速下发收集服务器时,主账号走 user_inbound_configs(物理),子账号在 user_subaccounts ——
 // 只有 routed 子账号、没有物理 inbound 的用户,光查 inbound_configs 会漏掉这些 server。
 func (r *TrafficRepository) ListServerIDsForUserSubaccounts(ctx context.Context, username string) ([]int64, error) {
@@ -9341,7 +9408,7 @@ func (r *TrafficRepository) ListServerIDsForUserSubaccounts(ctx context.Context,
 		FROM user_subaccounts sa
 		INNER JOIN nodes n ON sa.routed_node_id = n.id
 		INNER JOIN remote_servers rs ON rs.name = n.original_server
-		WHERE sa.is_active = 1 AND sa.username = ? AND n.node_type = 'routed'
+		WHERE sa.username = ? AND n.node_type = 'routed'
 	`, username)
 	if err != nil {
 		return nil, err
@@ -9732,12 +9799,44 @@ func (r *TrafficRepository) UpdateUserNodeLimits(ctx context.Context, username s
 }
 
 func (r *TrafficRepository) UpdateUserOverLimit(ctx context.Context, username string, isOverLimit bool) error {
-	val := 0
+	return r.UpdateUserOverLimitState(ctx, username, isOverLimit, false)
+}
+
+// UpdateUserOverLimitState 原子更新额度状态和实际断流完成状态。
+func (r *TrafficRepository) UpdateUserOverLimitState(ctx context.Context, username string, isOverLimit, enforced bool) error {
+	over, done := 0, 0
 	if isOverLimit {
-		val = 1
+		over = 1
 	}
-	_, err := r.db.ExecContext(ctx, `UPDATE users SET is_over_limit = ? WHERE username = ?`, val, username)
+	if enforced {
+		done = 1
+	}
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE users SET is_over_limit = ?, over_limit_enforced = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`,
+		over, done, username)
 	return err
+}
+
+func (r *TrafficRepository) IsUserOverLimitEnforced(ctx context.Context, username string) (bool, error) {
+	var val int
+	err := r.db.QueryRowContext(ctx, `SELECT COALESCE(over_limit_enforced, 0) FROM users WHERE username = ?`, username).Scan(&val)
+	return val == 1, err
+}
+
+func (r *TrafficRepository) UpdateUserDisabledAccessEnforced(ctx context.Context, username string, enforced bool) error {
+	value := 0
+	if enforced {
+		value = 1
+	}
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE users SET disabled_access_enforced = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, value, username)
+	return err
+}
+
+func (r *TrafficRepository) IsUserDisabledAccessEnforced(ctx context.Context, username string) (bool, error) {
+	var value int
+	err := r.db.QueryRowContext(ctx, `SELECT COALESCE(disabled_access_enforced, 0) FROM users WHERE username = ?`, username).Scan(&value)
+	return value == 1, err
 }
 
 func (r *TrafficRepository) IsUserOverLimit(ctx context.Context, username string) (bool, error) {

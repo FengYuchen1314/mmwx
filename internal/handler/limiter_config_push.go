@@ -169,7 +169,9 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		usernames[c.Username] = true
 	}
 	for _, sa := range subaccs {
-		usernames[sa.Username] = true
+		if sa.IsActive {
+			usernames[sa.Username] = true
+		}
 	}
 
 	// 缓存 user 对象(指针)和套餐(指针);**不预算限速值** — 现在同一用户在不同 inbound 上限速可能不同,
@@ -185,6 +187,9 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if !user.IsActive {
 			continue
 		}
+		if overLimit, _ := p.repo.IsUserOverLimit(ctx, username); overLimit {
+			continue
+		}
 		u := user // 避免循环变量 alias
 		userMap[username] = &u
 		if user.PackageID > 0 {
@@ -198,6 +203,14 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 
 	tagUsers := make(map[string][]WSUserLimitInfo)
 	tagPkgIDs := make(map[string]map[int64]bool)
+	// 即使某 tag 当前没有可用用户，也必须发送 Users:[]。否则 Agent 会保留
+	// 上一次的 limiter 用户和存量连接，禁用/超限看起来仍有连接数。
+	for _, c := range configs {
+		tagUsers[c.InboundTag] = nil
+	}
+	for _, sa := range subaccs {
+		tagUsers[sa.InboundTag] = nil
+	}
 
 	// 主账号:走 c.InboundTag,反查 physical 节点的 (nodeID, parentID)
 	for _, c := range configs {
@@ -236,6 +249,9 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 	// 子账号:走 sa.InboundTag,反查 routed 节点的 (nodeID, parentID)。
 	// routed 节点的 per-node 限速继承 parent 物理节点(在 resolveLimit 内自动处理)。
 	for _, sa := range subaccs {
+		if !sa.IsActive {
+			continue
+		}
 		user, ok := userMap[sa.Username]
 		if !ok {
 			continue

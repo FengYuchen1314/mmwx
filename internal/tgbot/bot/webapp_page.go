@@ -270,6 +270,21 @@ function renderRedeem(){
  h+='</div>';
  return h;
 }
+function renderRenewal(d){
+ var r=d.renewal_request||{},pending=r.status==="pending"||r.status==="processing";
+ var h='<div class="card"><div class="title">申请续费</div>';
+ if(pending){h+='<div class="muted">续费申请审核中 · '+esc(r.package_name||"")+'</div></div>';return h;}
+ if(r.status==="approved")h+='<div style="color:var(--ok);font-size:13px;margin-bottom:7px">上次申请已通过'+(r.new_end_date?' · 到期 '+esc(String(r.new_end_date).slice(0,10)):'')+'</div>';
+ else if(r.status==="rejected")h+='<div class="warn" style="font-size:13px;margin-bottom:7px">上次申请未通过</div>';
+ h+='<div style="display:flex;gap:8px"><input id="rn-pass" class="inp" style="margin:0;flex:1" maxlength="256" placeholder="输入续费口令">';
+ h+='<button class="btn" onclick="__renew(this)">提交</button></div><div id="rn-msg" style="font-size:13px;min-height:18px;margin:6px 0 0"></div></div>';return h;
+}
+function __renew(btn){var el=document.getElementById("rn-pass"),pass=(el&&el.value||"").trim(),msg=document.getElementById("rn-msg");
+ if(!pass){msg.className="warn";msg.textContent="请输入续费口令";return;}btn.disabled=true;btn.textContent="提交中...";
+ fetch("/api/tg-webapp/renewal-request",{method:"POST",headers:{"Content-Type":"application/json","X-Telegram-Init-Data":window.__init},body:JSON.stringify({passphrase:pass})})
+ .then(function(x){return x.json().then(function(j){return{ok:x.ok,j:j};});}).then(function(res){if(!res.ok)throw new Error(res.j.error||"提交失败");hap("notif","success");toast("已发送给管理员审核");load();})
+ .catch(function(err){btn.disabled=false;btn.textContent="提交";msg.className="warn";msg.textContent=err.message||"提交失败";});}
+window.__renew=__renew;
 function __redeem(btn){
  var code=(document.getElementById("rd-code").value||"").trim();
  var msg=document.getElementById("rd-msg");msg.className="";msg.style.color="var(--muted)";
@@ -352,6 +367,7 @@ function renderHome(d){
  });
  h+='</div>';
  h+=chart(d.history);
+ h+=renderRenewal(d);
  h+=renderRedeem();
  return h;
 }

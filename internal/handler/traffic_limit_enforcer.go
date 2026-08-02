@@ -100,15 +100,33 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 	now := time.Now()
 
 	for _, user := range users {
+		// 禁用用户必须同时从普通入站和全部 routed 子账户摘除。状态接口首次同步
+		// 失败时保留 enforced=0，由这里每个周期补偿，直到所有 Agent 确认完成。
+		if !user.IsActive {
+			enforced, _ := e.repo.IsUserDisabledAccessEnforced(ctx, user.Username)
+			if !enforced {
+				plainOK := e.removeUserFromAllInbounds(ctx, user.Username)
+				routedOK := e.suspendUserRoutedAccess(ctx, user.Username)
+				if plainOK && routedOK {
+					_ = e.repo.UpdateUserDisabledAccessEnforced(ctx, user.Username, true)
+					if e.pusher != nil {
+						go e.pusher.PushToAllServersForUser(context.Background(), user.Username)
+					}
+				} else {
+					log.Printf("[TrafficLimitEnforcer] Disabled user %s enforcement incomplete (plain=%t routed=%t), retry next cycle",
+						user.Username, plainOK, routedOK)
+				}
+			}
+			continue
+		}
+
 		// 套餐到期检查：到期后移除入站并清除套餐绑定
 		if user.PackageEndDate != nil && now.After(*user.PackageEndDate) {
 			log.Printf("[TrafficLimitEnforcer] User %s package expired at %s, removing from inbounds and clearing package",
 				user.Username, user.PackageEndDate.Format("2006-01-02"))
 			removed := e.removeUserFromAllInbounds(ctx, user.Username)
-			// 用户私有路由出站(routed_owner='user'):父 inbound 来自套餐分配的节点,
-			// 套餐到期后失去访问权,所以一并 suspend(凭据保留供续费恢复)。
-			suspendUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
-			if !removed {
+			routedRemoved := e.suspendUserRoutedAccess(ctx, user.Username)
+			if !removed || !routedRemoved {
 				// agent 摘除未确认成功(多半离线):保留 user_inbound_configs 与套餐绑定,下个周期重试。
 				// 不在此清 DB —— 否则 agent 残留孤儿 client 而 DB 无行,既造成「同 email 不同 uuid」漂移,
 				// 过期用户还因孤儿 client 继续有访问权。也暂不发到期通知,避免每周期反复打扰。
@@ -118,7 +136,7 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 			if err := e.repo.DeleteUserInboundConfigs(ctx, user.Username); err != nil {
 				log.Printf("[TrafficLimitEnforcer] Failed to delete inbound configs for %s: %v", user.Username, err)
 			}
-			if err := e.repo.RemovePackageFromUser(ctx, user.Username); err != nil {
+			if err := e.repo.RemoveExpiredPackageFromUser(ctx, user.Username); err != nil {
 				log.Printf("[TrafficLimitEnforcer] Failed to remove package from %s: %v", user.Username, err)
 			}
 			// 套餐过期 tg 通知 — 用户的当前 package_id 在 RemovePackageFromUser 之前的快照里
@@ -172,13 +190,8 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 				runErrors = append(runErrors, fmt.Errorf("reset user %s: %w", user.Username, err))
 			} else {
 				userResetCount++
-				// 复用现有"恢复入站"路径:如果用户之前因超额被踢,reset 后自动放回
-				if wasOver, _ := e.repo.IsUserOverLimit(ctx, user.Username); wasOver {
-					log.Printf("[TrafficLimitEnforcer] User %s back under limit after monthly reset, restoring inbounds", user.Username)
-					e.restoreUserToInbounds(ctx, user)
-					resumeUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
-					e.repo.UpdateUserOverLimit(ctx, user.Username, false)
-				}
+				// 若此前超额，下面统一的 under-limit 分支负责恢复全部普通入站和 routed
+				// 子账户；恢复未完整成功前保留 is_over_limit，下一轮继续补偿。
 				// limiter 配置在 agent 端按 user_traffic 累计算,重置归零后下次 push 自然刷新
 			}
 		}
@@ -187,6 +200,18 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 		// 位置必须留在月度重置之后:提前 continue 会让不限流量的用户永远不重置周期。
 		limitBytes := resolveTrafficLimitBytes(&user, pkg)
 		if limitBytes <= 0 {
+			// 管理员把额度改为“不限量”也属于恢复条件，不能因为提前 continue
+			// 让此前已超限的用户永久保持断流。
+			if wasOver, _ := e.repo.IsUserOverLimit(ctx, user.Username); wasOver {
+				plainOK := e.restoreUserToInbounds(ctx, user)
+				routedOK := e.resumeUserRoutedAccess(ctx, user)
+				if plainOK && routedOK {
+					_ = e.repo.UpdateUserOverLimitState(ctx, user.Username, false, false)
+					if e.pusher != nil {
+						go e.pusher.PushToAllServersForUser(context.Background(), user.Username)
+					}
+				}
+			}
 			continue
 		}
 
@@ -224,21 +249,46 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 			}
 		}
 
-		if isOverLimit && !wasOverLimit {
-			log.Printf("[TrafficLimitEnforcer] User %s exceeded limit (%d/%d bytes), removing from inbounds",
-				user.Username, usedWeighted, limitBytes)
-			e.removeUserFromAllInbounds(ctx, user.Username)
-			suspendUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
-			e.repo.UpdateUserOverLimit(ctx, user.Username, true)
-			usedGB := float64(usedWeighted) / (1024 * 1024 * 1024)
-			limitGB := float64(limitBytes) / (1024 * 1024 * 1024)
-			SendOverLimitNotification(ctx, user.Username, usedGB, limitGB)
+		if isOverLimit {
+			enforced, _ := e.repo.IsUserOverLimitEnforced(ctx, user.Username)
+			if !wasOverLimit {
+				log.Printf("[TrafficLimitEnforcer] User %s exceeded limit (%d/%d bytes), removing all inbound and routed clients",
+					user.Username, usedWeighted, limitBytes)
+				_ = e.repo.UpdateUserOverLimitState(ctx, user.Username, true, false)
+				enforced = false
+			}
+			if !enforced {
+				plainOK := e.removeUserFromAllInbounds(ctx, user.Username)
+				routedOK := e.suspendUserRoutedAccess(ctx, user.Username)
+				if plainOK && routedOK {
+					_ = e.repo.UpdateUserOverLimitState(ctx, user.Username, true, true)
+					if e.pusher != nil {
+						go e.pusher.PushToAllServersForUser(context.Background(), user.Username)
+					}
+				} else {
+					log.Printf("[TrafficLimitEnforcer] User %s over-limit enforcement incomplete (plain=%t routed=%t), retry next cycle",
+						user.Username, plainOK, routedOK)
+				}
+			}
+			if !wasOverLimit {
+				usedGB := float64(usedWeighted) / (1024 * 1024 * 1024)
+				limitGB := float64(limitBytes) / (1024 * 1024 * 1024)
+				SendOverLimitNotification(ctx, user.Username, usedGB, limitGB)
+			}
 		} else if !isOverLimit && wasOverLimit {
 			log.Printf("[TrafficLimitEnforcer] User %s back under limit (%d/%d bytes), restoring inbounds",
 				user.Username, usedWeighted, limitBytes)
-			e.restoreUserToInbounds(ctx, user)
-			resumeUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
-			e.repo.UpdateUserOverLimit(ctx, user.Username, false)
+			plainOK := e.restoreUserToInbounds(ctx, user)
+			routedOK := e.resumeUserRoutedAccess(ctx, user)
+			if plainOK && routedOK {
+				_ = e.repo.UpdateUserOverLimitState(ctx, user.Username, false, false)
+				if e.pusher != nil {
+					go e.pusher.PushToAllServersForUser(context.Background(), user.Username)
+				}
+			} else {
+				log.Printf("[TrafficLimitEnforcer] User %s restore incomplete (plain=%t routed=%t), retry next cycle",
+					user.Username, plainOK, routedOK)
+			}
 		}
 	}
 
@@ -299,16 +349,83 @@ func (e *TrafficLimitEnforcer) removeUserFromAllInbounds(ctx context.Context, us
 	return safe
 }
 
-func (e *TrafficLimitEnforcer) restoreUserToInbounds(ctx context.Context, user storage.User) {
+// suspendUserRoutedAccess 摘除用户的全部 routed 子账户，而不仅是 routed_owner=user
+// 的私有路由。套餐中管理员创建的 shared routed 节点同样使用 user_subaccounts，
+// 超限/到期时如果漏掉它们，用户仍可通过父入站继续连接。
+func (e *TrafficLimitEnforcer) suspendUserRoutedAccess(ctx context.Context, username string) bool {
+	privateOK := suspendUserPrivateRouted(ctx, e.remoteManage, e.repo, username)
+	subaccounts, err := e.repo.ListUserSubaccounts(ctx, username)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] Failed to list routed subaccounts for %s: %v", username, err)
+		return false
+	}
+	ok := privateOK
+	for _, sa := range subaccounts {
+		if !sa.IsActive {
+			continue
+		}
+		node, err := e.repo.GetNodeByID(ctx, sa.RoutedNodeID)
+		if err != nil {
+			log.Printf("[TrafficLimitEnforcer] Failed to resolve routed node %d for %s: %v", sa.RoutedNodeID, username, err)
+			ok = false
+			continue
+		}
+		if node.RoutedOwner == "user" {
+			continue // 私有节点已由 suspendUserPrivateRouted 安全删除整条 rule。
+		}
+		if err := removeUserFromRoutedNode(ctx, e.remoteManage, e.repo, username, sa.RoutedNodeID); err != nil {
+			log.Printf("[TrafficLimitEnforcer] Failed to suspend routed node %d for %s: %v", sa.RoutedNodeID, username, err)
+			ok = false
+		}
+	}
+	return ok
+}
+
+func (e *TrafficLimitEnforcer) resumeUserRoutedAccess(ctx context.Context, user storage.User) bool {
+	privateOK := resumeUserPrivateRouted(ctx, e.remoteManage, e.repo, user.Username)
+	subaccounts, err := e.repo.ListUserSubaccounts(ctx, user.Username)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] Failed to list routed subaccounts for restore %s: %v", user.Username, err)
+		return false
+	}
+	ok := privateOK
+	for _, sa := range subaccounts {
+		if sa.IsActive {
+			continue
+		}
+		node, err := e.repo.GetNodeByID(ctx, sa.RoutedNodeID)
+		if err != nil {
+			log.Printf("[TrafficLimitEnforcer] Failed to resolve routed node %d for restore %s: %v", sa.RoutedNodeID, user.Username, err)
+			ok = false
+			continue
+		}
+		if node.RoutedOwner == "user" {
+			continue // 私有节点已由 resumeUserPrivateRouted 重建整条 rule。
+		}
+		if err := addUserToRoutedNode(ctx, e.remoteManage, e.repo, user, sa.RoutedNodeID); err != nil {
+			// addUserToRoutedNode 的历史语义可能已把 DB 置 active 后才发现 routing
+			// 写入失败；恢复流程必须改回 inactive，给下一轮留下重试依据。
+			_ = e.repo.SetSubaccountActive(ctx, sa.ID, false)
+			log.Printf("[TrafficLimitEnforcer] Failed to restore routed node %d for %s: %v", sa.RoutedNodeID, user.Username, err)
+			ok = false
+		}
+	}
+	return ok
+}
+
+func (e *TrafficLimitEnforcer) restoreUserToInbounds(ctx context.Context, user storage.User) bool {
 	configs, err := e.repo.GetUserInboundConfigs(ctx, user.Username)
 	if err != nil {
 		log.Printf("[TrafficLimitEnforcer] Failed to get inbound configs for %s: %v", user.Username, err)
-		return
+		return false
 	}
+	ok := true
 	for _, cfg := range configs {
 		if err := addUserToInbound(ctx, e.remoteManage, e.repo, user, cfg.ServerID, cfg.InboundTag); err != nil {
 			log.Printf("[TrafficLimitEnforcer] Failed to restore %s to %s on server %d: %v",
 				user.Username, cfg.InboundTag, cfg.ServerID, err)
+			ok = false
 		}
 	}
+	return ok
 }
