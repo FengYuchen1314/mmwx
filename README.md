@@ -49,6 +49,9 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.4.4 (2026-08-02)
+- 🌈 主控交互自愈
+
 ### v0.4.3 (2026-07-31)
 - 🌈 增加cdn更新
 - 🛠️ fix: 不再始终更新master_url
