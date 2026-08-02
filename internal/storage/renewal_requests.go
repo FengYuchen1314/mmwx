@@ -143,6 +143,26 @@ func (r *TrafficRepository) GetLatestRenewalRequest(ctx context.Context, usernam
 	return q, err
 }
 
+func (r *TrafficRepository) ListRenewalRequests(ctx context.Context, username string, limit int) ([]RenewalRequest, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := r.db.QueryContext(ctx, renewalSelect+` WHERE username = ? ORDER BY id DESC LIMIT ?`, username, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]RenewalRequest, 0, limit)
+	for rows.Next() {
+		req, scanErr := scanRenewal(rows, false)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		out = append(out, *req)
+	}
+	return out, rows.Err()
+}
+
 func (r *TrafficRepository) ClaimRenewalRequest(ctx context.Context, token string, adminTGID int64) (bool, error) {
 	res, err := r.db.ExecContext(ctx, `UPDATE renewal_requests SET status='processing', reviewed_by=?, updated_at=CURRENT_TIMESTAMP WHERE request_token=? AND status='pending'`, adminTGID, token)
 	if err != nil {

@@ -34,6 +34,10 @@ func (s *RenewalService) Latest(ctx context.Context, username string) (*storage.
 	return s.repo.GetLatestRenewalRequest(ctx, username)
 }
 
+func (s *RenewalService) History(ctx context.Context, username string, limit int) ([]storage.RenewalRequest, error) {
+	return s.repo.ListRenewalRequests(ctx, username, limit)
+}
+
 func (s *RenewalService) Approve(ctx context.Context, token string, adminTGID int64) (*storage.RenewalRequest, bool, error) {
 	if s == nil || s.repo == nil || s.assign == nil {
 		return nil, false, errors.New("renewal service not initialized")
@@ -111,12 +115,16 @@ func (h *UserRenewalHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		req, err := h.service.Latest(r.Context(), username)
+		requests, err := h.service.History(r.Context(), username, 20)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"request": req})
+		var latest *storage.RenewalRequest
+		if len(requests) > 0 {
+			latest = &requests[0]
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"request": latest, "requests": requests})
 	case http.MethodPost:
 		var body struct {
 			Passphrase string `json:"passphrase"`

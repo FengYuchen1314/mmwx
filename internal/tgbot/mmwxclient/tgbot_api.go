@@ -53,6 +53,20 @@ type RenewalRequest struct {
 	Source          string `json:"source"`
 	Status          string `json:"status"`
 	NewEndDate      string `json:"new_end_date,omitempty"`
+	ErrorMessage    string `json:"error_message,omitempty"`
+	CreatedAt       string `json:"created_at,omitempty"`
+	ReviewedAt      string `json:"reviewed_at,omitempty"`
+}
+
+func (c *Client) RenewalRequestHistory(ctx context.Context, tgID int64) ([]RenewalRequest, error) {
+	var out struct {
+		Requests []RenewalRequest `json:"requests"`
+	}
+	q := url.Values{"telegram_id": []string{strconv.FormatInt(tgID, 10)}}
+	if err := c.get(ctx, "/api/admin/tgbot/renewal-request/status", q, &out); err != nil {
+		return nil, err
+	}
+	return out.Requests, nil
 }
 
 func (c *Client) CreateRenewalRequest(ctx context.Context, tgID int64, passphrase string) (*RenewalRequest, error) {

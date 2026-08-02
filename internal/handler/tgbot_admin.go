@@ -1156,12 +1156,16 @@ func (h *TGBotAPIHandler) renewalRequestStatus(w http.ResponseWriter, r *http.Re
 		writeJSONError(w, http.StatusBadRequest, "Telegram 未绑定用户")
 		return
 	}
-	req, err := h.renewal.Latest(r.Context(), username)
+	requests, err := h.renewal.History(r.Context(), username, 20)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"request": req})
+	var latest *storage.RenewalRequest
+	if len(requests) > 0 {
+		latest = &requests[0]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"request": latest, "requests": requests})
 }
 
 func (h *TGBotAPIHandler) reviewRenewalRequest(w http.ResponseWriter, r *http.Request, approve bool) {

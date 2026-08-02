@@ -187,6 +187,7 @@ nav svg{width:22px;height:22px}
   <div id="view-home"></div>
   <div id="view-traffic" class="hide"></div>
   <div id="view-status" class="hide"></div>
+  <div id="view-renewal" class="hide"></div>
   <div id="view-invites" class="hide"></div>
   <div id="view-users" class="hide"></div>
 </main>
@@ -202,6 +203,10 @@ nav svg{width:22px;height:22px}
   <button data-v="status" onclick="__tab('status')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
     <span>状态</span>
+  </button>
+  <button id="nav-renewal" data-v="renewal" class="hide" onclick="__tab('renewal')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v6h-6"/><path d="M12 8v4l3 2"/></svg>
+    <span>续费</span>
   </button>
   <button id="nav-invites" data-v="invites" class="hide" onclick="__tab('invites')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M4 9h16M9 4v5"/></svg>
@@ -233,7 +238,7 @@ function subURL(i,base){var t=document.getElementById("cli-"+i).value;return bas
 function __subcopy(i,base){copy(subURL(i,base));}
 window.__subcopy=__subcopy;
 function __tab(v){hap("sel");
- ["home","traffic","status","invites","users"].forEach(function(x){document.getElementById("view-"+x).classList.toggle("hide",x!==v);});
+ ["home","traffic","status","renewal","invites","users"].forEach(function(x){document.getElementById("view-"+x).classList.toggle("hide",x!==v);});
  document.querySelectorAll("#nav button").forEach(function(b){b.classList.toggle("active",b.getAttribute("data-v")===v);});
  if(v==="invites"&&!window.__invLoaded){loadInvites();}
  if(v==="users"&&!window.__usersLoaded){loadUsers();}}
@@ -285,6 +290,25 @@ function __renew(btn){var el=document.getElementById("rn-pass"),pass=(el&&el.val
  .then(function(x){return x.json().then(function(j){return{ok:x.ok,j:j};});}).then(function(res){if(!res.ok)throw new Error(res.j.error||"提交失败");hap("notif","success");toast("已发送给管理员审核");load();})
  .catch(function(err){btn.disabled=false;btn.textContent="提交";msg.className="warn";msg.textContent=err.message||"提交失败";});}
 window.__renew=__renew;
+
+function renewalStatus(s){
+ return {pending:["等待管理员确认","var(--brand)"],processing:["正在处理","var(--brand)"],approved:["续费成功","var(--ok)"],rejected:["申请未通过","var(--warn)"],failed:["处理失败","var(--warn)"]}[s]||[s||"未知","var(--unknown)"];
+}
+function shortDate(v){if(!v)return "--";var d=new Date(v);return isNaN(d.getTime())?String(v).slice(0,10):d.toLocaleString();}
+function renderRenewalPage(d){
+ var list=d.renewal_requests||[],h='<div class="card"><div class="title">套餐续费</div><div class="muted">使用续费口令申请管理员审核，或使用兑换码立即续期。</div></div>';
+ h+=renderRenewal(d);h+=renderRedeem();
+ h+='<div class="card"><div class="title">续费记录</div>';
+ if(!list.length){h+='<div class="muted">暂无续费申请记录。</div></div>';return h;}
+ list.forEach(function(r,i){var st=renewalStatus(r.status);if(i>0)h+='<div style="border-top:1px solid var(--border);margin:12px 0"></div>';
+  h+='<div class="row" style="margin:0"><span style="font-weight:600">'+esc(r.package_name||"套餐续费")+'</span><span style="color:'+st[1]+'">'+st[0]+'</span></div>';
+  h+='<div class="row" style="margin:6px 0 0"><span class="muted">申请时间</span><span class="muted">'+esc(shortDate(r.created_at))+'</span></div>';
+  h+='<div class="row" style="margin:4px 0 0"><span class="muted">续费周期</span><span class="muted">'+esc(r.renew_days||0)+' 天</span></div>';
+  if(r.previous_end_date)h+='<div class="row" style="margin:4px 0 0"><span class="muted">原到期时间</span><span class="muted">'+esc(String(r.previous_end_date).slice(0,10))+'</span></div>';
+  if(r.new_end_date)h+='<div class="row" style="margin:4px 0 0"><span class="muted">新到期时间</span><span style="color:var(--ok)">'+esc(String(r.new_end_date).slice(0,10))+'</span></div>';
+  if(r.error_message)h+='<div class="warn" style="font-size:12px;margin-top:6px">'+esc(r.error_message)+'</div>';
+ });h+='</div>';return h;
+}
 function __redeem(btn){
  var code=(document.getElementById("rd-code").value||"").trim();
  var msg=document.getElementById("rd-msg");msg.className="";msg.style.color="var(--muted)";
@@ -367,8 +391,6 @@ function renderHome(d){
  });
  h+='</div>';
  h+=chart(d.history);
- h+=renderRenewal(d);
- h+=renderRedeem();
  return h;
 }
 function renderTraffic(d){
@@ -426,8 +448,10 @@ function render(d){
  document.getElementById("view-home").innerHTML=renderHome(d);
  document.getElementById("view-traffic").innerHTML=renderTraffic(d);
  document.getElementById("view-status").innerHTML=renderStatus(d);
+ document.getElementById("view-renewal").innerHTML=renderRenewalPage(d);
  if(d.bound!==false)document.getElementById("nav").classList.remove("hide");
  if(d.is_admin){document.getElementById("nav-invites").classList.remove("hide");document.getElementById("nav-users").classList.remove("hide");}
+ else if(d.bound!==false){document.getElementById("nav-renewal").classList.remove("hide");}
 }
 
 // ===== 管理员:邀请码 =====

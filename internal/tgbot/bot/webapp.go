@@ -158,8 +158,11 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	username := info.Username
 
 	resp := map[string]any{"bound": true, "is_admin": s.cfg.IsAdmin(tgID)}
-	if renewal, err := s.client.RenewalRequestStatus(ctx, tgID); err == nil && renewal != nil {
-		resp["renewal_request"] = renewal
+	if renewals, err := s.client.RenewalRequestHistory(ctx, tgID); err == nil {
+		resp["renewal_requests"] = renewals
+		if len(renewals) > 0 {
+			resp["renewal_request"] = renewals[0]
+		}
 	}
 
 	// 账号 + 流量 + 套餐
