@@ -170,6 +170,9 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.4-beta.2 (2026-08-03)
+- 🌈 优化普通用户的miniapp续费
+- 🌈 服务器视图流量支持日期筛选
 ### v0.4.4-beta.1 (2026-08-03)
 - 🌈 增加prerelease版本
 - 🌈 增加用户自主续费功能
