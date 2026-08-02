@@ -22,6 +22,21 @@ func TestClassifyNginxWebsite(t *testing.T) {
 	}
 }
 
+func TestClassifyNginxWebsiteResolvesProxyPassVariable(t *testing.T) {
+	info := fakeWebsiteInfo{}
+	content := `server {
+    server_name g.2ha.me;
+    set $website 127.0.0.1:5555;
+    location / {
+        proxy_pass http://$website;
+    }
+}`
+	got := classifyNginxWebsite("/tmp/g.2ha.me.conf", info, content)
+	if got.Type != "proxy" || got.Value != "http://127.0.0.1:5555" {
+		t.Fatalf("unexpected website: %+v", got)
+	}
+}
+
 type fakeWebsiteInfo struct{}
 
 func (fakeWebsiteInfo) Name() string       { return "site.conf" }

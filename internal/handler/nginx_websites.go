@@ -57,7 +57,30 @@ var (
 	websiteProxyRE = regexp.MustCompile(`(?m)^\s*proxy_pass\s+([^;]+);`)
 	websiteNameRE  = regexp.MustCompile(`(?m)^\s*server_name\s+([^;]+);`)
 	websiteLocRE   = regexp.MustCompile(`(?m)^\s*location\s+[^\s{]+\s*\{`)
+	websiteSetRE   = regexp.MustCompile(`(?m)^\s*set\s+\$([A-Za-z_][A-Za-z0-9_]*)\s+([^;]+);`)
 )
+
+// resolveNginxWebsiteVariables expands variables declared by `set` in the same
+// domain config. Website inventory is descriptive only, so unknown/built-in
+// nginx variables are deliberately left untouched.
+func resolveNginxWebsiteVariables(value, content string) string {
+	variables := make(map[string]string)
+	for _, match := range websiteSetRE.FindAllStringSubmatch(content, -1) {
+		variables[match[1]] = strings.Trim(strings.TrimSpace(match[2]), `"'`)
+	}
+	for range len(variables) + 1 {
+		previous := value
+		for name, resolved := range variables {
+			value = strings.ReplaceAll(value, "${"+name+"}", resolved)
+			variableRE := regexp.MustCompile(`\$` + regexp.QuoteMeta(name) + `\b`)
+			value = variableRE.ReplaceAllStringFunc(value, func(string) string { return resolved })
+		}
+		if value == previous {
+			break
+		}
+	}
+	return value
+}
 
 func classifyNginxWebsite(path string, info os.FileInfo, content string) nginxWebsite {
 	domain := strings.ToLower(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
@@ -78,7 +101,8 @@ func classifyNginxWebsite(path string, info os.FileInfo, content string) nginxWe
 	}
 	if entry.Type == "unknown" {
 		if match := websiteProxyRE.FindStringSubmatch(content); len(match) == 2 {
-			entry.Type, entry.Value = "proxy", strings.TrimSpace(match[1])
+			entry.Type = "proxy"
+			entry.Value = resolveNginxWebsiteVariables(strings.TrimSpace(match[1]), content)
 		} else if match := websiteRootRE.FindStringSubmatch(content); len(match) == 2 {
 			entry.Type, entry.Value = "static", strings.Trim(strings.TrimSpace(match[1]), `"'`)
 		}
