@@ -154,7 +154,7 @@ func (h *RemoteManageHandler) HandleMasterMigration(w http.ResponseWriter, r *ht
 				continue
 			}
 			s := &servers[i]
-			if err := h.syncMasterURLToAgent(r.Context(), s, req.NewMasterURL); err != nil {
+			if err := h.syncMasterURLToAgentWithPolicy(r.Context(), s, req.NewMasterURL, req.MoveHost); err != nil {
 				results[i].Status, results[i].Message = "failed", err.Error()
 				ready = false
 			}
@@ -1399,7 +1399,15 @@ func (h *RemoteManageHandler) ForwardToServer(ctx context.Context, serverID int6
 // syncMasterURLToAgent 校准单台 Agent 的回连地址。同机 Agent 必须保留
 // 127.0.0.1:主控端口，联邦服务器则属于其它主控，两者都不能改写。
 func (h *RemoteManageHandler) syncMasterURLToAgent(ctx context.Context, server *storage.RemoteServer, newMasterURL string) error {
+	return h.syncMasterURLToAgentWithPolicy(ctx, server, newMasterURL, false)
+}
+
+func (h *RemoteManageHandler) syncMasterURLToAgentWithPolicy(ctx context.Context, server *storage.RemoteServer, newMasterURL string, allowSameHostOverride bool) error {
 	if server == nil || server.IsFederated {
+		return nil
+	}
+	if server.SameHostAsMaster && !allowSameHostOverride {
+		log.Printf("[MasterURLSync] Server %d (%s): preserve same-host transport", server.ID, server.Name)
 		return nil
 	}
 	// During automatic HTTPS recovery, agents whose existing transport still
