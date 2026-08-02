@@ -294,7 +294,7 @@ func (h *SubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		if clientType == "" {
 			clientType = "unknown"
 		}
-		SendSubscribeFetchNotification(r.Context(), username, clientType, GetClientIP(r))
+		SendSubscribeFetchNotification(r.Context(), h.repo, username, clientType, GetClientIP(r))
 		if silentMgr := GetSilentModeManager(); silentMgr != nil && username != "" {
 			silentMgr.RecordSubscriptionAccessWithIP(username, GetClientIP(r))
 		}

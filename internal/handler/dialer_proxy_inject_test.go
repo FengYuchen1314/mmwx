@@ -9,12 +9,38 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"miaomiaowux/internal/storage"
 )
+
+func TestBuildSubscribeFetchNotificationIncludesPackageTraffic(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "subscribe-notify.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	if err := repo.CreateUser(ctx, "alice", "", "alice", "hash", storage.RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	pkgID, err := repo.CreatePackage(ctx, storage.Package{Name: "100GB 月付", TrafficLimitBytes: 100 * 1024 * 1024 * 1024, CycleDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AssignPackageToUser(ctx, "alice", pkgID, time.Now(), time.Now().AddDate(0, 0, 30), true, 1); err != nil {
+		t.Fatal(err)
+	}
+	message := buildSubscribeFetchNotification(ctx, repo, "alice", "Clash", "203.0.113.1")
+	for _, want := range []string{"套餐: `100GB 月付`", "流量: `0.00 GB / 100.00 GB`", "剩余: `100.00 GB`"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("notification missing %q:\n%s", want, message)
+		}
+	}
+}
 
 func TestTrafficLimitEnforcerSuspendsSharedRoutedSubaccount(t *testing.T) {
 	var mu sync.Mutex

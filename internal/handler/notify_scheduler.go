@@ -597,11 +597,57 @@ func SendLoginNotification(ctx context.Context, username, ip string) {
 	)
 }
 
-func SendSubscribeFetchNotification(ctx context.Context, username, clientType, ip string) {
+func SendSubscribeFetchNotification(ctx context.Context, repo *storage.TrafficRepository, username, clientType, ip string) {
+	message := buildSubscribeFetchNotification(ctx, repo, username, clientType, ip)
 	notifyAsync(ctx, notify.EventSubscribeFetch,
 		"订阅获取",
-		fmt.Sprintf("用户: `%s`\n客户端: `%s`\nIP: `%s`", username, clientType, ip),
+		message,
 	)
+}
+
+func buildSubscribeFetchNotification(ctx context.Context, repo *storage.TrafficRepository, username, clientType, ip string) string {
+	safeCode := func(value string) string { return strings.ReplaceAll(value, "`", "'") }
+	lines := []string{
+		fmt.Sprintf("用户: `%s`", safeCode(username)),
+		fmt.Sprintf("客户端: `%s`", safeCode(clientType)),
+		fmt.Sprintf("IP: `%s`", safeCode(ip)),
+	}
+	if repo == nil || strings.TrimSpace(username) == "" {
+		return strings.Join(lines, "\n")
+	}
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		return strings.Join(lines, "\n")
+	}
+	packageName := "未绑定"
+	var pkg *storage.Package
+	if user.PackageID > 0 {
+		if loaded, loadErr := repo.GetPackage(ctx, user.PackageID); loadErr == nil && loaded != nil {
+			pkg = loaded
+			packageName = loaded.Name
+		}
+	}
+	lines = append(lines, fmt.Sprintf("套餐: `%s`", safeCode(packageName)))
+	used, trafficErr := repo.GetUserBillableTraffic(ctx, username)
+	if trafficErr != nil {
+		lines = append(lines, "流量: `读取失败`")
+		return strings.Join(lines, "\n")
+	}
+	usedGB := float64(used) / (1024 * 1024 * 1024)
+	limit := resolveTrafficLimitBytes(&user, pkg)
+	if limit <= 0 {
+		lines = append(lines, fmt.Sprintf("流量: `%.2f GB / 不限量`", usedGB))
+		return strings.Join(lines, "\n")
+	}
+	remaining := limit - used
+	if remaining < 0 {
+		remaining = 0
+	}
+	lines = append(lines,
+		fmt.Sprintf("流量: `%.2f GB / %.2f GB`", usedGB, float64(limit)/(1024*1024*1024)),
+		fmt.Sprintf("剩余: `%.2f GB`", float64(remaining)/(1024*1024*1024)),
+	)
+	return strings.Join(lines, "\n")
 }
 
 // ============ Phase 2: 9 个新通知 helper ============

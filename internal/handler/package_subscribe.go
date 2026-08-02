@@ -208,7 +208,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		if ua == "" {
 			ua = "unknown"
 		}
-		SendSubscribeFetchNotification(r.Context(), username, ua, GetClientIP(r))
+		SendSubscribeFetchNotification(r.Context(), h.repo, username, ua, GetClientIP(r))
 		if silentMgr := GetSilentModeManager(); silentMgr != nil {
 			silentMgr.RecordSubscriptionAccessWithIP(username, GetClientIP(r))
 		}
@@ -269,7 +269,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	if ua == "" {
 		ua = "unknown"
 	}
-	SendSubscribeFetchNotification(r.Context(), username, ua, GetClientIP(r))
+	SendSubscribeFetchNotification(r.Context(), h.repo, username, ua, GetClientIP(r))
 	if silentMgr := GetSilentModeManager(); silentMgr != nil {
 		silentMgr.RecordSubscriptionAccessWithIP(username, GetClientIP(r))
 	}
