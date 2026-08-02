@@ -11,7 +11,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"miaomiaowux/internal/notify"
@@ -216,5 +215,3 @@ func FinishPendingMasterHTTPSRecovery(ctx context.Context, repo *storage.Traffic
 	log.Printf("[Master HTTPS Recovery] 主控HTTPS故障，已恢复HTTP模式: %s (%s)", masterURL, reason)
 	_ = repo.SetSystemSetting(ctx, settingRecoveryPending, "0")
 }
-
-func SignalGracefulRestart() error { return syscall.Kill(syscall.Getpid(), syscall.SIGTERM) }
