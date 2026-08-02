@@ -38,6 +38,7 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildCertDeploy, manageHandler.HandleCertDeploy)
 	mux.HandleFunc(constants.PathChildNginxSetup, manageHandler.HandleNginxSetupSSL)
 	mux.HandleFunc(constants.PathChildNginxServersList, manageHandler.HandleNginxServersList)
+	mux.HandleFunc(constants.PathChildNginxWebsites, manageHandler.HandleNginxWebsites)
 	mux.HandleFunc(constants.PathChildDomainProbe, manageHandler.HandleDomainLatencyProbe)
 	mux.HandleFunc(constants.PathChildNginxClearStream, manageHandler.HandleClearStreamPort)
 	mux.HandleFunc(constants.PathChildValidateSite, manageHandler.HandleValidateSite)
@@ -45,6 +46,7 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildSwitchXrayMode, manageHandler.HandleSwitchXrayMode)
 	mux.HandleFunc(constants.PathChildSwitchListenPort, manageHandler.HandleSwitchListenPort)
 	mux.HandleFunc(constants.PathChildUpdateMasterURL, manageHandler.HandleUpdateMasterURL)
+	mux.HandleFunc(constants.PathChildProbeMasterURL, manageHandler.HandleProbeMasterURL)
 	mux.HandleFunc(constants.PathChildTakeoverXray, manageHandler.HandleTakeoverExternalXray)
 
 	// SSE 流式安装和卸载接口

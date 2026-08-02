@@ -45,6 +45,8 @@ type ManageHandler struct {
 	embeddedXray        *embedded.EmbeddedXray
 	embeddedMu          sync.Mutex
 	onEmbeddedXrayStart func(*embedded.EmbeddedXray)
+	onMasterURLChanged  func(string)
+	probeMasterURL      func(context.Context, string) (time.Duration, error)
 	// inboundsMu 串行化所有 manageInbound 操作(包括新的 add-client/remove-client),
 	// 防止主控并发绑多个用户时:1) 配置文件 read-modify-write 撕裂;
 	// 2) 主控旧 GET→remove+add 路径下相互覆盖丢 client。
@@ -55,6 +57,11 @@ type ManageHandler struct {
 	// xrayAccessLogPath 是内嵌 xray 的 access log 文件(见 config.XrayAccessLogPathFor)。
 	// 内嵌模式下 service=xray 读它,而不是查 journalctl -u xray(那个 unit 不存在)。
 	xrayAccessLogPath string
+}
+
+func (h *ManageHandler) OnMasterURLChanged(fn func(string)) { h.onMasterURLChanged = fn }
+func (h *ManageHandler) OnProbeMasterURL(fn func(context.Context, string) (time.Duration, error)) {
+	h.probeMasterURL = fn
 }
 
 // SetLogPath 注入 agent 自身日志文件路径,供 HandleGetLogs 读取。
@@ -221,13 +228,9 @@ func (h *ManageHandler) removeFallback443() {
 }
 
 func (h *ManageHandler) reloadNginx() {
-	for _, bin := range constants.NginxBinarySearchPaths {
-		if p, err := exec.LookPath(bin); err == nil {
-			_ = exec.Command(p, "-s", "reload").Run()
-			return
-		}
+	if err := nginxReload(); err != nil {
+		log.Printf("[NginxManager] reload failed: %v", err)
 	}
-	_ = exec.Command("systemctl", "reload", "nginx").Run()
 }
 
 // lazyStartEmbeddedXray 在 embedded 模式下延迟初始化 xray 实例。
@@ -450,7 +453,6 @@ func (h *ManageHandler) getNginxStatus() *ServiceStatus {
 	if nginxInstalling.Load() {
 		status.Version = "安装中..."
 	}
-
 	// 优先使用 systemctl 检查
 	cmd := exec.Command("systemctl", "is-active", "nginx")
 	output, _ := cmd.Output()
@@ -1198,6 +1200,16 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusConflict, "Nginx installation already in progress")
 		return
 	}
+	// User-installed nginx is a valid website host. Do not run the MMWX install
+	// script over it; website discovery separately verifies whether its main
+	// config includes the managed servers directory.
+	if bin := findNginxBinary(); bin != "" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Nginx already installed at " + bin,
+		})
+		return
+	}
 
 	var req struct {
 		Domain string `json:"domain"`
@@ -1230,7 +1242,20 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 		cmd.Stderr = &stderr
 
 		if err := cmd.Run(); err != nil {
-			log.Printf("[Manage] Nginx installation failed: %v, stderr: %s", err, stderr.String())
+			// NAT/Alpine/minimal systems may successfully install the binary and
+			// config, then fail only at the script's systemctl step. Detect that
+			// state and finish with OpenRC/SysV/direct command management.
+			if findNginxBinary() == "" {
+				log.Printf("[Manage] full Nginx installer failed: %v, trying package manager fallback", err)
+				if packageErr := installNginxPackage(); packageErr != nil {
+					log.Printf("[Manage] Nginx package fallback failed: %v, installer stderr: %s", packageErr, stderr.String())
+					return
+				}
+			}
+			log.Printf("[Manage] install script service step failed; nginx binary exists, using manager=%s", detectNginxManager())
+		}
+		if err := nginxStart(); err != nil {
+			log.Printf("[Manage] Nginx installed but start failed: %v", err)
 			return
 		}
 		log.Printf("[Manage] Nginx installed successfully")
@@ -4862,9 +4887,12 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 	}
 	log.Printf("[Manage] setup-ssl confDir=%s authoritative=%v (domain=%s)", confDir, confDirAuthoritative, domain)
 
-	// 确保证书和 servers 目录存在
+	// 用户安装的发行版 nginx 通常 include conf.d/*.conf，MMWX 编译版则
+	// include servers/*.conf。写入实际被主配置 include 的目录。
+	managedServerDir := nginxManagedServerDir()
+	// 确保证书和网站配置目录存在
 	os.MkdirAll(filepath.Join(confDir, "cert"), 0755)
-	os.MkdirAll(filepath.Join(confDir, "servers"), 0755)
+	os.MkdirAll(managedServerDir, 0755)
 
 	if req.NginxConfig != "" {
 		// 下发主 nginx.conf
@@ -4881,7 +4909,7 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 
 	if req.DomainConfig != "" {
 		// 下发域名 server 配置到 servers/{domain}.conf
-		domainConfPath := filepath.Join(confDir, "servers", domain+".conf")
+		domainConfPath := filepath.Join(managedServerDir, domain+".conf")
 		if err := os.WriteFile(domainConfPath, []byte(req.DomainConfig), 0644); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to write domain config: %v", err))
 			return
@@ -5071,12 +5099,7 @@ func detectNginxConfDirFromBinary() string {
 }
 
 func reloadNginx() error {
-	for _, bin := range constants.NginxBinarySearchPaths {
-		if path, err := exec.LookPath(bin); err == nil {
-			return runCommand(path, "-s", "reload")
-		}
-	}
-	return runCommand("systemctl", "reload", "nginx")
+	return nginxReload()
 }
 
 func runCommand(name string, args ...string) error {
@@ -5839,6 +5862,36 @@ func (h *ManageHandler) HandleSwitchListenPort(w http.ResponseWriter, r *http.Re
 
 // HandleUpdateMasterURL 处理 POST /api/child/agent/update-master-url。
 // 更新 config.yaml 中的 master_url 并重启 agent。
+func (h *ManageHandler) HandleProbeMasterURL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	var req struct {
+		MasterURL string `json:"master_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !util.IsHTTPURL(strings.TrimSpace(req.MasterURL)) {
+		writeError(w, http.StatusBadRequest, "master_url must be a valid HTTP(S) URL")
+		return
+	}
+	if h.probeMasterURL == nil {
+		writeError(w, http.StatusServiceUnavailable, "master probe is not ready")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	latency, err := h.probeMasterURL(ctx, strings.TrimRight(strings.TrimSpace(req.MasterURL), "/"))
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"success": false, "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "latency_ms": latency.Milliseconds()})
+}
+
 func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -5850,7 +5903,8 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 	}
 
 	var req struct {
-		MasterURL string `json:"master_url"`
+		MasterURL      string `json:"master_url"`
+		OnlyIfRecovery bool   `json:"only_if_recovery"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MasterURL == "" {
 		writeError(w, http.StatusBadRequest, "master_url required")
@@ -5873,6 +5927,25 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Read config: %v", err))
 		return
+	}
+	if req.OnlyIfRecovery {
+		var currentURL, recoveryURL string
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			switch {
+			case strings.HasPrefix(trimmed, "master_url:"):
+				currentURL = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "master_url:")), `"'`)
+			case strings.HasPrefix(trimmed, "recovery_url:"):
+				recoveryURL = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "recovery_url:")), `"'`)
+			}
+		}
+		if recoveryURL == "" || !sameMasterURL(currentURL, recoveryURL) {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true, "unchanged": true,
+				"message": "working non-recovery master_url preserved",
+			})
+			return
+		}
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -5907,18 +5980,22 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": fmt.Sprintf("master_url updated to %s, agent restarting...", req.MasterURL),
+		"message": fmt.Sprintf("master_url updated to %s, reconnecting...", req.MasterURL),
 	})
 
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	// 不用 exec systemctl restart;直接 os.Exit,systemd Restart=always 拉起新实例。
-	go func() {
-		time.Sleep(500 * time.Millisecond)
-		log.Printf("[Manage] Exiting for master_url update (systemd will restart)")
-		os.Exit(0)
-	}()
+	// Delay until the RPC response has left the current WebSocket, then reconnect
+	// in-process. This keeps embedded Xray running and also works in containers
+	// without systemd or a restart policy.
+	if h.onMasterURLChanged != nil {
+		newURL := req.MasterURL
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			h.onMasterURLChanged(newURL)
+		}()
+	}
 }
 
 func sameMasterURL(a, b string) bool {

@@ -38,6 +38,10 @@ const (
 	// PathChildNginxServersList 列出 setup-ssl 实际写入的 servers/ 目录里所有 *.conf,
 	// 用于前端在 wss 提交前检测目标域名是否已被(reality / 旧 wss)占用。
 	PathChildNginxServersList = "/api/child/nginx/servers-list"
+	// PathChildNginxWebsites scans and safely manages domain configs deployed in
+	// the active nginx servers directory. GET=list/environment, DELETE=remove a
+	// managed standalone website with nginx -t/reload rollback.
+	PathChildNginxWebsites    = "/api/child/nginx/websites"
 	PathChildDomainProbe      = "/api/child/domains/latency"
 	PathChildNginxClearStream = "/api/child/nginx/clear-stream-port"
 	PathChildValidateSite     = "/api/child/validate-site"
@@ -45,6 +49,7 @@ const (
 	PathChildSwitchXrayMode   = "/api/child/agent/switch-xray-mode"
 	PathChildSwitchListenPort = "/api/child/agent/switch-listen-port"
 	PathChildUpdateMasterURL  = "/api/child/agent/update-master-url"
+	PathChildProbeMasterURL   = "/api/child/agent/probe-master-url"
 	PathChildTakeoverXray     = "/api/child/external-xray/takeover"
 	// PathChildBatchApply 一次性提交多个 inbound add-client + routing rule add_user 改动,
 	// 在 inboundsMu 锁内单次读 config + 单次写盘 + per-inbound runtime apply 完成。

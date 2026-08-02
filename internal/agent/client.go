@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto/ed25519"
@@ -142,7 +143,9 @@ type Client struct {
 
 	// onXrayAuthChange 由 main.go 注入:主控下发的许可证配额授权变化时调用(true=授权→确保 xray 运行,
 	// false=超额→停 xray)。Client 不直接持 ManageHandler 引用,故用回调解耦(仿 onWSConnected 范式)。
-	onXrayAuthChange func(authorized bool)
+	onXrayAuthChange  func(authorized bool)
+	lastMasterContact atomic.Int64
+	recoveryActivated atomic.Bool
 }
 
 // SetXrayAuthHandler 注入「许可证配额授权变化 → 停/启 xray」回调。main.go 启动时调一次。
@@ -180,8 +183,8 @@ func (c *Client) getPublicIPv6() string {
 }
 
 // sameHostAsMaster 判断主控是否与本 agent 同机 —— 「反代主控」的硬前提(proxy_pass 127.0.0.1 才通)。
-// 只做非阻塞判断:master_url host 是 localhost/127.0.0.1/::1,或等于本机已探测到的公网 IPv4/v6。
-// 不 resolve 域名(避免阻塞心跳);宿主机反代主控的推荐配置是 master_url=http://127.0.0.1:<port>。
+// master_url host 是 localhost/127.0.0.1/::1、等于本机公网 IP，或域名解析结果
+// 命中本机公网 IP时视为同机。DNS 查询限制为 1 秒，避免网络异常拖住心跳。
 func (c *Client) sameHostAsMaster() bool {
 	u, err := url.Parse(c.config.MasterURL)
 	if err != nil {
@@ -199,6 +202,18 @@ func (c *Client) sameHostAsMaster() bool {
 	}
 	if v6 := c.getPublicIPv6(); v6 != "" && host == v6 {
 		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resolved, err := net.DefaultResolver.LookupHost(ctx, host)
+	if err != nil {
+		return false
+	}
+	v4, v6 := c.getPublicIPv4(), c.getPublicIPv6()
+	for _, ip := range resolved {
+		if (v4 != "" && ip == v4) || (v6 != "" && ip == v6) {
+			return true
+		}
 	}
 	return false
 }
@@ -287,6 +302,7 @@ func NewClient(cfg *config.Config) *Client {
 		currentMode:     ModePull,
 		reconnectSignal: make(chan struct{}, 1),
 	}
+	c.lastMasterContact.Store(time.Now().Unix())
 	// httpClient 用跟 WS 同款的 v4 优先 dialer — 否则 Go 默认 dialer 在 dual-stack 主机上
 	// Happy Eyeballs 偏好 v6,HTTP heartbeat 全程走 v6 → master 看 RemoteAddr 是 v6 →
 	// db.ip_address 误写 v6 → IPv4-only master 反向请求 502。
@@ -342,6 +358,7 @@ func (c *Client) Start(ctx context.Context) {
 	// 后台 IP detect 循环 — 启动时立即跑一次,失败时 30s 重试,直到拿到 v4 / v6。
 	// 不阻塞 WS / HTTP / pull 模式的握手路径。
 	c.startIPProbeLoop(ctx)
+	go c.runMasterRecoveryLoop(ctx)
 
 	// 伪装探针 ping 循环(独立于 traffic tick)。未开启 ping 时循环空转,开销可忽略。
 	go c.runProbePingLoop()
@@ -385,6 +402,76 @@ func (c *Client) triggerReconnect() {
 	case c.reconnectSignal <- struct{}{}:
 	default:
 	}
+}
+
+// ApplyMasterURL applies an address already persisted by the management handler
+// and reconnects immediately, without restarting the Agent or embedded Xray.
+func (c *Client) ApplyMasterURL(masterURL string) {
+	c.config.MasterURL = strings.TrimRight(strings.TrimSpace(masterURL), "/")
+	c.recoveryActivated.Store(false)
+	c.wsMu.Lock()
+	if c.wsConn != nil {
+		_ = c.wsConn.Close()
+	}
+	c.wsMu.Unlock()
+	c.triggerReconnect()
+}
+
+// ProbeMasterURL verifies that a candidate is not merely an HTTP server but a
+// restored master that accepts this Agent's existing token.
+func (c *Client) ProbeMasterURL(ctx context.Context, masterURL string) (time.Duration, error) {
+	u, err := url.Parse(strings.TrimRight(strings.TrimSpace(masterURL), "/"))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return 0, fmt.Errorf("invalid master URL")
+	}
+	if u.Scheme == "http" {
+		u.Scheme = "ws"
+	} else {
+		u.Scheme = "wss"
+	}
+	u.Path = constants.PathRemoteWebSocket
+	started := time.Now()
+	conn, _, err := (&websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		NetDialContext:   c.preferV4DialContext,
+	}).DialContext(ctx, u.String(), c.wsHeaders())
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	authPayload, _ := json.Marshal(map[string]interface{}{"token": c.config.Token, "probe": true})
+	authMessage, _ := json.Marshal(map[string]interface{}{"type": "auth", "payload": json.RawMessage(authPayload)})
+	if c.masterPubKey != nil {
+		session, keyErr := c.performKeyExchange(conn)
+		if keyErr != nil {
+			return 0, fmt.Errorf("key exchange failed: %w", keyErr)
+		}
+		envelope, encryptErr := session.Encrypt(authMessage)
+		if encryptErr != nil {
+			return 0, encryptErr
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, envelope); err != nil {
+			return 0, err
+		}
+	} else if err := conn.WriteMessage(websocket.TextMessage, authMessage); err != nil {
+		return 0, err
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, response, err := conn.ReadMessage()
+	if err != nil {
+		return 0, fmt.Errorf("agent authentication failed: %w", err)
+	}
+	var result struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Success bool   `json:"success"`
+			Message string `json:"message"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal(response, &result) != nil || result.Type != "auth_result" || !result.Payload.Success {
+		return 0, fmt.Errorf("agent authentication failed: %s", result.Payload.Message)
+	}
+	return time.Since(started), nil
 }
 
 // 停止客户端。
@@ -594,6 +681,7 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 	c.wsMu.Unlock()
 
 	log.Printf("[Agent] Connected and authenticated")
+	c.lastMasterContact.Store(time.Now().Unix())
 
 	// WS 鉴权成功:主控指令将走 WS 反向 RPC,入站端口不再需要 → 通知主程序(延迟)关闭监听。
 	if c.onWSConnected != nil {
@@ -613,6 +701,10 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 
 // 发送鉴权消息。
 func (c *Client) authenticate(conn *websocket.Conn) error {
+	return c.authenticateMode(conn, false)
+}
+
+func (c *Client) authenticateMode(conn *websocket.Conn, probe bool) error {
 	// auth 时把缓存的 public_ipv4 也带上,让 master 在第一次 heartbeat 到来之前(~10s 窗口)
 	// 就有正确的 v4 IP 可用,避开 master 重启 → preferV4DialContext 偶尔 v6 → auth 时 master
 	// 用 WS 源 IP (v6) 写 db → master 反向请求 agent 走 v6 → 失败 的时序问题。
@@ -632,6 +724,7 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 	}
 	authPayload, _ := json.Marshal(map[string]any{
 		"token":               c.config.Token,
+		"probe":               probe,
 		"public_ipv4":         publicIPv4,
 		"public_ipv6":         publicIPv6,
 		"warp_installed":      warpInstalled,
@@ -1091,25 +1184,34 @@ func (c *Client) GetEmbeddedXray() *embedded.EmbeddedXray {
 
 // 采集本机 Xray 流量指标。
 func (c *Client) collectLocalMetrics() (*collector.XrayStats, error) {
-	// 嵌入模式：直接从 stats.Manager 读取
-	if c.embeddedXray != nil {
-		stats := c.embeddedXray.CollectStats()
-		if stats != nil {
-			return stats, nil
-		}
+	emptyStats := func() *collector.XrayStats {
 		return &collector.XrayStats{
 			Inbound:  make(map[string]collector.TrafficData),
 			Outbound: make(map[string]collector.TrafficData),
 			User:     make(map[string]collector.TrafficData),
-		}, nil
+		}
+	}
+
+	// 嵌入模式必须以配置为准。Xray 未启动、启动失败或因授权被停用时，
+	// embeddedXray 会是 nil；此时直接返回空统计，不能错误回退到外部模式，
+	// 否则流量定时器会持续请求 127.0.0.1:38889/debug/vars 并刷错误日志。
+	if c.config.XrayMode == "embedded" {
+		if c.embeddedXray == nil || !c.embeddedXray.IsRunning() {
+			return emptyStats(), nil
+		}
+		stats := c.embeddedXray.CollectStats()
+		if stats != nil {
+			return stats, nil
+		}
+		return emptyStats(), nil
 	}
 
 	// 外部模式：通过 HTTP /debug/vars 拉取
-	stats := &collector.XrayStats{
-		Inbound:  make(map[string]collector.TrafficData),
-		Outbound: make(map[string]collector.TrafficData),
-		User:     make(map[string]collector.TrafficData),
+	// 先检查进程，未运行时跳过本轮；下一轮会重新检测，启动后自动恢复采集。
+	if len(discovery.FindXrayPIDs()) == 0 {
+		return emptyStats(), nil
 	}
+	stats := emptyStats()
 
 	for _, server := range c.xrayServers {
 		host, port, err := c.collector.GetMetricsPortFromConfig(server.ConfigPath)
@@ -1449,8 +1551,10 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 		return err
 	}
 
+	c.lastMasterContact.Store(time.Now().Unix())
 	var hbResp struct {
-		ServerTime int64 `json:"server_time"`
+		ServerTime int64  `json:"server_time"`
+		MasterURL  string `json:"master_url"`
 	}
 	if err := json.Unmarshal(respBody, &hbResp); err == nil && hbResp.ServerTime > 0 {
 		if drift := time.Now().Unix() - hbResp.ServerTime; drift > 10 || drift < -10 {
@@ -1458,6 +1562,91 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 		}
 	}
 
+	return nil
+}
+
+// runMasterRecoveryLoop is deliberately independent from connection_mode. It is only
+// armed after five minutes without any authenticated WS/HTTP contact and can therefore
+// rescue explicit websocket/http/pull configurations as well as auto mode.
+func (c *Client) runMasterRecoveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			// 长期使用 HTTP+端口属于正常部署方式，不是 HTTPS 故障。
+			// 这种情况下只继续重连 master_url，绝不进入降级流程或改写地址。
+			if !c.httpsRecoveryEligible() {
+				continue
+			}
+			if strings.TrimSpace(c.config.RecoveryURL) == "" {
+				continue
+			}
+			if time.Since(time.Unix(c.lastMasterContact.Load(), 0)) < 5*time.Minute || c.recoveryActivated.Load() {
+				continue
+			}
+			if err := c.tryRecoveryHeartbeat(ctx); err != nil {
+				debugLogf("[Agent] master HTTP recovery probe failed: %v", err)
+			}
+		}
+	}
+}
+
+func (c *Client) httpsRecoveryEligible() bool {
+	u, err := url.Parse(strings.TrimSpace(c.config.MasterURL))
+	return err == nil && strings.EqualFold(u.Scheme, "https") && u.Host != ""
+}
+
+func (c *Client) tryRecoveryHeartbeat(ctx context.Context) error {
+	// 再检查一次，避免 ticker 判断后 master_url 被配置更新切换为 HTTP，
+	// 或其它调用方绕过恢复循环直接触发降级探测。
+	if !c.httpsRecoveryEligible() {
+		return fmt.Errorf("HTTPS recovery is disabled for a non-HTTPS master URL")
+	}
+	recovery := strings.TrimRight(strings.TrimSpace(c.config.RecoveryURL), "/")
+	u, err := url.Parse(recovery)
+	if err != nil || u.Scheme != "http" || u.Hostname() == "" {
+		return fmt.Errorf("invalid recovery_url")
+	}
+	u.Path = constants.PathRemoteHeartbeat
+	listenPort, _ := strconv.Atoi(c.config.ListenPort)
+	payload, _ := json.Marshal(map[string]interface{}{"boot_time": c.startTime.Unix(), "listen_port": listenPort, "local_time": time.Now().Unix(), "public_ipv4": c.getPublicIPv4(), "public_ipv6": c.getPublicIPv6(), "recovery_probe": true})
+	body, err := c.doEncryptedHTTP(ctx, u.String(), payload)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Success   bool   `json:"success"`
+		MasterURL string `json:"master_url"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || !resp.Success {
+		return fmt.Errorf("invalid recovery response")
+	}
+	// The authenticated fallback path itself is alive. Even when the master still
+	// advertises HTTPS (no recovery transition), avoid probing it every 30 seconds.
+	c.lastMasterContact.Store(time.Now().Unix())
+	newURL := strings.TrimRight(strings.TrimSpace(resp.MasterURL), "/")
+	if newURL == "" {
+		newURL = recovery
+	}
+	if !strings.HasPrefix(newURL, "http://") {
+		return fmt.Errorf("master did not enter HTTP recovery mode")
+	}
+	if !c.recoveryActivated.CompareAndSwap(false, true) {
+		return nil
+	}
+	if err := c.persistConfigField("master_url", newURL); err != nil {
+		c.recoveryActivated.Store(false)
+		return err
+	}
+	c.config.MasterURL = newURL
+	c.lastMasterContact.Store(time.Now().Unix())
+	log.Printf("[Agent] master HTTPS unavailable; switched to recovery URL %s", newURL)
+	c.triggerReconnect()
 	return nil
 }
 
@@ -2405,6 +2594,16 @@ func (c *Client) sendScanResult(conn *websocket.Conn) {
 }
 
 func (c *Client) handleConfigUpdate(updates map[string]string) {
+	if recoveryURL, ok := updates["recovery_url"]; ok && strings.TrimSpace(recoveryURL) != "" && recoveryURL != c.config.RecoveryURL {
+		if u, err := url.Parse(recoveryURL); err == nil && u.Scheme == "http" && u.Hostname() != "" {
+			c.config.RecoveryURL = strings.TrimRight(recoveryURL, "/")
+			if err := c.persistConfigField("recovery_url", c.config.RecoveryURL); err != nil {
+				log.Printf("[Agent] Failed to persist recovery_url: %v", err)
+			} else {
+				log.Printf("[Agent] Updated HTTP recovery URL")
+			}
+		}
+	}
 	if stealMode, ok := updates["steal_mode"]; ok && stealMode != c.config.StealMode {
 		c.config.StealMode = stealMode
 		if err := c.persistConfigField("steal_mode", stealMode); err != nil {
