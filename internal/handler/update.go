@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -19,8 +20,16 @@ import (
 )
 
 const (
-	githubRepo   = "iluobei/miaomiaowuX"
-	githubAPIURL = "https://api.github.com/repos/%s/releases/latest"
+	githubRepo           = "iluobei/miaomiaowuX"
+	githubAPIURL         = "https://api.github.com/repos/%s/releases/latest"
+	githubReleasesAPIURL = "https://api.github.com/repos/%s/releases?per_page=30"
+)
+
+type UpdateChannel string
+
+const (
+	UpdateChannelStable     UpdateChannel = "stable"
+	UpdateChannelPrerelease UpdateChannel = "prerelease"
 )
 
 // UpdateInfo包含版本更新信息
@@ -31,6 +40,8 @@ type UpdateInfo struct {
 	ReleaseURL     string `json:"release_url"`
 	DownloadURL    string `json:"download_url"`
 	ReleaseNotes   string `json:"release_notes"`
+	Channel        string `json:"channel"`
+	Prerelease     bool   `json:"prerelease"`
 }
 
 // UpdateProgress 表示更新操作的进度
@@ -42,10 +53,12 @@ type UpdateProgress struct {
 
 // GitHubRelease 表示版本的 GitHub API 响应
 type GitHubRelease struct {
-	TagName string `json:"tag_name"`
-	HTMLURL string `json:"html_url"`
-	Body    string `json:"body"`
-	Assets  []struct {
+	TagName    string `json:"tag_name"`
+	HTMLURL    string `json:"html_url"`
+	Body       string `json:"body"`
+	Draft      bool   `json:"draft"`
+	Prerelease bool   `json:"prerelease"`
+	Assets     []struct {
 		Name               string `json:"name"`
 		BrowserDownloadURL string `json:"browser_download_url"`
 	} `json:"assets"`
@@ -59,7 +72,8 @@ func NewUpdateCheckHandler() http.Handler {
 			return
 		}
 
-		info, err := checkLatestVersion()
+		channel := parseUpdateChannel(r.URL.Query().Get("channel"))
+		info, err := checkLatestVersion(channel)
 		if err != nil {
 			writeUpdateError(w, http.StatusInternalServerError, fmt.Errorf("检查更新失败: %w", err))
 			return
@@ -80,7 +94,8 @@ func NewUpdateApplyHandler() http.Handler {
 		}
 
 		// 1.获取最新版本信息
-		info, err := checkLatestVersion()
+		channel := parseUpdateChannel(r.URL.Query().Get("channel"))
+		info, err := checkLatestVersion(channel)
 		if err != nil {
 			writeUpdateError(w, http.StatusInternalServerError, fmt.Errorf("检查更新失败: %w", err))
 			return
@@ -179,7 +194,8 @@ func NewUpdateApplySSEHandler() http.Handler {
 
 		force := r.URL.Query().Get("force") == "true"
 
-		info, err := checkLatestVersion()
+		channel := parseUpdateChannel(r.URL.Query().Get("channel"))
+		info, err := checkLatestVersion(channel)
 		if err != nil {
 			sendProgress("error", 0, fmt.Sprintf("检查更新失败: %v", err))
 			return
@@ -187,6 +203,10 @@ func NewUpdateApplySSEHandler() http.Handler {
 
 		if !info.HasUpdate && !force {
 			sendProgress("error", 0, "已是最新版本")
+			return
+		}
+		if target := strings.TrimPrefix(strings.TrimSpace(r.URL.Query().Get("target")), "v"); target != "" && target != info.LatestVersion {
+			sendProgress("error", 0, "目标版本已变化，请重新检查更新")
 			return
 		}
 
@@ -265,20 +285,31 @@ func NewUpdateApplySSEHandler() http.Handler {
 
 // 从 GitHub 获取最新版本信息
 // checkLatestVersion:优先走更新 CDN(绕开 GitHub 限流),失败/未配置则回退 GitHub API。
-func checkLatestVersion() (*UpdateInfo, error) {
+func parseUpdateChannel(raw string) UpdateChannel {
+	if strings.EqualFold(strings.TrimSpace(raw), string(UpdateChannelPrerelease)) {
+		return UpdateChannelPrerelease
+	}
+	return UpdateChannelStable
+}
+
+func checkLatestVersion(channel UpdateChannel) (*UpdateInfo, error) {
 	if cdn := UpdateCDNBase(); cdn != "" {
-		if info, err := checkLatestVersionCDN(cdn); err == nil {
+		if info, err := checkLatestVersionCDN(cdn, channel); err == nil {
 			return info, nil
 		} else {
 			logger.Info("[系统更新] CDN 版本检查失败,回退 GitHub", "error", err.Error())
 		}
 	}
-	return checkLatestVersionGitHub()
+	return checkLatestVersionGitHub(channel)
 }
 
 // checkLatestVersionCDN 从 {cdn}/miaomiaowux/version.json 拿版本,下载 URL 指向同目录的固定命名二进制。
-func checkLatestVersionCDN(cdn string) (*UpdateInfo, error) {
-	meta, err := fetchCDNVersion(cdn, "miaomiaowux")
+func checkLatestVersionCDN(cdn string, channel UpdateChannel) (*UpdateInfo, error) {
+	project := "miaomiaowux"
+	if channel == UpdateChannelPrerelease {
+		project += "/channels/prerelease"
+	}
+	meta, err := fetchCDNVersion(cdn, project)
 	if err != nil {
 		return nil, err
 	}
@@ -289,13 +320,18 @@ func checkLatestVersionCDN(cdn string) (*UpdateInfo, error) {
 		LatestVersion:  latestVersion,
 		HasUpdate:      compareVersions(version.Version, latestVersion),
 		ReleaseURL:     meta.HTMLURL,
-		DownloadURL:    cdn + "/miaomiaowux/" + binaryName,
+		DownloadURL:    cdn + "/miaomiaowux/releases/" + strings.TrimPrefix(meta.Version, "v") + "/" + binaryName,
 		ReleaseNotes:   meta.Notes,
+		Channel:        string(channel),
+		Prerelease:     strings.Contains(latestVersion, "-"),
 	}, nil
 }
 
-func checkLatestVersionGitHub() (*UpdateInfo, error) {
+func checkLatestVersionGitHub(channel UpdateChannel) (*UpdateInfo, error) {
 	url := fmt.Sprintf(githubAPIURL, githubRepo)
+	if channel == UpdateChannelPrerelease {
+		url = fmt.Sprintf(githubReleasesAPIURL, githubRepo)
+	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -316,7 +352,23 @@ func checkLatestVersionGitHub() (*UpdateInfo, error) {
 	}
 
 	var release GitHubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if channel == UpdateChannelPrerelease {
+		var releases []GitHubRelease
+		if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+			return nil, fmt.Errorf("解析 GitHub 响应失败: %w", err)
+		}
+		candidates := releases[:0]
+		for _, item := range releases {
+			if !item.Draft && parseSemVersion(item.TagName).valid {
+				candidates = append(candidates, item)
+			}
+		}
+		if len(candidates) == 0 {
+			return nil, errors.New("没有找到可用的发布版本")
+		}
+		sort.SliceStable(candidates, func(i, j int) bool { return compareSemVersion(candidates[i].TagName, candidates[j].TagName) > 0 })
+		release = candidates[0]
+	} else if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		return nil, fmt.Errorf("解析 GitHub 响应失败: %w", err)
 	}
 
@@ -343,44 +395,92 @@ func checkLatestVersionGitHub() (*UpdateInfo, error) {
 		ReleaseURL:     release.HTMLURL,
 		DownloadURL:    downloadURL,
 		ReleaseNotes:   release.Body,
+		Channel:        string(channel),
+		Prerelease:     release.Prerelease,
 	}, nil
 }
 
 // 如果最新 > 当前，compareVersions 返回 true
 func compareVersions(current, latest string) bool {
-	currentParts := parseVersion(current)
-	latestParts := parseVersion(latest)
-
-	for i := 0; i < len(latestParts) || i < len(currentParts); i++ {
-		var cp, lp int
-		if i < len(currentParts) {
-			cp = currentParts[i]
-		}
-		if i < len(latestParts) {
-			lp = latestParts[i]
-		}
-
-		if lp > cp {
-			return true
-		}
-		if lp < cp {
-			return false
-		}
-	}
-	return false
+	return compareSemVersion(latest, current) > 0
 }
 
-// 将版本字符串拆分为整数部分
-func parseVersion(v string) []int {
-	v = strings.TrimPrefix(v, "v")
-	parts := strings.Split(v, ".")
-	result := make([]int, len(parts))
-	for i, p := range parts {
-		var num int
-		fmt.Sscanf(p, "%d", &num)
-		result[i] = num
+type semVersion struct {
+	major, minor, patch int
+	pre                 []string
+	valid               bool
+}
+
+func parseSemVersion(v string) semVersion {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	v = strings.SplitN(v, "+", 2)[0]
+	parts := strings.SplitN(v, "-", 2)
+	var out semVersion
+	if _, err := fmt.Sscanf(parts[0], "%d.%d.%d", &out.major, &out.minor, &out.patch); err != nil {
+		return out
 	}
-	return result
+	if parts[0] != fmt.Sprintf("%d.%d.%d", out.major, out.minor, out.patch) {
+		return out
+	}
+	if len(parts) == 2 {
+		if parts[1] == "" {
+			return out
+		}
+		out.pre = strings.Split(parts[1], ".")
+	}
+	out.valid = true
+	return out
+}
+
+func compareSemVersion(a, b string) int {
+	av, bv := parseSemVersion(a), parseSemVersion(b)
+	if !av.valid || !bv.valid {
+		return strings.Compare(a, b)
+	}
+	for _, pair := range [][2]int{{av.major, bv.major}, {av.minor, bv.minor}, {av.patch, bv.patch}} {
+		if pair[0] < pair[1] {
+			return -1
+		}
+		if pair[0] > pair[1] {
+			return 1
+		}
+	}
+	if len(av.pre) == 0 && len(bv.pre) > 0 {
+		return 1
+	}
+	if len(av.pre) > 0 && len(bv.pre) == 0 {
+		return -1
+	}
+	for i := 0; i < len(av.pre) || i < len(bv.pre); i++ {
+		if i >= len(av.pre) {
+			return -1
+		}
+		if i >= len(bv.pre) {
+			return 1
+		}
+		var ai, bi int
+		aNum, aErr := fmt.Sscanf(av.pre[i], "%d", &ai)
+		bNum, bErr := fmt.Sscanf(bv.pre[i], "%d", &bi)
+		if aErr == nil && bErr == nil && aNum == 1 && bNum == 1 {
+			if ai < bi {
+				return -1
+			}
+			if ai > bi {
+				return 1
+			}
+			continue
+		}
+		if aErr == nil {
+			return -1
+		}
+		if bErr == nil {
+			return 1
+		}
+		if cmp := strings.Compare(av.pre[i], bv.pre[i]); cmp != 0 {
+			return cmp
+		}
+	}
+	return 0
 }
 
 // downloadBinary 将二进制文件下载到临时文件

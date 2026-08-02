@@ -8,6 +8,8 @@
 #   bash scripts/release.sh minor     # bump minor (0.2.4 -> 0.3.0)
 #   bash scripts/release.sh major     # bump major (0.2.4 -> 1.0.0)
 #   bash scripts/release.sh 0.5.0     # 直接指定版本号
+#   bash scripts/release.sh prerelease # 发布下一个 beta 版本
+#   bash scripts/release.sh stable     # 将当前 beta/rc 版本转为稳定版
 #
 # 历史背景:之前从 miaomiaowux-frontend/package.json 用 npm version bump,前端迁私有 repo 后
 # 改成后端 internal/version/version.go 作唯一来源,bump 用纯 bash awk 解析 X.Y.Z 自增。
@@ -46,7 +48,27 @@ if [ -z "$CURRENT_VERSION" ]; then
 fi
 
 BUMP_ARG="${1:-patch}"
+RELEASE_KIND="stable"
 case "$BUMP_ARG" in
+  prerelease)
+    RELEASE_KIND="prerelease"
+    if [[ "$CURRENT_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-(beta|rc)\.([0-9]+)$ ]]; then
+      NEW_VERSION="${BASH_REMATCH[1]}-${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+    elif [[ "$CURRENT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+      NEW_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))-beta.1"
+    else
+      echo "[ERROR] 当前版本格式不支持自动生成预发布版: $CURRENT_VERSION"
+      exit 1
+    fi
+    ;;
+  stable)
+    if [[ "$CURRENT_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-(beta|rc)\.[0-9]+$ ]]; then
+      NEW_VERSION="${BASH_REMATCH[1]}"
+    else
+      echo "[ERROR] 当前版本不是 beta/rc，请使用 patch/minor/major 发布稳定版"
+      exit 1
+    fi
+    ;;
   major)
     NEW_VERSION=$(echo "$CURRENT_VERSION" | awk -F. '{printf "%d.0.0", $1+1}')
     ;;
@@ -187,7 +209,7 @@ gh release create "v${NEW_VERSION}" \
   --title "v${NEW_VERSION}" \
   --notes "$RELEASE_BODY" \
   --generate-notes \
-  --latest
+  $(if [ "$RELEASE_KIND" = "prerelease" ]; then echo "--prerelease"; else echo "--latest"; fi)
 
 echo ""
 echo "=== 发布完成! v${NEW_VERSION} ==="

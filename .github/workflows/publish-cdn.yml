@@ -28,6 +28,7 @@ jobs:
       TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
       NOTES: ${{ github.event.release.body }}
       URL: ${{ github.event.release.html_url }}
+      PRERELEASE: ${{ github.event.release.prerelease }}
       PROJECT: miaomiaowux
     steps:
       - name: Download release assets (mmwx-*) — 等 build.yml 传完再下,避免竞态
@@ -63,13 +64,18 @@ jobs:
           if [ -z "${URL:-}" ]; then
             URL=$(gh release view "$TAG" --repo "${{ github.repository }}" --json url --jq '.url' 2>/dev/null || echo "")
           fi
+          if [ -z "${PRERELEASE:-}" ]; then
+            PRERELEASE=$(gh release view "$TAG" --repo "${{ github.repository }}" --json isPrerelease --jq '.isPrerelease' 2>/dev/null || echo "false")
+          fi
+          echo "PRERELEASE=${PRERELEASE:-false}" >> "$GITHUB_ENV"
           # 用 jq -n + 环境变量构造,避免 release body 里的引号/换行破坏 JSON 或注入
           jq -n \
             --arg version "$TAG" \
             --arg tag "$TAG" \
             --arg notes "${NOTES:-}" \
             --arg html_url "${URL:-}" \
-            '{version:$version, tag:$tag, notes:$notes, html_url:$html_url}' > dist/version.json
+            --argjson prerelease "${PRERELEASE:-false}" \
+            '{version:$version, tag:$tag, notes:$notes, html_url:$html_url, prerelease:$prerelease}' > dist/version.json
           cat dist/version.json
 
       - name: Upload to R2 (S3-compatible)
@@ -80,18 +86,31 @@ jobs:
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          # 二进制:长缓存(内容随版本名变,可安全长缓存)
+          VERSION="${TAG#v}"
+          CHANNEL=stable
+          if [ "${PRERELEASE:-false}" = "true" ]; then CHANNEL=prerelease; fi
+
+          # 每个版本使用不可变目录，检查和安装始终指向同一个 release。
           for f in dist/mmwx-*; do
             [ -f "$f" ] || continue
             name=$(basename "$f")
-            aws s3 cp "$f" "s3://$BUCKET/$PROJECT/$name" \
+            aws s3 cp "$f" "s3://$BUCKET/$PROJECT/releases/$VERSION/$name" \
               --endpoint-url "$R2_ENDPOINT" \
               --content-type application/octet-stream \
-              --cache-control "public, max-age=86400"
+              --cache-control "public, max-age=31536000, immutable"
           done
-          # version.json:短缓存,发新版后 1 分钟内全球生效
-          aws s3 cp dist/version.json "s3://$BUCKET/$PROJECT/version.json" \
+          aws s3 cp dist/version.json "s3://$BUCKET/$PROJECT/channels/$CHANNEL/version.json" \
             --endpoint-url "$R2_ENDPOINT" \
             --content-type application/json \
             --cache-control "public, max-age=60"
-          echo "已发布到 R2: $PROJECT/ (tag=$TAG)"
+          # 兼容旧客户端：只有稳定版可以更新顶层索引及固定文件。
+          if [ "$CHANNEL" = "stable" ]; then
+            aws s3 cp dist/version.json "s3://$BUCKET/$PROJECT/version.json" \
+              --endpoint-url "$R2_ENDPOINT" --content-type application/json --cache-control "public, max-age=60"
+            for f in dist/mmwx-*; do
+              [ -f "$f" ] || continue
+              aws s3 cp "$f" "s3://$BUCKET/$PROJECT/$(basename "$f")" \
+                --endpoint-url "$R2_ENDPOINT" --content-type application/octet-stream --cache-control "public, max-age=86400"
+            done
+          fi
+          echo "已发布到 R2: $PROJECT/releases/$VERSION (channel=$CHANNEL)"
