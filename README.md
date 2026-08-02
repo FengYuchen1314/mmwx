@@ -170,6 +170,8 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.3 (2026-08-02)
+- 🛠️ fix: windows system.call 问题
 ### v0.4.2 (2026-08-02)
 - 🌈 TG相关功能增加超链接
 - 🌈 主控与agent互联优化
