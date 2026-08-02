@@ -154,7 +154,7 @@ type wssInboundInfo struct {
 //   - 根域必须有可用证书(无证书直接跳过 — 调用前前端已预检,只兜底)
 //   - 不下发主 nginx.conf(留空),只覆盖 servers/{domain}.conf
 //   - infos 为空(用户删完所有 WSS 入站)时也走渲染流程下发空 location 的 server 块,
-//     借模板的 default `location / { return 404; }` 兜底,把旧 location 全部覆盖,避免死 backend 残留。
+//     把旧 location 全部覆盖,避免死 backend 残留。同机主控域名始终保留主控反代。
 //
 // 大写导出:nodes.go 的 deleteRemoteInbound 也要调,删节点路径不走 HandleInbounds remove。
 func (h *RemoteManageHandler) SyncWSSNginx(ctx context.Context, serverID int64) error {
@@ -272,6 +272,26 @@ func (h *RemoteManageHandler) syncWSSNginx(ctx context.Context, serverID int64, 
 		return fmt.Errorf("读取 single_nginx.conf 模板失败: %v", err)
 	}
 
+	// 同机 Agent 的 WSS 使用主控域名时，这份配置同时承担主控 HTTPS 入口。
+	// 精确 WSS location 与主控 location / 可以共存；删除最后一个 WSS 入站时也只清理
+	// WSS location，不能把主控反代覆盖成默认 404。
+	if h.isSameHostMasterWSSDomain(ctx, server, domain) {
+		conf, renderErr := renderMasterDomainWSSConf(domain, certName, infos)
+		if renderErr != nil {
+			return renderErr
+		}
+		payload, _ := json.Marshal(map[string]interface{}{
+			"domain":        domain,
+			"nginx_config":  string(nginxConf),
+			"domain_config": conf,
+		})
+		if _, err := h.forwardNginxSetupSSL(ctx, serverID, payload); err != nil {
+			return fmt.Errorf("下发主控与 WSS 共存 nginx 配置失败: %v", err)
+		}
+		log.Printf("[WSS-Nginx] server %d domain=%s 同机主控模式:主控反代 + %d 条 WSS location 已下发", serverID, domain, len(infos))
+		return nil
+	}
+
 	tplBytes, err := templates.ReadFile("wss_domain.conf.tpl")
 	if err != nil {
 		return fmt.Errorf("读取 wss 模板失败: %v", err)
@@ -343,6 +363,18 @@ func wssCertificateCovers(domain, certDomain string) bool {
 	}
 	suffix := strings.TrimPrefix(certDomain, "*.")
 	return strings.HasSuffix(domain, "."+suffix) && strings.Count(domain, ".") == strings.Count(suffix, ".")+1
+}
+
+func (h *RemoteManageHandler) isSameHostMasterWSSDomain(ctx context.Context, server *storage.RemoteServer, domain string) bool {
+	if server == nil {
+		return false
+	}
+	masterURL, _ := h.repo.GetSystemSetting(ctx, "master_url")
+	if normalizeWSSDomain(masterURL) != normalizeWSSDomain(domain) {
+		return false
+	}
+	return server.SameHostAsMaster || serverTargetsMasterHost(ctx, h.repo,
+		server.PullAddress, server.IPAddress, server.Domain)
 }
 
 // extractWSSInbounds 从 agent inbounds 列表过滤出 vless+ws 入站的 {path, port}。
@@ -433,18 +465,54 @@ func renderStealSelfWSLocations(wssInbounds []wssInboundInfo) string {
 	return b.String()
 }
 
+// renderDirectWSSLocations 渲染直接监听 443 的 WSS location。这里没有
+// proxy_protocol，真实来源地址使用 $remote_addr。
+func renderDirectWSSLocations(wssInbounds []wssInboundInfo) string {
+	var b strings.Builder
+	for _, w := range wssInbounds {
+		fmt.Fprintf(&b, `
+        location = %s {
+            if ($http_upgrade != "websocket") { return 404; }
+            proxy_pass         http://127.0.0.1:%s;
+            proxy_redirect     off;
+            proxy_http_version 1.1;
+            proxy_set_header   Upgrade            $http_upgrade;
+            proxy_set_header   Connection         "upgrade";
+            proxy_set_header   Host               $host;
+            proxy_set_header   X-Real-IP          $remote_addr;
+            proxy_set_header   X-Forwarded-For    $proxy_add_x_forwarded_for;
+            proxy_read_timeout 5d;
+        }
+`, w.WSPath, w.Port)
+	}
+	return b.String()
+}
+
+func injectRenderedLocations(conf, locations string) string {
+	if locations == "" {
+		return conf
+	}
+	idx := strings.LastIndex(conf, "}")
+	if idx < 0 {
+		return conf + locations
+	}
+	return conf[:idx] + locations + conf[idx:]
+}
+
 // injectWSLocations 把 ws location 注入伪装站 conf 的 server 块内(最后一个 } 前)。
 // 伪装站模板只有一个 server 块,最后一个 } 即 server 结束。无 ws 入站时原样返回。
 func injectWSLocations(conf string, wssInbounds []wssInboundInfo) string {
-	if len(wssInbounds) == 0 {
-		return conf
+	return injectRenderedLocations(conf, renderStealSelfWSLocations(wssInbounds))
+}
+
+func renderMasterDomainWSSConf(domain, certName string, wssInbounds []wssInboundInfo) (string, error) {
+	tpl, err := templates.ReadFile("mmwx_domain.conf")
+	if err != nil {
+		return "", fmt.Errorf("读取 mmwx_domain.conf 模板失败: %w", err)
 	}
-	wsLoc := renderStealSelfWSLocations(wssInbounds)
-	idx := strings.LastIndex(conf, "}")
-	if idx < 0 {
-		return conf + wsLoc
-	}
-	return conf[:idx] + wsLoc + conf[idx:]
+	conf := strings.ReplaceAll(string(tpl), "{domain}", domain)
+	conf = strings.ReplaceAll(conf, "{cert_name}", certName)
+	return injectRenderedLocations(conf, renderDirectWSSLocations(wssInbounds)), nil
 }
 
 // renderStealSelfDomainConf 渲染偷自己 server 的 servers/{domain}.conf:

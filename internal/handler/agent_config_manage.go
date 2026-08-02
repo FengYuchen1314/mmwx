@@ -753,7 +753,14 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	}
 	serverName := server.Name
 
-	if req.UninstallAgent != nil && *req.UninstallAgent {
+	requestedUninstall := req.UninstallAgent != nil && *req.UninstallAgent
+	// 兼容旧前端或页面状态缓存：只有数据库中仍为 connected 的服务器才尝试远程
+	// 卸载。离线/pending Agent 不可能受理卸载，必须直接清理主控记录，不能因此阻止删除。
+	shouldUninstallAgent := requestedUninstall && strings.EqualFold(strings.TrimSpace(server.Status), "connected")
+	if requestedUninstall && !shouldUninstallAgent {
+		log.Printf("[Remote Server] skip agent uninstall for %s: status=%s", serverName, server.Status)
+	}
+	if shouldUninstallAgent {
 		if _, fedErr := h.repo.GetFederatedServer(ctx, req.ID); fedErr == nil {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(RemoteServerResponse{

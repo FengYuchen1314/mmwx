@@ -1203,7 +1203,28 @@ func (h *nodesHandler) handleNodeURI(w http.ResponseWriter, r *http.Request, idS
 		writeBadRequest(w, "无效的节点标识")
 		return
 	}
-	node, err := h.fetchNodeForAccess(r.Context(), id, username, userIsAdmin(r.Context(), h.repo, username))
+	isAdmin := userIsAdmin(r.Context(), h.repo, username)
+	var node storage.Node
+	if isAdmin {
+		node, err = h.repo.GetNodeByID(r.Context(), id)
+	} else {
+		// 普通用户节点页同时展示自己导入的节点与套餐可见节点，复制 URI 必须沿用
+		// 完全相同的可见性口径。套餐节点不属于该用户，不能再用 GetNode(id,
+		// username) 查询；同时先替换为用户子账户凭据，避免生成管理员 URI。
+		var visible []storage.Node
+		visible, err = collectUserVisibleNodes(r.Context(), h.repo, username)
+		if err == nil {
+			visible = substituteNodesForUser(r.Context(), h.repo, username, visible)
+			err = storage.ErrNodeNotFound
+			for _, candidate := range visible {
+				if candidate.ID == id {
+					node = candidate
+					err = nil
+					break
+				}
+			}
+		}
+	}
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, storage.ErrNodeNotFound) {
