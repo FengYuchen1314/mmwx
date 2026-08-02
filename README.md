@@ -170,6 +170,14 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.4-beta.1 (2026-08-03)
+- 🌈 增加prerelease版本
+- 🌈 增加用户自主续费功能
+- 🌈 支持再套餐为节点设置专用节点名
+- 🌈 获取订阅通知增加流量与套餐
+- 🛠️ fix: bot错误被后端吃掉了
+- 🛠️ fix: 离线服务器删除失败
+- 🛠️ fix: 自动填写备份主控地址
 ### v0.4.3 (2026-08-02)
 - 🛠️ fix: windows system.call 问题
 ### v0.4.2 (2026-08-02)
