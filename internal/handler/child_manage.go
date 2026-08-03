@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -922,7 +923,8 @@ func (h *ChildManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Req
 	}
 
 	info := map[string]interface{}{
-		"success": true,
+		"success":              true,
+		"tcp_fast_open_server": tcpFastOpenServerSupported(),
 	}
 
 	// 获取主机名
@@ -961,6 +963,15 @@ func (h *ChildManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Req
 	}
 
 	childWriteJSON(w, http.StatusOK, info)
+}
+
+func tcpFastOpenServerSupported() bool {
+	raw, err := os.ReadFile("/proc/sys/net/ipv4/tcp_fastopen")
+	if err != nil {
+		return false
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	return err == nil && value&2 != 0
 }
 
 // HandleSystemNICs 列出本机可用于 xray 出站 sendThrough 绑定的网卡地址。
