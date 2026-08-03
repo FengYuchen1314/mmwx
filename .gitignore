@@ -55,4 +55,5 @@ deploy.sh
 miaomiaowux-frontend
 MCP_PLAN.md
 *_test.go
+!internal/storage/database_config_test.go
 AGENTS.md

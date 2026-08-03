@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,7 +19,13 @@ func (r *TrafficRepository) QuickCheck(ctx context.Context) error {
 	if r == nil || r.db == nil {
 		return fmt.Errorf("database is not initialized")
 	}
-	return quickCheckDB(ctx, r.db)
+	if r.config.Driver == "postgres" {
+		if err := r.db.PingContext(ctx); err != nil {
+			return fmt.Errorf("postgresql health check: %w", err)
+		}
+		return nil
+	}
+	return quickCheckDB(ctx, r.db.DB)
 }
 
 func quickCheckDB(ctx context.Context, db *sql.DB) error {
@@ -50,6 +57,9 @@ func quickCheckDB(ctx context.Context, db *sql.DB) error {
 // 快照。复制按小批页面执行，避免 VACUUM INTO 长时间占用主库；快照通过
 // quick_check 后才替换唯一正式备份，失败时保留上一次可用备份。
 func (r *TrafficRepository) BackupDatabase(ctx context.Context, backupPath string) error {
+	if r != nil && r.config.Driver == "postgres" {
+		return errors.New("SQLite online backup is unavailable for PostgreSQL")
+	}
 	if strings.TrimSpace(backupPath) == "" {
 		return fmt.Errorf("backup path is empty")
 	}
@@ -65,7 +75,7 @@ func (r *TrafficRepository) BackupDatabase(ctx context.Context, backupPath strin
 	}
 	tmp := abs + ".tmp"
 	_ = os.Remove(tmp)
-	if err := onlineBackup(ctx, r.db, tmp); err != nil {
+	if err := onlineBackup(ctx, r.db.DB, tmp); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("online database backup: %w", err)
 	}

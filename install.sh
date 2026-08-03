@@ -151,7 +151,6 @@ SyslogIdentifier=$SERVICE_NAME
 
 # 环境变量
 Environment="PORT=$PORT_INPUT"
-Environment="DATABASE_PATH=$DATA_DIR/mmwx.db"
 Environment="LOG_LEVEL=info"
 
 # 安全选项

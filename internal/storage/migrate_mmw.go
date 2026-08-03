@@ -12,16 +12,16 @@ import (
 
 // MmwImportReport 每张表迁移结果。
 type MmwImportReport struct {
-	Users           int `json:"users"`
-	UserTokens      int `json:"user_tokens"`
-	Nodes           int `json:"nodes"`
-	SubscribeFiles  int `json:"subscribe_files"`
-	UserSubs        int `json:"user_subscriptions"`
-	UserSettings    int `json:"user_settings"`
-	Templates       int `json:"templates"`
-	CustomRules     int `json:"custom_rules"`
-	OverrideScripts int `json:"override_scripts"`
-	ExtSubs         int `json:"external_subscriptions"`
+	Users           int      `json:"users"`
+	UserTokens      int      `json:"user_tokens"`
+	Nodes           int      `json:"nodes"`
+	SubscribeFiles  int      `json:"subscribe_files"`
+	UserSubs        int      `json:"user_subscriptions"`
+	UserSettings    int      `json:"user_settings"`
+	Templates       int      `json:"templates"`
+	CustomRules     int      `json:"custom_rules"`
+	OverrideScripts int      `json:"override_scripts"`
+	ExtSubs         int      `json:"external_subscriptions"`
 	Warnings        []string `json:"warnings,omitempty"`
 }
 
@@ -64,8 +64,8 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string)
 	// 单独写明列名而不是 `SELECT *`,这样 mmwx 后续加新列不会让 INSERT 报错。
 	type tableSpec struct {
 		dest   string
-		target *int      // report 字段指针
-		cols   []string  // 两边都有的列
+		target *int     // report 字段指针
+		cols   []string // 两边都有的列
 	}
 	specs := []tableSpec{
 		{
@@ -171,7 +171,7 @@ func (r *TrafficRepository) ImportFromMmw(ctx context.Context, mmwDBPath string)
 
 	for _, spec := range specs {
 		// 检查 src 是否真有这些列;少的列对应 INSERT 给默认值(NULL/0/...)。
-		availCols, err := txTableColumns(ctx, tx, "src", spec.dest)
+		availCols, err := txTableColumns(ctx, tx.Tx, "src", spec.dest)
 		if err != nil {
 			report.Warnings = append(report.Warnings, fmt.Sprintf("跳过 %s: %v", spec.dest, err))
 			continue
@@ -261,7 +261,7 @@ type DistinctNodeServer struct {
 	NodeCount        int
 	Ports            []int
 	Protocols        []string
-	ExistingServer   bool   // mmwx 已有同名 remote_server 或同 IP / 同域名
+	ExistingServer   bool // mmwx 已有同名 remote_server 或同 IP / 同域名
 	ExistingServerID int64
 	SampleNodeName   string
 }

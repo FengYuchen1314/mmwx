@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -76,7 +78,8 @@ type TrafficRecord struct {
 
 // TrafficRepository 管理流量使用快照的持久性。
 type TrafficRepository struct {
-	db *sql.DB
+	db     *dialectDB
+	config DatabaseConfig
 	// attrCache 缓存 BuildEmailAttributor 的结果,见 BuildEmailAttributorCached。
 	attrCache attributorCache
 	// emailUserCache 缓存 email → username 解析结果,见 ResolveUsernameByEmailCached。
@@ -989,30 +992,50 @@ var (
 
 // 初始化存储在给定路径或 DSN 中的新的 SQLite 支持的存储库。
 func NewTrafficRepository(path string) (*TrafficRepository, error) {
-	if path == "" {
+	return NewTrafficRepositoryFromConfig(DatabaseConfig{Driver: "sqlite", Path: path})
+}
+
+// NewTrafficRepositoryFromConfig opens either the legacy SQLite database or a
+// PostgreSQL database. Callers should load the config through LoadDatabaseConfig
+// so environment overrides and defaults are applied consistently.
+func NewTrafficRepositoryFromConfig(cfg DatabaseConfig) (*TrafficRepository, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.Driver == "sqlite" && cfg.Path == "" {
 		return nil, errors.New("traffic repository path is empty")
 	}
 
-	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if cfg.Driver == "sqlite" && cfg.Path != ":memory:" && !strings.HasPrefix(cfg.Path, "file:") {
+		if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o755); err != nil {
 			return nil, fmt.Errorf("create traffic data directory: %w", err)
 		}
 	}
 
 	// 把裸路径转成 file: URI 并挂载 per-connection pragma(busy_timeout / WAL / synchronous)。
 	// :memory: 与已是 file: URI 的 DSN 保持原样;后者由调用方负责挂载需要的 pragma。
-	dsn := path
-	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
-		dsn = "file:" + path + "?" + sqliteDSNPragma
+	driver, dsn := "sqlite", cfg.Path
+	if cfg.Driver == "sqlite" && cfg.Path != ":memory:" && !strings.HasPrefix(cfg.Path, "file:") {
+		dsn = "file:" + cfg.Path + "?" + sqliteDSNPragma
+	}
+	if cfg.Driver == "postgres" {
+		driver = "pgx"
+		u := &url.URL{Scheme: "postgres", Host: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port), Path: cfg.Database}
+		u.User = url.UserPassword(cfg.Username, cfg.Password)
+		values := u.Query()
+		values.Set("sslmode", cfg.SSLMode)
+		u.RawQuery = values.Encode()
+		dsn = u.String()
 	}
 
-	db, err := sql.Open("sqlite", dsn)
+	rawDB, err := sql.Open(driver, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite db: %w", err)
+		return nil, fmt.Errorf("open %s db: %w", cfg.Driver, err)
 	}
+	db := &dialectDB{DB: rawDB, driver: cfg.Driver, writes: &sync.RWMutex{}}
 
-	db.SetMaxOpenConns(sqliteMaxOpenConns)
-	db.SetMaxIdleConns(sqliteMaxIdleConns)
+	db.SetMaxOpenConns(cfg.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.MaxIdleConns)
 	// 空闲连接最多留 5 分钟就回收 — 释放其持有的 WAL 读快照,让 checkpoint 能抽干旧帧。
 	// (不设时 idle conn 永不回收,长跑容器里旧读标记会一直钉住 WAL。)
 	db.SetConnMaxIdleTime(5 * time.Minute)
@@ -1020,21 +1043,27 @@ func NewTrafficRepository(path string) (*TrafficRepository, error) {
 	// 兜底再 Exec 一次 — DSN _pragma 在某些 modernc.org/sqlite 版本路径异常时可能不生效,
 	// 这里在第一个 conn 上强制设一次 journal_mode 让整库进入 WAL(db-level、persistent),
 	// 并设 journal_size_limit 让 checkpoint 后 -wal 文件缩回。
-	if _, err := db.Exec(pragmaJournalMode); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("enable wal: %w", err)
-	}
-	if _, err := db.Exec("PRAGMA journal_size_limit=67108864"); err != nil {
-		log.Printf("[storage] set journal_size_limit failed (non-fatal): %v", err)
+	if cfg.Driver == "sqlite" {
+		if _, err := db.Exec(pragmaJournalMode); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("enable wal: %w", err)
+		}
+		if _, err := db.Exec("PRAGMA journal_size_limit=67108864"); err != nil {
+			log.Printf("[storage] set journal_size_limit failed (non-fatal): %v", err)
+		}
 	}
 
-	repo := &TrafficRepository{db: db}
+	repo := &TrafficRepository{db: db, config: cfg}
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	checkErr := repo.QuickCheck(checkCtx)
-	checkCancel()
-	if checkErr != nil {
+	defer checkCancel()
+	if cfg.Driver == "sqlite" {
+		if checkErr := repo.QuickCheck(checkCtx); checkErr != nil {
+			_ = db.Close()
+			return nil, checkErr
+		}
+	} else if err := db.PingContext(checkCtx); err != nil {
 		_ = db.Close()
-		return nil, checkErr
+		return nil, fmt.Errorf("connect PostgreSQL: %w", err)
 	}
 	if err := repo.migrate(); err != nil {
 		_ = db.Close()
@@ -1043,6 +1072,9 @@ func NewTrafficRepository(path string) (*TrafficRepository, error) {
 
 	return repo, nil
 }
+
+func (r *TrafficRepository) DatabaseConfig() DatabaseConfig { return r.config }
+func (r *TrafficRepository) DatabaseDriver() string { return r.config.Driver }
 
 // 关闭会释放底层数据库资源。
 func (r *TrafficRepository) Close() error {
@@ -1056,6 +1088,9 @@ func (r *TrafficRepository) Close() error {
 // 这在创建备份之前很有用。
 func (r *TrafficRepository) Checkpoint() error {
 	if r == nil || r.db == nil {
+		return nil
+	}
+	if r.config.Driver == "postgres" {
 		return nil
 	}
 	// 必须用 QueryRow 读回 (busy, log, checkpointed) —— PRAGMA wal_checkpoint **不会**
@@ -1078,6 +1113,9 @@ func (r *TrafficRepository) Checkpoint() error {
 // 从而即使 TRUNCATE 长期 busy(有长读事务持 WAL mark),-wal 也不会无界追加膨胀。
 // 返回:truncated=是否成功截断,remaining=降级后 WAL 仍剩的帧数(供观测)。
 func (r *TrafficRepository) CheckpointBestEffort() (truncated bool, remaining int, err error) {
+	if r == nil || r.db == nil || r.config.Driver == "postgres" {
+		return true, 0, nil
+	}
 	if r == nil || r.db == nil {
 		return false, 0, nil
 	}
@@ -2497,7 +2535,7 @@ CREATE TABLE IF NOT EXISTS batch_inbounds (
     protocol TEXT NOT NULL,
     port INTEGER NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (server_id) REFERENCES xray_servers(id) ON DELETE CASCADE
+    FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_batch_inbounds_batch_id ON batch_inbounds(batch_id);
 CREATE INDEX IF NOT EXISTS idx_batch_inbounds_server_id ON batch_inbounds(server_id);
@@ -2516,7 +2554,7 @@ CREATE TABLE IF NOT EXISTS batch_outbounds (
     server_id INTEGER NOT NULL,
     protocol TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (server_id) REFERENCES xray_servers(id) ON DELETE CASCADE
+    FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_batch_outbounds_batch_id ON batch_outbounds(batch_id);
 CREATE INDEX IF NOT EXISTS idx_batch_outbounds_server_id ON batch_outbounds(server_id);
@@ -2541,7 +2579,7 @@ CREATE TABLE IF NOT EXISTS node_traffic (
     last_downlink INTEGER NOT NULL DEFAULT 0,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(server_id, tag, type),
-    FOREIGN KEY (server_id) REFERENCES xray_servers(id) ON DELETE CASCADE
+    FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_node_traffic_server_id ON node_traffic(server_id);
 CREATE INDEX IF NOT EXISTS idx_node_traffic_tag ON node_traffic(tag);
@@ -2566,7 +2604,7 @@ CREATE TABLE IF NOT EXISTS user_traffic (
     cycle_start TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(server_id, username),
-    FOREIGN KEY (server_id) REFERENCES xray_servers(id) ON DELETE CASCADE
+    FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_user_traffic_server_id ON user_traffic(server_id);
 CREATE INDEX IF NOT EXISTS idx_user_traffic_username ON user_traffic(username);
@@ -2600,7 +2638,7 @@ CREATE TABLE IF NOT EXISTS user_email_traffic (
     cycle_start TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(server_id, email),
-    FOREIGN KEY (server_id) REFERENCES xray_servers(id) ON DELETE CASCADE
+    FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_user_email_traffic_server_id ON user_email_traffic(server_id);
 CREATE INDEX IF NOT EXISTS idx_user_email_traffic_email ON user_email_traffic(email);
@@ -2645,7 +2683,7 @@ CREATE TABLE IF NOT EXISTS traffic_snapshots (
     user_downlink INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(server_id, date),
-    FOREIGN KEY (server_id) REFERENCES xray_servers(id) ON DELETE CASCADE
+    FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_snapshots_server_id ON traffic_snapshots(server_id);
 CREATE INDEX IF NOT EXISTS idx_traffic_snapshots_date ON traffic_snapshots(date);
@@ -3486,6 +3524,11 @@ func (r *TrafficRepository) ensureNodeColumn(name, definition string) error {
 // 用 PRAGMA index_list 找所有 UNIQUE index,逐个用 index_info 查列名集合;
 // 任一 UNIQUE 同时包含 server_id+tag+date 但**不**包含 type → 旧 schema bug,需要 rebuild。
 func (r *TrafficRepository) nodeTrafficSnapshotsNeedsRebuild() (bool, error) {
+	if r.config.Driver == "postgres" {
+		// Fresh PostgreSQL schemas are created with the current four-column
+		// uniqueness constraint; the rebuild below is only for legacy SQLite.
+		return false, nil
+	}
 	rows, err := r.db.Query(`PRAGMA index_list(node_traffic_snapshots)`)
 	if err != nil {
 		return false, fmt.Errorf("index_list: %w", err)
@@ -3741,6 +3784,11 @@ func (r *TrafficRepository) ensureSubscribeFileColumn(name, definition string) e
 // PackageAssign 自动生成订阅会因为约束失败。SQLite 不支持改 CHECK，只能 rebuild 表。
 // idempotent：检测到 sql 里已有 'package' 直接 return。
 func (r *TrafficRepository) ensureSubscribeFileTypeAllowsPackage() error {
+	if r.config.Driver == "postgres" {
+		// PostgreSQL is created from the current schema and therefore already
+		// includes package in the CHECK constraint. sqlite_master is SQLite-only.
+		return nil
+	}
 	var schema string
 	err := r.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='subscribe_files'`).Scan(&schema)
 	if err != nil {

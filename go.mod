@@ -12,6 +12,7 @@ require (
 	github.com/go-acme/tencentclouddnspod v1.3.24
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/jackc/pgx/v5 v5.7.5
 	github.com/mark3labs/mcp-go v0.54.0
 	github.com/nrdcg/dnspod-go v0.4.0
 	github.com/nrdcg/namesilo v0.5.0
@@ -24,6 +25,12 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.39.1
+)
+
+require (
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 )
 
 require (

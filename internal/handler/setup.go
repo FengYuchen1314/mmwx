@@ -26,12 +26,13 @@ type setupStatusResponse struct {
 }
 
 type setupRequest struct {
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	Nickname  string `json:"nickname"`
-	Email     string `json:"email"`
-	AvatarURL string `json:"avatar_url"`
-	Domain    string `json:"domain"`
+	Username  string                  `json:"username"`
+	Password  string                  `json:"password"`
+	Nickname  string                  `json:"nickname"`
+	Email     string                  `json:"email"`
+	AvatarURL string                  `json:"avatar_url"`
+	Domain    string                  `json:"domain"`
+	Database  *storage.DatabaseConfig `json:"database,omitempty"`
 }
 
 type setupResponse struct {
@@ -40,6 +41,7 @@ type setupResponse struct {
 	Email       string `json:"email"`
 	NginxSetup  bool   `json:"nginx_setup,omitempty"`
 	RedirectURL string `json:"redirect_url,omitempty"`
+	Restarting  bool   `json:"restarting,omitempty"`
 }
 
 // 返回一个处理程序，用于检查是否需要初始设置
@@ -92,7 +94,7 @@ func NewSetupStatusHandler(repo *storage.TrafficRepository) http.Handler {
 }
 
 // 处理第一个管理员用户的创建
-func NewInitialSetupHandler(repo *storage.TrafficRepository) http.Handler {
+func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) http.Handler {
 	if repo == nil {
 		panic("initial setup handler requires repository")
 	}
@@ -170,8 +172,40 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 
+		setupRepo := repo
+		var selectedDatabase *storage.DatabaseConfig
+		if payload.Database != nil {
+			if storage.DatabaseConfigUsesEnvironment() {
+				writeError(w, http.StatusConflict, errors.New("数据库连接正由环境变量管理，不能在初始化页面覆盖"))
+				return
+			}
+			cfg := *payload.Database
+			if err := cfg.Validate(); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			if cfg.Driver == "postgres" {
+				candidate, err := storage.NewTrafficRepositoryFromConfig(cfg)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, fmt.Errorf("PostgreSQL 初始化失败: %w", err))
+					return
+				}
+				defer candidate.Close()
+				existing, err := candidate.ListUsers(r.Context(), 1)
+				if err != nil || len(existing) > 0 {
+					if err == nil {
+						err = errors.New("目标 PostgreSQL 已存在用户")
+					}
+					writeError(w, http.StatusConflict, err)
+					return
+				}
+				setupRepo = candidate
+				selectedDatabase = &cfg
+			}
+		}
+
 		// 创建管理员用户
-		if err := repo.CreateUser(r.Context(), username, email, nickname, string(hash), storage.RoleAdmin, ""); err != nil {
+		if err := setupRepo.CreateUser(r.Context(), username, email, nickname, string(hash), storage.RoleAdmin, ""); err != nil {
 			if errors.Is(err, storage.ErrUserExists) {
 				logger.Warn("[初始化] 用户已存在", "username", username)
 				writeError(w, http.StatusConflict, errors.New("用户已存在"))
@@ -183,11 +217,11 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository) http.Handler {
 		}
 
 		// 确保用户设置为管理员且处于活动状态
-		_ = repo.UpdateUserRole(r.Context(), username, storage.RoleAdmin)
-		_ = repo.UpdateUserStatus(r.Context(), username, true)
+		_ = setupRepo.UpdateUserRole(r.Context(), username, storage.RoleAdmin)
+		_ = setupRepo.UpdateUserStatus(r.Context(), username, true)
 
 		if avatarURL != "" || email != "" || nickname != "" {
-			_ = repo.UpdateUserProfile(r.Context(), username, storage.UserProfileUpdate{
+			_ = setupRepo.UpdateUserProfile(r.Context(), username, storage.UserProfileUpdate{
 				Email:     email,
 				Nickname:  nickname,
 				AvatarURL: avatarURL,
@@ -215,14 +249,28 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository) http.Handler {
 				port = p
 			}
 			masterURL := fmt.Sprintf("http://%s:%s", domain, port)
-			_ = repo.SetSystemSetting(r.Context(), "master_url", masterURL)
+			_ = setupRepo.SetSystemSetting(r.Context(), "master_url", masterURL)
 			resp.RedirectURL = masterURL
 			logger.Info("[初始化] 已保存 master_url", "master_url", masterURL)
+		}
+		if selectedDatabase != nil {
+			dir := "data"
+			if len(dataDir) > 0 && strings.TrimSpace(dataDir[0]) != "" {
+				dir = dataDir[0]
+			}
+			if err := storage.SaveDatabaseConfig(dir, *selectedDatabase); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("保存数据库配置失败: %w", err))
+				return
+			}
+			resp.Restarting = true
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(resp)
+		if resp.Restarting {
+			go func() { time.Sleep(500 * time.Millisecond); _ = SignalGracefulRestart() }()
+		}
 	})
 }
 

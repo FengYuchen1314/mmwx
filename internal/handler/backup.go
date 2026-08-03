@@ -28,6 +28,10 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 			writeBackupError(w, http.StatusMethodNotAllowed, errors.New("only GET or POST is supported"))
 			return
 		}
+		if repo.DatabaseDriver() == "postgres" {
+			writeBackupError(w, http.StatusNotImplemented, errors.New("PostgreSQL 数据库请使用 pg_dump 备份；当前 ZIP 备份不包含 PostgreSQL 数据，已拒绝生成不完整备份"))
+			return
+		}
 
 		// 检查点 WAL 确保所有数据都写入主数据库文件
 		if err := repo.Checkpoint(); err != nil {
@@ -71,6 +75,10 @@ func NewBackupRestoreHandler(repo *storage.TrafficRepository) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeBackupError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
+			return
+		}
+		if repo.DatabaseDriver() == "postgres" {
+			writeBackupError(w, http.StatusNotImplemented, errors.New("当前使用 PostgreSQL，不能用 SQLite ZIP 覆盖恢复；请使用 pg_restore 恢复数据库，并单独还原 data/subscribes 目录"))
 			return
 		}
 

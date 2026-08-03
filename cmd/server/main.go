@@ -118,13 +118,28 @@ func main() {
 		log.Printf("Loaded configuration from %s", *configPath)
 	}
 
-	databasePath := filepath.Join("data", "mmwx.db")
-	databaseBackupPath := filepath.Join("data", "mmwx.db.backup")
-	repo, recoveredFromBackup, err := storage.OpenTrafficRepositoryWithRecovery(databasePath, databaseBackupPath)
+	// WorkingDirectory is /etc/mmwx for bare metal and /app in the image, so
+	// the shared relative data directory resolves to the documented persistent
+	// paths /etc/mmwx/data and /app/data respectively.
+	dataDir := "data"
+	databaseConfig, databaseConfigPath, err := storage.LoadDatabaseConfig(dataDir)
 	if err != nil {
-		logger.Error("流量数据库初始化失败", "error", err)
+		logger.Error("数据库配置加载失败", "path", databaseConfigPath, "error", err)
 		os.Exit(1)
 	}
+	var repo *storage.TrafficRepository
+	var recoveredFromBackup bool
+	if databaseConfig.Driver == "sqlite" {
+		databaseBackupPath := databaseConfig.Path + ".backup"
+		repo, recoveredFromBackup, err = storage.OpenTrafficRepositoryWithRecovery(databaseConfig.Path, databaseBackupPath)
+	} else {
+		repo, err = storage.NewTrafficRepositoryFromConfig(databaseConfig)
+	}
+	if err != nil {
+		logger.Error("数据库初始化失败", "driver", databaseConfig.Driver, "error", err)
+		os.Exit(1)
+	}
+	logger.Info("数据库连接成功", "driver", databaseConfig.Driver, "config", databaseConfigPath)
 	if recoveredFromBackup {
 		logger.Warn("主数据库损坏或无法启动，已使用最近的每小时备份恢复；故障数据库及 WAL/SHM 已归档到 data/database-recovery-*，请检查磁盘和文件系统")
 	}
@@ -281,7 +296,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/setup/status", handler.NewSetupStatusHandler(repo))
-	mux.Handle("/api/setup/init", handler.NewInitialSetupHandler(repo))
+	mux.Handle("/api/setup/init", handler.NewInitialSetupHandler(repo, dataDir))
 	mux.Handle("/api/setup/verify-domain", handler.NewVerifyDomainHandler())
 	mux.Handle("/api/setup/restore-backup", handler.NewSetupRestoreBackupHandler(repo))
 
@@ -852,6 +867,11 @@ func main() {
 
 	// 系统设置 API（仅限管理员）
 	systemSettingsHandler := handler.NewSystemSettingsHandler(repo, cryptoConfig)
+	databaseSettingsHandler := handler.NewDatabaseSettingsHandler(repo, dataDir)
+	mux.Handle("/api/admin/database/status", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(databaseSettingsHandler.Status)))
+	mux.Handle("/api/admin/database/migration-progress", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(databaseSettingsHandler.MigrationProgress)))
+	mux.Handle("/api/admin/database/test", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(databaseSettingsHandler.Test)))
+	mux.Handle("/api/admin/database/migrate", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(databaseSettingsHandler.Migrate)))
 	systemSettingsHandler.SetCollector(trafficCollector)
 	systemSettingsHandler.SetWSHandler(remoteWSHandler)
 	systemSettingsHandler.SetOnMasterURLChanged(remoteManageHandler.BroadcastMasterURLUpdate)
