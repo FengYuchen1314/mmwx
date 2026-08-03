@@ -66,7 +66,7 @@ func resetAdminXrayCredentials(ctx context.Context, repo *storage.TrafficReposit
 		if err := json.Unmarshal([]byte(cfg.CredentialJSON), &oldCred); err != nil {
 			return updated, fmt.Errorf("decode credential for server %d inbound %s: %w", cfg.ServerID, cfg.InboundTag, err)
 		}
-		remoteKey := xrayCredentialRemoteKey(cfg.ServerID, cfg.InboundTag, oldCred)
+		remoteKey := xrayCredentialRemoteKey(cfg.ServerID, cfg.InboundTag, cfg.Protocol, oldCred)
 		newCred := rotatedRemote[remoteKey]
 		didRemoteRotate := false
 		if newCred == nil {
@@ -126,7 +126,7 @@ func resetAdminXrayCredentials(ctx context.Context, repo *storage.TrafficReposit
 		if err := json.Unmarshal([]byte(sa.CredentialJSON), &oldCred); err != nil {
 			return updated, fmt.Errorf("decode routed credential %d: %w", sa.ID, err)
 		}
-		remoteKey := xrayCredentialRemoteKey(server.ID, parent.InboundTag, oldCred)
+		remoteKey := xrayCredentialRemoteKey(server.ID, parent.InboundTag, parent.Protocol, oldCred)
 		newCred := rotatedRemote[remoteKey]
 		didRemoteRotate := false
 		if newCred == nil {
@@ -164,15 +164,29 @@ func resetAdminXrayCredentials(ctx context.Context, repo *storage.TrafficReposit
 	return updated, nil
 }
 
-func xrayCredentialRemoteKey(serverID int64, inboundTag string, credential map[string]interface{}) string {
-	identity := fmt.Sprint(credential["email"])
-	if identity == "" || identity == "<nil>" {
-		identity = fmt.Sprint(credential["user"])
+func xrayCredentialRemoteKey(serverID int64, inboundTag, protocol string, credential map[string]interface{}) string {
+	// Email is metadata in Xray and legacy imports may contain several clients
+	// with the same administrator email. Use the protocol's actual client key so
+	// each distinct credential is rotated, while duplicate DB references to the
+	// same client still collapse into one remote operation.
+	var identity interface{}
+	switch strings.ToLower(protocol) {
+	case "vless", "vmess":
+		identity = credential["id"]
+	case "trojan", "anytls", "shadowsocks", "ss":
+		identity = credential["password"]
+	case "snell":
+		identity = credential["psk"]
+	case "hysteria", "hysteria2", "hy2":
+		identity = credential["auth"]
+	case "socks", "http":
+		identity = credential["user"]
+	case "mieru":
+		identity = credential["username"]
+	default:
+		identity = credential["email"]
 	}
-	if identity == "" || identity == "<nil>" {
-		identity = fmt.Sprint(credential["username"])
-	}
-	return fmt.Sprintf("%d\x00%s\x00%s", serverID, inboundTag, identity)
+	return fmt.Sprintf("%d\x00%s\x00%s\x00%v", serverID, inboundTag, strings.ToLower(protocol), identity)
 }
 
 func replaceInboundClientCredential(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag string, oldCred, newCred map[string]interface{}) error {
