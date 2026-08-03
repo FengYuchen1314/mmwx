@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mathrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -2336,6 +2337,116 @@ func preserveInboundCredentials(newInbound, current map[string]any, protocol str
 	}
 }
 
+// applyShadowsocksTCPFastOpen 让目标 Agent 检测内核服务端 TFO 能力，再决定是否下发。
+// 老 Agent 没有该字段时按不支持处理，避免 xray 配置看似开启、实际内核未启用。
+func (h *RemoteManageHandler) applyShadowsocksTCPFastOpen(ctx context.Context, serverID int64, inboundReq map[string]interface{}) {
+	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+	protocol, _ := inbound["protocol"].(string)
+	if !strings.EqualFold(protocol, "shadowsocks") {
+		return
+	}
+	supported := false
+	if raw, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/system/info", nil); err == nil {
+		var info struct {
+			TCPFastOpenServer bool `json:"tcp_fast_open_server"`
+		}
+		if json.Unmarshal(raw, &info) == nil {
+			supported = info.TCPFastOpenServer
+		}
+	} else {
+		log.Printf("[HandleInbounds] detect TCP Fast Open on server %d failed: %v", serverID, err)
+	}
+
+	stream, _ := inbound["streamSettings"].(map[string]interface{})
+	if supported {
+		if stream == nil {
+			stream = map[string]interface{}{"network": "tcp"}
+			inbound["streamSettings"] = stream
+		}
+		sockopt, _ := stream["sockopt"].(map[string]interface{})
+		if sockopt == nil {
+			sockopt = map[string]interface{}{}
+			stream["sockopt"] = sockopt
+		}
+		sockopt["tcpFastOpen"] = true
+		return
+	}
+	if stream == nil {
+		return
+	}
+	if sockopt, _ := stream["sockopt"].(map[string]interface{}); sockopt != nil {
+		delete(sockopt, "tcpFastOpen")
+		if len(sockopt) == 0 {
+			delete(stream, "sockopt")
+		}
+	}
+	if len(stream) == 1 && strings.EqualFold(fmt.Sprint(stream["network"]), "tcp") {
+		delete(inbound, "streamSettings")
+	}
+}
+
+// applyConfiguredInboundPortRange 是随机端口范围的后端最终兜底。前端可能在服务器
+// 详情尚未加载完成时先按默认范围生成端口，因此不能只依赖浏览器端约束。
+func (h *RemoteManageHandler) applyConfiguredInboundPortRange(ctx context.Context, serverID int64, inboundReq map[string]interface{}) error {
+	inbound, _ := inboundReq["inbound"].(map[string]interface{})
+	if inbound == nil || isRealityInbound(inbound) || isVlessWSInboundReq(inboundReq) {
+		return nil
+	}
+	protocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(inbound["protocol"])))
+	if protocol == "tunnel" || protocol == "dokodemo-door" {
+		return nil
+	}
+	server, err := h.repo.GetRemoteServer(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	minPort, maxPort := server.PortRangeMin, server.PortRangeMax
+	if minPort <= 0 || maxPort <= 0 || minPort > maxPort {
+		return nil
+	}
+	oldPort := toInt(inbound["port"])
+	if oldPort >= minPort && oldPort <= maxPort {
+		return nil
+	}
+
+	raw, err := h.forwardToRemoteServer(ctx, serverID, http.MethodGet, "/api/child/inbounds", nil)
+	if err != nil {
+		return fmt.Errorf("读取已用端口失败: %w", err)
+	}
+	var current struct {
+		Inbounds []map[string]interface{} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return fmt.Errorf("解析已用端口失败: %w", err)
+	}
+	used := make(map[int]bool, len(current.Inbounds))
+	for _, item := range current.Inbounds {
+		used[toInt(item["port"])] = true
+	}
+	size := maxPort - minPort + 1
+	start := mathrand.IntN(size)
+	newPort := 0
+	for offset := 0; offset < size; offset++ {
+		candidate := minPort + (start+offset)%size
+		if !used[candidate] {
+			newPort = candidate
+			break
+		}
+	}
+	if newPort == 0 {
+		return fmt.Errorf("服务器随机端口范围 %d-%d 已全部占用", minPort, maxPort)
+	}
+	inbound["port"] = newPort
+	if tag, _ := inbound["tag"].(string); tag != "" && oldPort > 0 {
+		oldSuffix := "-" + strconv.Itoa(oldPort)
+		if strings.HasSuffix(tag, oldSuffix) {
+			inbound["tag"] = strings.TrimSuffix(tag, oldSuffix) + "-" + strconv.Itoa(newPort)
+		}
+	}
+	log.Printf("[HandleInbounds] remapped out-of-range port %d to %d (range=%d-%d server=%d)", oldPort, newPort, minPort, maxPort, serverID)
+	return nil
+}
+
 // fetchRemoteInboundByTag 从 agent 拉当前全部入站,按 tag 返回一条完整配置(含 settings/streamSettings)。
 // 无匹配返回 (nil, nil)。给「修改入站」保留原协议/凭据用。
 func (h *RemoteManageHandler) fetchRemoteInboundByTag(ctx context.Context, serverID int64, tag string) (map[string]any, error) {
@@ -2529,6 +2640,14 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	// 这里在 forward 前明确拒绝并给出用户能看懂的提示。
 	if r.Method == http.MethodPost && inboundReq != nil {
 		if action, _ := inboundReq["action"].(string); action == "" || strings.ToLower(action) == "add" {
+			if !isUpdate {
+				if portErr := h.applyConfiguredInboundPortRange(r.Context(), id, inboundReq); portErr != nil {
+					remoteWriteError(w, http.StatusConflict, portErr.Error())
+					return
+				}
+			}
+			h.applyShadowsocksTCPFastOpen(r.Context(), id, inboundReq)
+			body, _ = json.Marshal(inboundReq)
 			if msg := validateInboundTLS(inboundReq); msg != "" {
 				remoteWriteError(w, http.StatusBadRequest, msg)
 				return
