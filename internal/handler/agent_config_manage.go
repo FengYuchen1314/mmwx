@@ -175,8 +175,13 @@ type RemoteServerUpdateRequest struct {
 	PortRangeMin *int  `json:"port_range_min"`
 	PortRangeMax *int  `json:"port_range_max"`
 	// DDNS 同 Create
-	DDNSEnabled    bool  `json:"ddns_enabled"`
-	DDNSProviderID int64 `json:"ddns_provider_id"`
+	DDNSEnabled     bool     `json:"ddns_enabled"`
+	DDNSProviderID  int64    `json:"ddns_provider_id"`
+	Region          *string  `json:"region"`
+	RenewalPrice    *float64 `json:"renewal_price"`
+	RenewalCycle    *string  `json:"renewal_cycle"`
+	RenewalCurrency *string  `json:"renewal_currency"`
+	ExpiresAt       *string  `json:"expires_at"` // YYYY-MM-DD；空字符串清除
 }
 
 // followLinkedServerDomain 保留“地址与域名原本是同一值”的关联关系。
@@ -592,6 +597,16 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
+	if h.licenseManager != nil && strings.TrimSpace(server.IPAddress) != "" {
+		go func(serverID int64, publicIP string) {
+			lookupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			region, err := h.licenseManager.ResolveIPRegion(lookupCtx, publicIP)
+			if err == nil && region.Flag() != "" {
+				_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, serverID, region.Flag(), 0, "month", "CNY", nil)
+			}
+		}(server.ID, server.IPAddress)
+	}
 	// 需求1:添加后立即触发一次 DDNS(若此刻还没上报 IP 则是空跑,agent 连上后会再触发)。
 	if h.ddnsManager != nil && server.DDNSEnabled {
 		go h.ddnsManager.Trigger(context.Background(), server)
@@ -964,6 +979,36 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			Message: msg,
 		})
 		return
+	}
+	if req.Region != nil || req.RenewalPrice != nil || req.RenewalCycle != nil || req.RenewalCurrency != nil || req.ExpiresAt != nil {
+		region, price, cycle, currency, expires := oldServer.Region, oldServer.RenewalPrice, oldServer.RenewalCycle, oldServer.RenewalCurrency, oldServer.ExpiresAt
+		if req.Region != nil {
+			region = *req.Region
+		}
+		if req.RenewalPrice != nil {
+			price = *req.RenewalPrice
+		}
+		if req.RenewalCycle != nil {
+			cycle = *req.RenewalCycle
+		}
+		if req.RenewalCurrency != nil {
+			currency = *req.RenewalCurrency
+		}
+		if req.ExpiresAt != nil {
+			expires = nil
+			if raw := strings.TrimSpace(*req.ExpiresAt); raw != "" {
+				parsed, parseErr := time.Parse("2006-01-02", raw)
+				if parseErr != nil {
+					writeJSON(w, stdhttp.StatusBadRequest, map[string]any{"success": false, "message": "到期时间格式应为 YYYY-MM-DD"})
+					return
+				}
+				expires = &parsed
+			}
+		}
+		if err := h.repo.UpdateRemoteServerProbeMeta(ctx, req.ID, region, price, cycle, currency, expires); err != nil {
+			writeJSON(w, stdhttp.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
+			return
+		}
 	}
 
 	// 锁定入口 IP + 随机端口范围:三者任一非 nil 即表示前端提交了这组设置,一起落库

@@ -79,15 +79,18 @@ type UsageReporter interface {
 }
 
 type Manager struct {
-	mu        sync.RWMutex
-	status    Status
-	serverURL string
-	key       string
-	machineID string
-	settings  SettingsStore
-	usage     UsageReporter
-	client    *http.Client
-	cancel    context.CancelFunc
+	mu                sync.RWMutex
+	status            Status
+	serverURL         string
+	key               string
+	machineID         string
+	settings          SettingsStore
+	usage             UsageReporter
+	client            *http.Client
+	cancel            context.CancelFunc
+	exchangeMu        sync.RWMutex
+	exchangeRates     map[string]float64
+	exchangeFetchedAt time.Time
 	// onRecover 在 license 从 invalid→valid 恢复时异步触发(如重推 limiter — 失效期被 gate 漏下发的补上)。
 	onRecover func()
 	// onQuotaChange 在「有效服务器配额」变化(valid 翻转或 Plan.MaxServers 变化)时异步触发,

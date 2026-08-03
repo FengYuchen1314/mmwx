@@ -857,10 +857,15 @@ type RemoteServer struct {
 	// 动态出口 IP,只有用户填的静态入口 IP 能连。
 	LockEntryIP bool `json:"lock_entry_ip"`
 	// PortRangeMin/Max 随机端口范围:都 >0 且 min<=max 时,该服务器加节点自动分配的随机端口必须落在此区间。
-	PortRangeMin    int   `json:"port_range_min,omitempty"`
-	PortRangeMax    int   `json:"port_range_max,omitempty"`
-	TrafficLimit    int64 `json:"traffic_limit"`
-	TrafficResetDay int   `json:"traffic_reset_day"`
+	PortRangeMin    int        `json:"port_range_min,omitempty"`
+	PortRangeMax    int        `json:"port_range_max,omitempty"`
+	TrafficLimit    int64      `json:"traffic_limit"`
+	TrafficResetDay int        `json:"traffic_reset_day"`
+	Region          string     `json:"region,omitempty"`
+	RenewalPrice    float64    `json:"renewal_price,omitempty"`
+	RenewalCycle    string     `json:"renewal_cycle,omitempty"`
+	RenewalCurrency string     `json:"renewal_currency,omitempty"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
 	// 双令牌系统字段
 	AgentToken            string     `json:"agent_token,omitempty"` // 代理令牌（服务器持有，用于从代理拉取）
 	AgentTokenExpiresAt   *time.Time `json:"agent_token_expires_at,omitempty"`
@@ -2497,6 +2502,22 @@ CREATE INDEX IF NOT EXISTS idx_remote_servers_status ON remote_servers(status);
 	}
 	// 服务器按 traffic_reset_day 自动重置流量时,记录上次重置时间(防同月反复)
 	if err := r.ensureRemoteServerColumn("last_traffic_reset_at", "TIMESTAMP"); err != nil {
+		return err
+	}
+	// 探针展示元数据。地域允许用户覆盖；价格用 NUMERIC 兼容 PostgreSQL，SQLite 会按 REAL 存储。
+	if err := r.ensureRemoteServerColumn("region", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("renewal_price", "NUMERIC NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("renewal_cycle", "TEXT NOT NULL DEFAULT 'month'"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("renewal_currency", "TEXT NOT NULL DEFAULT 'CNY'"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("expires_at", "TIMESTAMP"); err != nil {
 		return err
 	}
 
@@ -10347,6 +10368,29 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 				servers[i].IncludeInTrafficStats = ns.includeStats
 			}
 		}
+		// 探针元数据独立补查，避免继续扩张上方易错的 positional Scan。
+		if mrows, merr := r.db.QueryContext(ctx, `SELECT id, COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at FROM remote_servers`); merr == nil {
+			byID := make(map[int64]*RemoteServer, len(servers))
+			for i := range servers {
+				byID[servers[i].ID] = &servers[i]
+			}
+			for mrows.Next() {
+				var id int64
+				var expires sql.NullTime
+				var region, cycle, currency string
+				var price float64
+				if mrows.Scan(&id, &region, &price, &cycle, &currency, &expires) == nil {
+					if s := byID[id]; s != nil {
+						s.Region, s.RenewalPrice, s.RenewalCycle, s.RenewalCurrency = region, price, cycle, currency
+						if expires.Valid {
+							t := expires.Time
+							s.ExpiresAt = &t
+						}
+					}
+				}
+			}
+			mrows.Close()
+		}
 	}
 
 	return servers, nil
@@ -10443,6 +10487,13 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		server.LockEntryIP = lockEntryInt != 0
 		server.IncludeInTrafficStats = includeStatsInt != 0
 	}
+	var expires sql.NullTime
+	_ = r.db.QueryRowContext(ctx, `SELECT COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at FROM remote_servers WHERE id = ?`, id).
+		Scan(&server.Region, &server.RenewalPrice, &server.RenewalCycle, &server.RenewalCurrency, &expires)
+	if expires.Valid {
+		t := expires.Time
+		server.ExpiresAt = &t
+	}
 
 	server.XrayRunning = xrayRunningInt != 0
 	server.WarpInstalled = warpInstalledInt != 0
@@ -10476,6 +10527,30 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		server.LastAgentTokenRefresh = &lastAgentTokenRefresh.Time
 	}
 	return &server, nil
+}
+
+// UpdateRemoteServerProbeMeta 更新服务管理与探针共用的地域/续费信息。
+func (r *TrafficRepository) UpdateRemoteServerProbeMeta(ctx context.Context, id int64, region string, price float64, cycle, currency string, expiresAt *time.Time) error {
+	if id <= 0 || price < 0 {
+		return errors.New("invalid server probe metadata")
+	}
+	cycle = strings.TrimSpace(cycle)
+	if cycle != "month" && cycle != "quarter" && cycle != "half_year" && cycle != "year" {
+		return errors.New("invalid renewal cycle")
+	}
+	currency = strings.ToUpper(strings.TrimSpace(currency))
+	if len(currency) != 3 {
+		return errors.New("invalid currency")
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET region=?, renewal_price=?, renewal_cycle=?, renewal_currency=?, expires_at=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		strings.TrimSpace(region), price, cycle, currency, expiresAt, id)
+	if err != nil {
+		return fmt.Errorf("update server probe metadata: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return ErrRemoteServerNotFound
+	}
+	return nil
 }
 
 // 通过其令牌返回远程服务器。

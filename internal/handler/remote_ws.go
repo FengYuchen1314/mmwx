@@ -1173,6 +1173,18 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	// 推送许可证状态给 Agent
 	if h.licenseManager != nil {
 		go h.SendLicenseStatus(wsConn)
+		// 地域只在尚未配置时预填。查询由许可证服务按 IP 网段缓存，绝不覆盖管理员修改。
+		if server.Region == "" && ip != "" {
+			go func(s *storage.RemoteServer, publicIP string) {
+				lookupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				region, err := h.licenseManager.ResolveIPRegion(lookupCtx, publicIP)
+				if err != nil || region.Flag() == "" {
+					return
+				}
+				_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, s.ID, region.Flag(), s.RenewalPrice, s.RenewalCycle, s.RenewalCurrency, s.ExpiresAt)
+			}(server, ip)
+		}
 	}
 
 	// 连接/重连时把当前「上报间隔」(dashboard_refresh_interval_ms) 下发给该 agent,

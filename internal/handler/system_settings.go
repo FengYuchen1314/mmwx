@@ -344,7 +344,10 @@ const (
 	// 流量/网速是展示开关(数据来自主控实时,不需 agent 采集):"1"/"" 控制伪装页是否显示该块。
 	probeDisguiseMetricTrafficKey = "probe_disguise_metric_traffic" // "1"/"" 伪装页显示流量
 	probeDisguiseMetricSpeedKey   = "probe_disguise_metric_speed"   // "1"/"" 伪装页显示网速
-	probeDisguisePingTargetsKey   = "probe_disguise_ping_targets"   // JSON [{key,label,isp,host,port}]
+	probeDisguiseShowExpiryKey    = "probe_disguise_show_expiry"
+	probeDisguiseShowPriceKey     = "probe_disguise_show_price"
+	probeDisguiseShowGlobeKey     = "probe_disguise_show_globe"
+	probeDisguisePingTargetsKey   = "probe_disguise_ping_targets" // JSON [{key,label,isp,host,port}]
 	// per-server 覆盖:JSON {"<serverID>": [{key,label,isp,host,port}]}。
 	// key 存在且为 [] = 该机不做 ping 探测;key 不存在 = 跟随全局 probeDisguisePingTargetsKey。
 	// 这两种状态必须可区分,所以用 map 的键存在性而不是空数组来表达"跟随全局"。
@@ -384,6 +387,9 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	// 流量/网速默认显示(历史行为=一直显示):未设置("")视为开,仅显式 "0" 才关。
 	metricTraffic, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricTrafficKey)
 	metricSpeed, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricSpeedKey)
+	showExpiry, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowExpiryKey)
+	showPrice, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowPriceKey)
+	showGlobe, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowGlobeKey)
 	pingTargetsRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguisePingTargetsKey)
 	pingIntervalRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguisePingIntervalKey)
 
@@ -419,6 +425,9 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 		"metric_ping":               metricPing == "1",
 		"metric_traffic":            metricTraffic != "0", // 默认显示
 		"metric_speed":              metricSpeed != "0",   // 默认显示
+		"show_expiry":               showExpiry == "1",
+		"show_price":                showPrice == "1",
+		"show_globe":                showGlobe == "1",
 		"ping_targets":              pingTargets,
 		"ping_targets_override":     pingTargetsOverride,
 		"ping_interval_ms":          pingInterval,
@@ -446,6 +455,9 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		MetricPing    *bool              `json:"metric_ping"`
 		MetricTraffic *bool              `json:"metric_traffic"`
 		MetricSpeed   *bool              `json:"metric_speed"`
+		ShowExpiry    *bool              `json:"show_expiry"`
+		ShowPrice     *bool              `json:"show_price"`
+		ShowGlobe     *bool              `json:"show_globe"`
 		PingTargets   *[]ProbePingTarget `json:"ping_targets"`
 		// per-server 覆盖:键为 serverID 字符串。键存在(值可为空数组)=该机单独指定,
 		// 不存在=跟随全局。整个字段为 nil 时不改(旧前端 PUT 不带它)。
@@ -575,7 +587,10 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 	if !setBoolPtr(probeDisguiseMetricCPUKey, req.MetricCPU) ||
 		!setBoolPtr(probeDisguiseMetricMemKey, req.MetricMem) ||
 		!setBoolPtr(probeDisguiseMetricDiskKey, req.MetricDisk) ||
-		!setBoolPtr(probeDisguiseMetricPingKey, req.MetricPing) {
+		!setBoolPtr(probeDisguiseMetricPingKey, req.MetricPing) ||
+		!setBoolPtr(probeDisguiseShowExpiryKey, req.ShowExpiry) ||
+		!setBoolPtr(probeDisguiseShowPriceKey, req.ShowPrice) ||
+		!setBoolPtr(probeDisguiseShowGlobeKey, req.ShowGlobe) {
 		fail()
 		return
 	}

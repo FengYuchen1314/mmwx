@@ -5,18 +5,23 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
+	"miaomiaowux/internal/license"
 	"miaomiaowux/internal/storage"
 )
 
 // ProbePublicHandler 提供"伪装成探针"的公开(无鉴权)只读服务器状态。
 // 安全红线:只序列化下方白名单字段,绝不返回 IP / token / host / inbound 等敏感信息。
 type ProbePublicHandler struct {
-	repo       *storage.TrafficRepository
-	wsHandler  *RemoteWSHandler
-	probeStore *ProbeMetricsStore // 真探针数据(cpu/mem/disk/ping),来自 agent 上报的内存 ring
+	repo           *storage.TrafficRepository
+	wsHandler      *RemoteWSHandler
+	probeStore     *ProbeMetricsStore // 真探针数据(cpu/mem/disk/ping),来自 agent 上报的内存 ring
+	licenseManager *license.Manager
 }
+
+func (h *ProbePublicHandler) SetLicenseManager(manager *license.Manager) { h.licenseManager = manager }
 
 func NewProbePublicHandler(repo *storage.TrafficRepository, ws *RemoteWSHandler, store *ProbeMetricsStore) *ProbePublicHandler {
 	return &ProbePublicHandler{repo: repo, wsHandler: ws, probeStore: store}
@@ -53,7 +58,8 @@ type probeHourBucket struct {
 // probeServer 是对外暴露的白名单字段集合(刻意不含 id/ip/token/host/reset_day 等)。
 // 新增的 cpu/mem/disk/ping 全用指针/切片 + omitempty:未开启或无数据时整个字段消失,不泄露 0 值。
 type probeServer struct {
-	Name string `json:"name,omitempty"` // show_name 关闭时省略
+	Name   string `json:"name,omitempty"` // show_name 关闭时省略
+	Region string `json:"region,omitempty"`
 	// 网速/流量是展示开关控制的:关闭时置 nil + omitempty,整个字段消失,前端据此隐藏。
 	UploadSpeed   *int64 `json:"upload_speed,omitempty"`   // B/s(当前上行速率)
 	DownloadSpeed *int64 `json:"download_speed,omitempty"` // B/s(当前下行速率)
@@ -65,13 +71,18 @@ type probeServer struct {
 	CumulativeDown *int64 `json:"cumulative_down,omitempty"` // 累计下行(SystemRxCycle)
 	Online         bool   `json:"online"`
 	// 真探针字段(聚合数值,用户已接受公开;不含任何主机标识)
-	CPUPct    *float64          `json:"cpu_pct,omitempty"`
-	LoadAvg   string            `json:"loadavg,omitempty"`
-	MemUsed   *int64            `json:"mem_used,omitempty"`
-	MemTotal  *int64            `json:"mem_total,omitempty"`
-	DiskUsed  *int64            `json:"disk_used,omitempty"`
-	DiskTotal *int64            `json:"disk_total,omitempty"`
-	Ping      []probePingSeries `json:"ping,omitempty"`
+	CPUPct          *float64          `json:"cpu_pct,omitempty"`
+	LoadAvg         string            `json:"loadavg,omitempty"`
+	MemUsed         *int64            `json:"mem_used,omitempty"`
+	MemTotal        *int64            `json:"mem_total,omitempty"`
+	DiskUsed        *int64            `json:"disk_used,omitempty"`
+	DiskTotal       *int64            `json:"disk_total,omitempty"`
+	Ping            []probePingSeries `json:"ping,omitempty"`
+	ExpiresAt       string            `json:"expires_at,omitempty"`
+	RenewalPrice    *float64          `json:"renewal_price,omitempty"`
+	RenewalCycle    string            `json:"renewal_cycle,omitempty"`
+	RenewalCurrency string            `json:"renewal_currency,omitempty"`
+	RenewalPriceCNY *float64          `json:"renewal_price_cny,omitempty"`
 }
 
 // ServeHTTP 处理 GET /api/public/probe-servers(无鉴权)。
@@ -124,6 +135,15 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	speedRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricSpeedKey)
 	onTraffic := trafficRaw != "0"
 	onSpeed := speedRaw != "0"
+	showExpiry := h.setting(ctx, probeDisguiseShowExpiryKey)
+	showPrice := h.setting(ctx, probeDisguiseShowPriceKey)
+	showGlobe := h.setting(ctx, probeDisguiseShowGlobeKey)
+	var exchangeRates map[string]float64
+	if showPrice && h.licenseManager != nil {
+		rateCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		exchangeRates, _ = h.licenseManager.ExchangeRates(rateCtx)
+		cancel()
+	}
 
 	// ping 目标的 Key→(Label,ISP) 映射,用于给 ring 里的 targetKey 配展示名(不回传 host/IP)。
 	// 各服务器可单独指定目标,故按服务器解析。
@@ -154,10 +174,21 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		used, _ := h.repo.GetServerTrafficUsed(ctx, s.ID)
 		used += s.TrafficUsedOffset
 		online := (h.wsHandler != nil && h.wsHandler.IsConnected(s.Token)) || s.Status == "connected"
-		ps := probeServer{Online: online}
+		ps := probeServer{Online: online, Region: s.Region}
 		if onSpeed {
 			up, down := s.CurrentUploadSpeed, s.CurrentDownloadSpeed
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
+		}
+		if showExpiry && s.ExpiresAt != nil {
+			ps.ExpiresAt = s.ExpiresAt.Format("2006-01-02")
+		}
+		if showPrice && s.RenewalPrice > 0 {
+			price := s.RenewalPrice
+			ps.RenewalPrice, ps.RenewalCycle, ps.RenewalCurrency = &price, s.RenewalCycle, s.RenewalCurrency
+			if rate, ok := exchangeRates[strings.ToUpper(strings.TrimSpace(s.RenewalCurrency))]; ok && rate > 0 {
+				cny := price * rate
+				ps.RenewalPriceCNY = &cny
+			}
 		}
 		if onTraffic {
 			tu, tl := used, s.TrafficLimit
@@ -193,6 +224,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		},
 		"block_login": blockLogin == "1",
 		"show_name":   showName,
+		"show_globe":  showGlobe,
 		"servers":     out,
 	}, nil
 }
