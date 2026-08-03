@@ -597,15 +597,21 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
+	var defaultExpiry *time.Time
+	if resetDay >= 1 && resetDay <= 31 {
+		next := nextResetDate(time.Now().UTC(), resetDay)
+		defaultExpiry = &next
+		_ = h.repo.UpdateRemoteServerProbeMeta(ctx, server.ID, "", 0, "month", "CNY", defaultExpiry)
+	}
 	if h.licenseManager != nil && strings.TrimSpace(server.IPAddress) != "" {
-		go func(serverID int64, publicIP string) {
+		go func(serverID int64, publicIP string, expiresAt *time.Time) {
 			lookupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			region, err := h.licenseManager.ResolveIPRegion(lookupCtx, publicIP)
 			if err == nil && region.Flag() != "" {
-				_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, serverID, region.Flag(), 0, "month", "CNY", nil)
+				_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, serverID, region.Flag(), 0, "month", "CNY", expiresAt)
 			}
-		}(server.ID, server.IPAddress)
+		}(server.ID, server.IPAddress, defaultExpiry)
 	}
 	// 需求1:添加后立即触发一次 DDNS(若此刻还没上报 IP 则是空跑,agent 连上后会再触发)。
 	if h.ddnsManager != nil && server.DDNSEnabled {
@@ -980,8 +986,13 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		})
 		return
 	}
-	if req.Region != nil || req.RenewalPrice != nil || req.RenewalCycle != nil || req.RenewalCurrency != nil || req.ExpiresAt != nil {
+	shouldDefaultExpiry := oldServer.ExpiresAt == nil && req.ExpiresAt == nil && req.TrafficResetDay >= 1 && req.TrafficResetDay <= 31
+	if req.Region != nil || req.RenewalPrice != nil || req.RenewalCycle != nil || req.RenewalCurrency != nil || req.ExpiresAt != nil || shouldDefaultExpiry {
 		region, price, cycle, currency, expires := oldServer.Region, oldServer.RenewalPrice, oldServer.RenewalCycle, oldServer.RenewalCurrency, oldServer.ExpiresAt
+		if shouldDefaultExpiry {
+			next := nextResetDate(time.Now().UTC(), req.TrafficResetDay)
+			expires = &next
+		}
 		if req.Region != nil {
 			region = *req.Region
 		}

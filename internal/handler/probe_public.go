@@ -179,8 +179,12 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 			up, down := s.CurrentUploadSpeed, s.CurrentDownloadSpeed
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
 		}
-		if showExpiry && s.ExpiresAt != nil {
-			ps.ExpiresAt = s.ExpiresAt.Format("2006-01-02")
+		if showExpiry {
+			if s.ExpiresAt != nil {
+				ps.ExpiresAt = s.ExpiresAt.Format("2006-01-02")
+			} else if s.TrafficResetDay >= 1 && s.TrafficResetDay <= 31 {
+				ps.ExpiresAt = nextResetDate(time.Now().UTC(), s.TrafficResetDay).Format("2006-01-02")
+			}
 		}
 		if showPrice && s.RenewalPrice > 0 {
 			price := s.RenewalPrice
