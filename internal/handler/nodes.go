@@ -1587,9 +1587,11 @@ func (h *nodesHandler) handleClearAll(w http.ResponseWriter, r *http.Request) {
 		for i := range nodes {
 			ids[i] = nodes[i].ID
 		}
+		h.cleanupOutboundsTargetingNodes(r.Context(), nodes)
+		h.cleanupTunnelsTargetingNodes(r.Context(), nodes)
 		cleaned := map[string]bool{}
 		for i := range nodes {
-			h.cleanupRemoteForNode(r.Context(), &nodes[i], ids, cleaned)
+			h.cleanupRemoteInboundForNode(r.Context(), &nodes[i], ids, cleaned)
 		}
 	}
 
@@ -1643,6 +1645,7 @@ func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request)
 	// 撞上 N×M×(HTTP 30s 兜底)= 几分钟并超时失败。再逐节点清各自 OriginalServer 上的 inbound/routed
 	// 出站(外部节点 OriginalServer 为空,自动跳过,基本不发远程请求)。
 	h.cleanupOutboundsTargetingNodes(r.Context(), nodes)
+	h.cleanupTunnelsTargetingNodes(r.Context(), nodes)
 	// excludeIDs=整批 ID:双栈时同入站两节点都在批内才删入站,只删一个则保留;cleaned 去重同一入站的删除请求。
 	cleaned := map[string]bool{}
 	for i := range nodes {
@@ -1694,6 +1697,8 @@ func (h *nodesHandler) cleanupRemoteForNode(ctx context.Context, node *storage.N
 	// 先清「以该节点为出口的出站」—— 这些 outbound + routing rule 可能在任意服务器上,与本节点的 OriginalServer 无关,
 	// 故放在 OriginalServer 守卫之前(外部/手动节点也可能被别的节点当落地出口)。
 	h.cleanupOutboundsTargetingNode(ctx, node)
+	// 同时反查并删除以该节点为转发目标的 tunnel 入站。删除事件会继续清掉 tunnel 配套节点。
+	h.cleanupTunnelsTargetingNodes(ctx, []storage.Node{*node})
 	h.cleanupRemoteInboundForNode(ctx, node, excludeIDs, cleaned)
 }
 
@@ -1847,8 +1852,86 @@ func (h *nodesHandler) cleanupOutboundsTargetingNode(ctx context.Context, node *
 
 // outboundTarget 一个待删节点的落地地址集 + 端口,用于比对 agent 出站是否指向它。
 type outboundTarget struct {
-	addrSet map[string]bool
-	port    int
+	addrSet       map[string]bool
+	port          int
+	protocol      string
+	socksUsername string
+	socksPassword string
+}
+
+func nodeOutboundTarget(ctx context.Context, repo *storage.TrafficRepository, node *storage.Node) (outboundTarget, bool) {
+	if node == nil {
+		return outboundTarget{}, false
+	}
+	var clash map[string]any
+	if json.Unmarshal([]byte(node.ClashConfig), &clash) != nil {
+		return outboundTarget{}, false
+	}
+	port := toInt(clash["port"])
+	if port == 0 {
+		return outboundTarget{}, false
+	}
+	addrSet := map[string]bool{}
+	if s, _ := clash["server"].(string); strings.TrimSpace(s) != "" {
+		addrSet[s] = true
+	}
+	if node.OriginalServer != "" {
+		if srv, err := repo.GetRemoteServerByName(ctx, node.OriginalServer); err == nil && srv != nil {
+			for _, a := range []string{srv.IPAddress, srv.IPAddressV6, srv.Domain, srv.DomainV6, srv.PullAddress, srv.PullAddressV6} {
+				if a = strings.TrimSpace(a); a != "" {
+					addrSet[a] = true
+				}
+			}
+		}
+	}
+	if len(addrSet) == 0 {
+		return outboundTarget{}, false
+	}
+	t := outboundTarget{addrSet: addrSet, port: port, protocol: normalizeProtocol(fmt.Sprint(clash["type"]))}
+	if t.protocol == "socks" || t.protocol == "socks5" {
+		t.protocol = "socks"
+		t.socksUsername = fmt.Sprint(clash["username"])
+		t.socksPassword = fmt.Sprint(clash["password"])
+		if t.socksUsername == "<nil>" {
+			t.socksUsername = ""
+		}
+		if t.socksPassword == "<nil>" {
+			t.socksPassword = ""
+		}
+	}
+	return t, true
+}
+
+// outboundTargetsNode adds credential disambiguation for SOCKS5. Multiple
+// upstream accounts commonly share one IP:port; deleting one node must not
+// remove outbounds belonging to another account.
+func outboundTargetsNode(ob map[string]any, target outboundTarget) bool {
+	if !outboundTargetsAddr(ob, target.addrSet, target.port) {
+		return false
+	}
+	if target.protocol != "socks" {
+		return true
+	}
+	if normalizeProtocol(fmt.Sprint(ob["protocol"])) != "socks" {
+		return false
+	}
+	settings, _ := ob["settings"].(map[string]any)
+	servers, _ := settings["servers"].([]interface{})
+	if len(servers) == 0 {
+		return target.socksUsername == "" && target.socksPassword == ""
+	}
+	server, _ := servers[0].(map[string]any)
+	users, _ := server["users"].([]interface{})
+	if len(users) == 0 {
+		return target.socksUsername == "" && target.socksPassword == ""
+	}
+	for _, raw := range users {
+		user, _ := raw.(map[string]any)
+		if fmt.Sprint(user["user"]) == target.socksUsername && fmt.Sprint(user["pass"]) == target.socksPassword {
+			return true
+		}
+	}
+	return false
 }
 
 // cleanupOutboundsTargetingNodes 批量清理「以这些节点为落地出口」的 agent 出站 + 引用它们的 routing rule。
@@ -1866,37 +1949,9 @@ func (h *nodesHandler) cleanupOutboundsTargetingNodes(ctx context.Context, nodes
 	targets := make([]outboundTarget, 0, len(nodes))
 	for i := range nodes {
 		node := &nodes[i]
-		var clash map[string]any
-		if json.Unmarshal([]byte(node.ClashConfig), &clash) != nil {
-			continue
+		if target, ok := nodeOutboundTarget(ctx, h.repo, node); ok {
+			targets = append(targets, target)
 		}
-		port := 0
-		switch v := clash["port"].(type) {
-		case float64:
-			port = int(v)
-		case int:
-			port = v
-		}
-		if port == 0 {
-			continue
-		}
-		addrSet := map[string]bool{}
-		if s, _ := clash["server"].(string); strings.TrimSpace(s) != "" {
-			addrSet[s] = true
-		}
-		if node.OriginalServer != "" {
-			if srv, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer); err == nil && srv != nil {
-				for _, a := range []string{srv.IPAddress, srv.Domain, srv.PullAddress} {
-					if a = strings.TrimSpace(a); a != "" {
-						addrSet[a] = true
-					}
-				}
-			}
-		}
-		if len(addrSet) == 0 {
-			continue
-		}
-		targets = append(targets, outboundTarget{addrSet: addrSet, port: port})
 	}
 	if len(targets) == 0 {
 		return
@@ -1941,7 +1996,7 @@ func (h *nodesHandler) cleanupOutboundsTargetingNodes(ctx context.Context, nodes
 					continue
 				}
 				for _, t := range targets {
-					if outboundTargetsAddr(ob, t.addrSet, t.port) {
+					if outboundTargetsNode(ob, t) {
 						h.removeOutboundAndRules(ctx, srv.ID, srv.Name, tag)
 						break // 该出站已命中并删除,不再比对其它 target
 					}
@@ -1950,6 +2005,71 @@ func (h *nodesHandler) cleanupOutboundsTargetingNodes(ctx context.Context, nodes
 		}(srv)
 	}
 	wg.Wait()
+}
+
+// cleanupTunnelsTargetingNodes removes tunnel inbounds whose fixed forwarding
+// destination points at one of the deleted nodes. It intentionally skips the
+// infrastructure tunnel-in used by master HTTPS recovery.
+func (h *nodesHandler) cleanupTunnelsTargetingNodes(ctx context.Context, nodes []storage.Node) {
+	if h.remoteManage == nil || len(nodes) == 0 {
+		return
+	}
+	targets := make([]outboundTarget, 0, len(nodes))
+	for i := range nodes {
+		if target, ok := nodeOutboundTarget(ctx, h.repo, &nodes[i]); ok {
+			targets = append(targets, target)
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	servers, err := h.repo.ListRemoteServers(ctx)
+	if err != nil {
+		return
+	}
+	for _, srv := range servers {
+		if srv.Status != storage.RemoteServerStatusConnected {
+			continue
+		}
+		raw, err := h.remoteManage.forwardToRemoteServer(ctx, srv.ID, http.MethodGet, "/api/child/inbounds", nil)
+		if err != nil {
+			continue
+		}
+		var resp struct {
+			Inbounds []map[string]any `json:"inbounds"`
+		}
+		if json.Unmarshal(raw, &resp) != nil {
+			continue
+		}
+		for _, inbound := range resp.Inbounds {
+			if fmt.Sprint(inbound["protocol"]) != "tunnel" {
+				continue
+			}
+			tag := strings.TrimSpace(fmt.Sprint(inbound["tag"]))
+			if tag == "" || tag == "tunnel-in" || tag == "api" {
+				continue
+			}
+			settings, _ := inbound["settings"].(map[string]any)
+			address := strings.TrimSpace(fmt.Sprint(settings["address"]))
+			port := toInt(settings["port"])
+			matched := false
+			for _, target := range targets {
+				if target.addrSet[address] && target.port == port {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			body, _ := json.Marshal(map[string]string{"action": "remove", "tag": tag})
+			if _, err := h.remoteManage.forwardToRemoteServer(ctx, srv.ID, http.MethodPost, "/api/child/inbounds", body); err != nil {
+				log.Printf("[Nodes] cleanup tunnel-target: remove tunnel (server=%s tag=%s) failed: %v", srv.Name, tag, err)
+			} else {
+				log.Printf("[Nodes] cleanup tunnel-target: removed tunnel %s on %s", tag, srv.Name)
+			}
+		}
+	}
 }
 
 // removeOutboundAndRules 删指定 server 上的 outbound(by tag)+ 所有引用该 outboundTag 的 routing rule

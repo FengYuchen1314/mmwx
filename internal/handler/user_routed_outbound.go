@@ -460,7 +460,36 @@ func verifyOutboundMatchesTarget(outbound map[string]interface{}, targetClashJSO
 	if gotServer != wantServer || gotPort != wantPort {
 		return fmt.Errorf("outbound 地址 %s:%d 与目标节点 %s:%d 不一致", gotServer, gotPort, wantServer, wantPort)
 	}
+	if strings.EqualFold(fmt.Sprint(clash["type"]), "socks5") {
+		wantUser := strings.TrimSpace(fmt.Sprint(clash["username"]))
+		wantPass := fmt.Sprint(clash["password"])
+		if wantUser == "<nil>" {
+			wantUser = ""
+		}
+		if wantPass == "<nil>" {
+			wantPass = ""
+		}
+		gotUser, gotPass := extractSocksOutboundCredential(outbound)
+		if gotUser != wantUser || gotPass != wantPass {
+			return errors.New("SOCKS5 outbound 用户名或密码与目标节点不一致")
+		}
+	}
 	return nil
+}
+
+func extractSocksOutboundCredential(outbound map[string]interface{}) (string, string) {
+	settings, _ := outbound["settings"].(map[string]interface{})
+	servers, _ := settings["servers"].([]interface{})
+	if len(servers) == 0 {
+		return "", ""
+	}
+	server, _ := servers[0].(map[string]interface{})
+	users, _ := server["users"].([]interface{})
+	if len(users) == 0 {
+		return "", ""
+	}
+	user, _ := users[0].(map[string]interface{})
+	return strings.TrimSpace(fmt.Sprint(user["user"])), fmt.Sprint(user["pass"])
 }
 
 func extractOutboundAddr(outbound map[string]interface{}) (string, int) {
