@@ -422,10 +422,35 @@ func (e *TrafficLimitEnforcer) restoreUserToInbounds(ctx context.Context, user s
 	ok := true
 	for _, cfg := range configs {
 		if err := addUserToInbound(ctx, e.remoteManage, e.repo, user, cfg.ServerID, cfg.InboundTag); err != nil {
+			// Agent 明确确认 inbound 已不存在时，这条 DB 绑定已经是孤儿配置。
+			// 它不可能通过重试恢复；若继续把它算作失败，会让 is_over_limit 永远无法清除，
+			// limiter 也会持续跳过该用户，最终表现为“流量已重置但连接数不显示”。
+			if orphan, removed := removeOrphanInboundConfig(ctx, e.repo, cfg, err); orphan {
+				if !removed {
+					ok = false
+				}
+				continue
+			}
 			log.Printf("[TrafficLimitEnforcer] Failed to restore %s to %s on server %d: %v",
 				user.Username, cfg.InboundTag, cfg.ServerID, err)
 			ok = false
 		}
 	}
 	return ok
+}
+
+// removeOrphanInboundConfig 仅处理 Agent 明确返回的 inbound not found。
+// 网络超时、Agent 离线、配置下发失败等错误仍保留绑定并重试，避免误删仍有效的凭据。
+func removeOrphanInboundConfig(ctx context.Context, repo *storage.TrafficRepository, cfg storage.UserInboundConfig, restoreErr error) (orphan, removed bool) {
+	if !isInboundNotFoundErr(restoreErr) {
+		return false, false
+	}
+	if err := repo.DeleteUserInboundConfig(ctx, cfg.Username, cfg.ServerID, cfg.InboundTag); err != nil {
+		log.Printf("[TrafficLimitEnforcer] Failed to delete orphan inbound config user=%s server=%d tag=%s: %v",
+			cfg.Username, cfg.ServerID, cfg.InboundTag, err)
+		return true, false
+	}
+	log.Printf("[TrafficLimitEnforcer] Deleted orphan inbound config user=%s server=%d tag=%s (agent confirmed inbound not found)",
+		cfg.Username, cfg.ServerID, cfg.InboundTag)
+	return true, true
 }
