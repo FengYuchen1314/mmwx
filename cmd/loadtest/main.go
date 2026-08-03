@@ -34,9 +34,15 @@ func main() {
 	interval := flag.Duration("interval", 15*time.Second, "每个 agent 的上报间隔")
 	users := flag.Int("users", 80, "每次上报携带的 user(email)条数")
 	inbounds := flag.Int("inbounds", 8, "每次上报的 inbound tag 数(outbound 同数)")
-	duration := flag.Duration("duration", 180*time.Second, "压测总时长")
+	duration := flag.Duration("duration", 10*time.Minute, "压测总时长")
 	ckpt := flag.Duration("ckpt", 300*time.Second, "WAL checkpoint 间隔(真实主控=5min)")
 	dir := flag.String("dir", "", "DB 目录(默认临时目录,测完自行清理)")
+	driver := flag.String("driver", "sqlite", "数据库类型: sqlite 或 postgres")
+	pgHost := flag.String("pg-host", "127.0.0.1", "PostgreSQL 主机")
+	pgPort := flag.Int("pg-port", 55432, "PostgreSQL 端口")
+	pgDatabase := flag.String("pg-database", "mmwx_loadtest", "PostgreSQL 数据库名(必须为空)")
+	pgUser := flag.String("pg-user", "mmwx", "PostgreSQL 用户")
+	pgPassword := flag.String("pg-password", "mmwx-loadtest", "PostgreSQL 密码")
 	flag.Parse()
 
 	if *dir == "" {
@@ -47,9 +53,13 @@ func main() {
 		*dir = d
 	}
 	dbPath := filepath.Join(*dir, "mmwx.db")
-	log.Printf("DB: %s", dbPath)
+	config := storage.DatabaseConfig{Driver: "sqlite", Path: dbPath}
+	if *driver == "postgres" {
+		config = storage.DatabaseConfig{Driver: "postgres", Host: *pgHost, Port: *pgPort, Database: *pgDatabase, Username: *pgUser, Password: *pgPassword, SSLMode: "disable", MaxOpenConns: 50, MaxIdleConns: 20}
+	}
+	log.Printf("DB driver=%s target=%s", config.Driver, config.SafeView())
 
-	repo, err := storage.NewTrafficRepository(dbPath)
+	repo, err := storage.NewTrafficRepositoryFromConfig(config)
 	if err != nil {
 		log.Fatalf("open repo: %v", err)
 	}
@@ -132,6 +142,10 @@ func main() {
 				lastReports = r
 				wal := fileSizeMB(dbPath + "-wal")
 				db := fileSizeMB(dbPath)
+				if status, err := repo.DatabaseStatus(context.Background()); err == nil {
+					db = float64(status.Size) / 1024 / 1024
+					wal = float64(status.WALSize) / 1024 / 1024
+				}
 				if w := int64(wal * 1024 * 1024); w > walPeak {
 					walPeak = w
 				}
@@ -205,13 +219,18 @@ func main() {
 	finalTrunc, finalRem, _ := repo.CheckpointBestEffort()
 
 	p50, p99 := percentiles(&latMu, &lats)
+	finalDB, finalWAL := fileSizeMB(dbPath), fileSizeMB(dbPath+"-wal")
+	if status, err := repo.DatabaseStatus(context.Background()); err == nil {
+		finalDB = float64(status.Size) / 1024 / 1024
+		finalWAL = float64(status.WALSize) / 1024 / 1024
+	}
 	fmt.Printf("\n========== 压测结果 ==========\n")
-	fmt.Printf("参数: agents=%d interval=%v users=%d inbounds=%d duration=%v ckpt=%v\n",
-		*agents, *interval, *users, *inbounds, *duration, *ckpt)
+	fmt.Printf("参数: driver=%s agents=%d interval=%v users=%d inbounds=%d duration=%v ckpt=%v\n",
+		config.Driver, *agents, *interval, *users, *inbounds, *duration, *ckpt)
 	fmt.Printf("成功上报: %d  失败: %d (其中非200: %d)\n", atomic.LoadInt64(&reports), atomic.LoadInt64(&errs), atomic.LoadInt64(&http4xx))
 	fmt.Printf("上报延迟: p50=%.1fms p99=%.1fms\n", p50, p99)
 	fmt.Printf("WAL 峰值: %.2f MB   收尾 DB: %.2f MB   收尾 WAL: %.2f MB\n",
-		float64(walPeak)/1024/1024, fileSizeMB(dbPath), fileSizeMB(dbPath+"-wal"))
+		float64(walPeak)/1024/1024, finalDB, finalWAL)
 	fmt.Printf("checkpoint: TRUNCATE成功 %d 次  PASSIVE(抢窗失败) %d 次\n",
 		atomic.LoadInt64(&ckptTrunc), atomic.LoadInt64(&ckptPassive))
 	fmt.Printf("收尾 TRUNCATE: truncated=%v remaining=%d 帧\n", finalTrunc, finalRem)

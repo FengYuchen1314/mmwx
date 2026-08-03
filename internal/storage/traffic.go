@@ -7515,43 +7515,29 @@ func (r *TrafficRepository) UpsertRemoteServerSystemTraffic(ctx context.Context,
 		return errors.New("traffic repository not initialized")
 	}
 
-	var (
-		lastRx   int64
-		lastTx   int64
-		lastBoot int64
-	)
-	err := r.db.QueryRowContext(ctx, `
-		SELECT COALESCE(system_last_seen_rx, 0), COALESCE(system_last_seen_tx, 0),
-		       COALESCE(system_boot_time_unix, 0)
-		FROM remote_servers WHERE id = ?`, serverID).Scan(&lastRx, &lastTx, &lastBoot)
-	if err != nil {
-		return fmt.Errorf("read server system traffic state: %w", err)
-	}
-
-	rxDelta, txDelta := int64(0), int64(0)
-	// lastBoot=0 是首次上报;lastBoot != bootTimeUnix 是系统/agent 重启 — 两种情况都不计 delta
-	if lastBoot != 0 && lastBoot == bootTimeUnix {
-		if rxTotal >= lastRx {
-			rxDelta = rxTotal - lastRx
-		}
-		if txTotal >= lastTx {
-			txDelta = txTotal - lastTx
-		}
-	}
-
-	_, err = r.db.ExecContext(ctx, `
+	// 用一条原子 UPDATE 在数据库内计算 delta。旧实现先 SELECT 再 UPDATE:
+	// 每轮多一次往返,且两个并发上报可能读到同一 last_seen 后重复累计。
+	result, err := r.db.ExecContext(ctx, `
 		UPDATE remote_servers SET
-			system_rx_cycle = COALESCE(system_rx_cycle, 0) + ?,
-			system_tx_cycle = COALESCE(system_tx_cycle, 0) + ?,
+			system_rx_cycle = COALESCE(system_rx_cycle, 0) + CASE
+				WHEN COALESCE(system_boot_time_unix,0) != 0 AND system_boot_time_unix = ? AND ? >= COALESCE(system_last_seen_rx,0)
+				THEN ? - COALESCE(system_last_seen_rx,0) ELSE 0 END,
+			system_tx_cycle = COALESCE(system_tx_cycle, 0) + CASE
+				WHEN COALESCE(system_boot_time_unix,0) != 0 AND system_boot_time_unix = ? AND ? >= COALESCE(system_last_seen_tx,0)
+				THEN ? - COALESCE(system_last_seen_tx,0) ELSE 0 END,
 			system_last_seen_rx = ?,
 			system_last_seen_tx = ?,
 			system_boot_time_unix = ?,
 			system_traffic_updated_at = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
 		WHERE id = ?`,
-		rxDelta, txDelta, rxTotal, txTotal, bootTimeUnix, serverID)
+		bootTimeUnix, rxTotal, rxTotal, bootTimeUnix, txTotal, txTotal,
+		rxTotal, txTotal, bootTimeUnix, serverID)
 	if err != nil {
 		return fmt.Errorf("update server system traffic: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrRemoteServerNotFound
 	}
 	return nil
 }
@@ -11320,7 +11306,7 @@ func (r *TrafficRepository) UpdateRemoteServerSpeed(ctx context.Context, id int6
 		return errors.New("remote server id is required")
 	}
 
-	const stmt = `UPDATE remote_servers SET current_upload_speed = ?, current_download_speed = ?, speed_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	const stmt = `UPDATE remote_servers SET current_upload_speed = ?, current_download_speed = ?, speed_updated_at = CURRENT_TIMESTAMP, status = 'connected', last_heartbeat = CURRENT_TIMESTAMP, offline_since = NULL, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
 
 	result, err := r.db.ExecContext(ctx, stmt, uploadSpeed, downloadSpeed, id)
 	if err != nil {
@@ -11349,7 +11335,7 @@ func (r *TrafficRepository) UpdateRemoteServerSpeedByToken(ctx context.Context, 
 		return errors.New("token is required")
 	}
 
-	const stmt = `UPDATE remote_servers SET current_upload_speed = ?, current_download_speed = ?, speed_updated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE token = ?`
+	const stmt = `UPDATE remote_servers SET current_upload_speed = ?, current_download_speed = ?, speed_updated_at = CURRENT_TIMESTAMP, status = 'connected', last_heartbeat = CURRENT_TIMESTAMP, offline_since = NULL, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE token = ?`
 
 	result, err := r.db.ExecContext(ctx, stmt, uploadSpeed, downloadSpeed, token)
 	if err != nil {
@@ -14012,6 +13998,9 @@ func (r *TrafficRepository) UpsertTrafficBatch(ctx context.Context, serverID int
 	}
 	if len(emails) == 0 && len(users) == 0 {
 		return nil
+	}
+	if r.config.Driver == "postgres" {
+		return r.upsertTrafficBatchPostgres(ctx, serverID, emails, users, isXrayRestarted)
 	}
 
 	// 用 BEGIN IMMEDIATE 而不是默认 BeginTx(deferred):

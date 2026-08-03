@@ -1437,11 +1437,8 @@ func (h *RemoteWSHandler) handleSpeed(wsConn *RemoteWSConnection, payload json.R
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// 更新速度报告上的last_heartbeat - 这使服务器标记为在线
-	if _, _, _, _, err := h.repo.UpdateRemoteServerLastActivity(ctx, wsConn.ServerID); err != nil {
-		log.Printf("[Remote WS] Failed to update last activity for server %s: %v", wsConn.ServerName, err)
-	}
-
+	// UpdateRemoteServerSpeed 同一条语句同时刷新在线状态和 last_heartbeat，
+	// 避免每次速度上报产生两次数据库写入。
 	if err := h.repo.UpdateRemoteServerSpeed(ctx, wsConn.ServerID, speedPayload.UploadSpeed, speedPayload.DownloadSpeed); err != nil {
 		log.Printf("[Remote WS] Failed to update speed for server %s: %v", wsConn.ServerName, err)
 		return

@@ -29,6 +29,9 @@ func (r *TrafficRepository) UpsertNodeTrafficBatch(ctx context.Context, serverID
 	if len(items) == 0 {
 		return nil
 	}
+	if r.config.Driver == "postgres" {
+		return r.upsertNodeTrafficBatchPostgres(ctx, serverID, items, isXrayRestarted)
+	}
 
 	// 用 BEGIN IMMEDIATE 而不是默认 BeginTx(deferred):deferred 以读快照开始,首个 SELECT 取快照后
 	// 再 INSERT/UPDATE 升级写锁 —— 期间别的连接提交了写就报 SQLITE_BUSY_SNAPSHOT(517),而 busy_timeout
