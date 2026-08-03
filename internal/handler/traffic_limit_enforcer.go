@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"miaomiaowux/internal/storage"
@@ -12,9 +13,10 @@ import (
 )
 
 type TrafficLimitEnforcer struct {
-	repo         *storage.TrafficRepository
-	remoteManage *RemoteManageHandler
-	pusher       *LimiterConfigPusher
+	repo          *storage.TrafficRepository
+	remoteManage  *RemoteManageHandler
+	pusher        *LimiterConfigPusher
+	serverResetMu sync.Mutex
 }
 
 func NewTrafficLimitEnforcer(repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher) *TrafficLimitEnforcer {
@@ -26,6 +28,9 @@ func (e *TrafficLimitEnforcer) Start(ctx context.Context, interval time.Duration
 		interval = 5 * time.Minute
 	}
 	log.Printf("[TrafficLimitEnforcer] Starting with interval: %v", interval)
+	// 独立兜底协程不依赖用户套餐/限流扫描。即使常规 CheckAll 因某个 Agent
+	// 或用户处理变慢，服务器账单日重置仍会按小时补偿执行。
+	go e.startServerResetGuard(ctx)
 	e.recordedCheck(ctx)
 
 	ticker := time.NewTicker(interval)
@@ -40,6 +45,28 @@ func (e *TrafficLimitEnforcer) Start(ctx context.Context, interval time.Duration
 	}
 }
 
+func (e *TrafficLimitEnforcer) startServerResetGuard(ctx context.Context) {
+	// 启动后先审计一次，覆盖主控在账单日停机、重启后错过执行的场景。
+	e.recordedServerResetGuard(ctx)
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.recordedServerResetGuard(ctx)
+		}
+	}
+}
+
+func (e *TrafficLimitEnforcer) recordedServerResetGuard(ctx context.Context) {
+	taskrun.Record(ctx, "server_traffic_reset_guard", func() (string, error) {
+		count, err := e.CheckServerTrafficResets(ctx, time.Now())
+		return fmt.Sprintf("servers_reset=%d", count), err
+	})
+}
+
 func (e *TrafficLimitEnforcer) recordedCheck(ctx context.Context) {
 	taskrun.Record(ctx, "traffic_enforcer", func() (string, error) {
 		return e.CheckAll(ctx)
@@ -52,7 +79,7 @@ func (e *TrafficLimitEnforcer) recordedCheck(ctx context.Context) {
 //  1. 必须 user.IsReset=true,resetDay∈[1,31]
 //  2. 当月的"有效重置日" = min(resetDay, 当月最后一天) — 处理 reset_day=31 但 2 月只有 28 天的边界
 //  3. now.Day() >= 有效重置日 才进入触发窗口
-//  4. lastResetAt 为 nil(从未重置过)或不在本月 → 应该重置;否则跳过(避免同月反复)
+//  4. lastResetAt 为 nil,或早于本月实际重置边界 → 应该重置;否则跳过
 //
 // 注:用 now 的本地时区(time.Now() 默认)。生产环境 server 时区需配为本地时区,否则用户感知的"7号"会偏移。
 // effectiveResetDay 返回 resetDay 在 t 所属月份的实际生效日:短月份夹到月末。
@@ -74,14 +101,16 @@ func shouldResetThisMonth(now time.Time, isReset bool, resetDay int, lastResetAt
 		return false
 	}
 	effectiveDay := effectiveResetDay(now, resetDay)
-	if now.Day() < effectiveDay {
+	resetBoundary := time.Date(now.Year(), now.Month(), effectiveDay, 0, 0, 0, 0, now.Location())
+	if now.Before(resetBoundary) {
 		return false
 	}
 	if lastResetAt == nil {
 		return true
 	}
-	// 同年同月 = 本月已经 reset 过,跳过
-	return lastResetAt.Year() != now.Year() || lastResetAt.Month() != now.Month()
+	// 不能只比较年月。服务器若在本月重置日前创建，last_traffic_reset_at
+	// 虽然属于本月，却并不代表本月账单日已经执行过重置。
+	return lastResetAt.In(now.Location()).Before(resetBoundary)
 }
 
 func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
@@ -292,38 +321,52 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 		}
 	}
 
-	// 服务器统一按 UTC 账单日在 00:05 后重置，不受主控或 Agent 所在时区影响。
-	if servers, sErr := e.repo.ListRemoteServers(ctx); sErr == nil {
-		for _, s := range servers {
-			if s.IsFederated {
-				continue // 联邦分享的服务器流量归拥有方管,本机不重置
-			}
-			utcNow := now.UTC()
-			isAfter0005 := utcNow.Hour() > 0 || (utcNow.Hour() == 0 && utcNow.Minute() >= 5)
-			var lastResetUTC *time.Time
-			if s.LastTrafficResetAt != nil {
-				t := s.LastTrafficResetAt.UTC()
-				lastResetUTC = &t
-			}
-			if !isAfter0005 || !shouldResetThisMonth(utcNow, true, s.TrafficResetDay, lastResetUTC) {
-				continue
-			}
-			if rErr := e.repo.ResetRemoteServerTrafficCycleAt(ctx, s.ID, now); rErr != nil {
-				log.Printf("[TrafficLimitEnforcer] reset server %d(%s) traffic failed: %v", s.ID, s.Name, rErr)
-				runErrors = append(runErrors, fmt.Errorf("reset server %d(%s): %w", s.ID, s.Name, rErr))
-				continue
-			}
-			serverResetCount++
-			log.Printf("[TrafficLimitEnforcer] server %d(%s) monthly traffic reset (day=%d, utc_time=%s)",
-				s.ID, s.Name, s.TrafficResetDay, utcNow.Format(time.RFC3339))
-		}
-	} else {
-		log.Printf("[TrafficLimitEnforcer] list servers for reset failed: %v", sErr)
-		runErrors = append(runErrors, fmt.Errorf("list servers: %w", sErr))
+	serverResetCount, serverResetErr := e.CheckServerTrafficResets(ctx, now)
+	if serverResetErr != nil {
+		runErrors = append(runErrors, serverResetErr)
 	}
 
 	summary := fmt.Sprintf("users_reset=%d servers_reset=%d", userResetCount, serverResetCount)
 	return summary, errors.Join(runErrors...)
+}
+
+// CheckServerTrafficResets 是常规扫描与独立兜底任务共用的服务器重置入口。
+// 互斥锁保证两条调度链同时命中时不会重复计算 offset。
+func (e *TrafficLimitEnforcer) CheckServerTrafficResets(ctx context.Context, now time.Time) (int, error) {
+	e.serverResetMu.Lock()
+	defer e.serverResetMu.Unlock()
+
+	servers, err := e.repo.ListRemoteServers(ctx)
+	if err != nil {
+		log.Printf("[TrafficLimitEnforcer] list servers for reset failed: %v", err)
+		return 0, fmt.Errorf("list servers for reset: %w", err)
+	}
+	utcNow := now.UTC()
+	isAfter0005 := utcNow.Hour() > 0 || (utcNow.Hour() == 0 && utcNow.Minute() >= 5)
+	resetCount := 0
+	var runErrors []error
+	for _, s := range servers {
+		if s.IsFederated {
+			continue
+		}
+		var lastResetUTC *time.Time
+		if s.LastTrafficResetAt != nil {
+			t := s.LastTrafficResetAt.UTC()
+			lastResetUTC = &t
+		}
+		if !isAfter0005 || !shouldResetThisMonth(utcNow, true, s.TrafficResetDay, lastResetUTC) {
+			continue
+		}
+		if resetErr := e.repo.ResetRemoteServerTrafficCycleAt(ctx, s.ID, now); resetErr != nil {
+			log.Printf("[TrafficLimitEnforcer] reset server %d(%s) traffic failed: %v", s.ID, s.Name, resetErr)
+			runErrors = append(runErrors, fmt.Errorf("reset server %d(%s): %w", s.ID, s.Name, resetErr))
+			continue
+		}
+		resetCount++
+		log.Printf("[TrafficLimitEnforcer] server %d(%s) monthly traffic reset (day=%d, utc_time=%s)",
+			s.ID, s.Name, s.TrafficResetDay, utcNow.Format(time.RFC3339))
+	}
+	return resetCount, errors.Join(runErrors...)
 }
 
 // removeUserFromAllInbounds 从该用户所有 inbound 摘除 client。

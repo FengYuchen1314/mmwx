@@ -5035,7 +5035,6 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 	}
 
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
-	rootDomain := extractRootDomain(domain)
 
 	var environment struct {
 		Nginx struct {
@@ -5099,7 +5098,7 @@ func (h *RemoteManageHandler) HandleAddWebsite(w http.ResponseWriter, r *http.Re
 		remoteWriteError(w, http.StatusInternalServerError, "证书服务不可用")
 		return
 	}
-	cert, certErr := h.repo.FindDeployableCertByDomain(ctx, rootDomain, req.ServerID)
+	cert, certErr := h.repo.FindDeployableCertByDomain(ctx, domain, req.ServerID)
 	if certErr != nil || cert == nil || cert.CertPEM == "" || cert.KeyPEM == "" {
 		remoteWriteError(w, http.StatusConflict, fmt.Sprintf("未找到覆盖 %s 的有效证书，请先申请或部署证书", domain))
 		return

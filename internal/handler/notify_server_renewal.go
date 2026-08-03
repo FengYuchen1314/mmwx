@@ -83,6 +83,7 @@ type serverRenewalPlan struct {
 	DueInDays int    // >0 表示应发"将至"提醒,值为剩余天数
 	Renewed   bool   // true 表示应发"续费成功"
 	Cycle     string // 去重用的周期标识(目标重置日)
+	ByExpiry  bool   // true 表示按探针配置的到期日期提醒
 }
 
 // planServerRenewalNotice 决定今天要不要给这台服务器发通知、发哪种。
@@ -110,6 +111,23 @@ func planServerRenewalNotice(now time.Time, resetDay int, online bool) serverRen
 	return serverRenewalPlan{}
 }
 
+// planServerRenewalNoticeWithExpiry 优先使用探针维护的明确到期日期。
+// 只有未配置到期日期时，才兼容旧行为，以每月流量重置日估算续费日。
+func planServerRenewalNoticeWithExpiry(now time.Time, resetDay int, expiresAt *time.Time, online bool) serverRenewalPlan {
+	if expiresAt == nil || expiresAt.IsZero() {
+		return planServerRenewalNotice(now, resetDay, online)
+	}
+	today := dayStart(now)
+	expiry := dayStart(expiresAt.In(now.Location()))
+	daysLeft := int(expiry.Sub(today).Hours() / 24)
+	for _, d := range renewalNoticeDaysAhead {
+		if daysLeft == d {
+			return serverRenewalPlan{DueInDays: d, Cycle: expiry.Format("2006-01-02"), ByExpiry: true}
+		}
+	}
+	return serverRenewalPlan{}
+}
+
 // checkServerRenewal 扫全部远程服务器,按重置日发续费提醒 / 续费成功确认。
 func checkServerRenewal(ctx context.Context, repo *storage.TrafficRepository) {
 	servers, err := repo.ListRemoteServers(ctx)
@@ -120,7 +138,7 @@ func checkServerRenewal(ctx context.Context, repo *storage.TrafficRepository) {
 	now := time.Now()
 	for _, s := range servers {
 		online := s.Status == storage.RemoteServerStatusConnected
-		plan := planServerRenewalNotice(now, s.TrafficResetDay, online)
+		plan := planServerRenewalNoticeWithExpiry(now, s.TrafficResetDay, s.ExpiresAt, online)
 
 		switch {
 		case plan.Renewed:
@@ -129,21 +147,25 @@ func checkServerRenewal(ctx context.Context, repo *storage.TrafficRepository) {
 			}
 		case plan.DueInDays > 0:
 			if markRenewalNotified(s.ID, plan.Cycle, fmt.Sprintf("d%d", plan.DueInDays)) {
-				SendServerRenewalDueNotification(ctx, s.Name, plan.DueInDays, plan.Cycle, online)
+				SendServerRenewalDueNotification(ctx, s.Name, plan.DueInDays, plan.Cycle, online, plan.ByExpiry)
 			}
 		}
 	}
 }
 
 // SendServerRenewalDueNotification 服务器将在 N 天后到重置日(=续费日)。
-func SendServerRenewalDueNotification(ctx context.Context, serverName string, daysLeft int, resetDate string, online bool) {
+func SendServerRenewalDueNotification(ctx context.Context, serverName string, daysLeft int, resetDate string, online bool, byExpiry bool) {
 	state := "在线"
 	if !online {
 		state = "离线"
 	}
+	dateLabel := "到期(重置)日"
+	if byExpiry {
+		dateLabel = "到期日"
+	}
 	notifyAsync(ctx, notify.EventServerRenewalDue,
 		"⏰ 服务器即将到期",
-		fmt.Sprintf("服务器: `%s`\n到期(重置)日: %s\n剩余: %d 天\n当前状态: %s", serverName, resetDate, daysLeft, state),
+		fmt.Sprintf("服务器: `%s`\n%s: %s\n剩余: %d 天\n当前状态: %s", serverName, dateLabel, resetDate, daysLeft, state),
 	)
 }
 

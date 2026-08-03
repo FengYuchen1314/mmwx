@@ -12982,29 +12982,52 @@ func (r *TrafficRepository) FindDeployableCertByDomain(ctx context.Context, doma
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
-
-	row := r.db.QueryRowContext(ctx, `
+	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if host == "" {
+		return nil, ErrCertificateNotFound
+	}
+	parts := strings.Split(host, ".")
+	candidates := []string{host}
+	// foo.example.com 可由 *.example.com 覆盖。保留更多层级候选是为了兼容
+	// 历史数据，但最终仍以 x509.VerifyHostname 为准，不会误用证书。
+	for i := 1; i < len(parts)-1; i++ {
+		candidates = append(candidates, "*."+strings.Join(parts[i:], "."))
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(candidates)), ",")
+	args := make([]any, 0, len(candidates)+2)
+	for _, candidate := range candidates {
+		args = append(args, candidate)
+	}
+	args = append(args, preferredServerID, host)
+	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
 		       status, expiry_date, issue_date, auto_renew, challenge_mode, webroot_path,
 		       remote_server_id, message, dns_provider_id, deploy_target, deploy_cert_path, deploy_key_path, auto_deploy,
 		       created_at, updated_at
 		FROM certificates
-		WHERE domain = ? AND cert_pem <> '' AND key_pem <> ''
+		WHERE LOWER(domain) IN (`+placeholders+`) AND cert_pem <> '' AND key_pem <> ''
 		ORDER BY CASE WHEN remote_server_id = ? THEN 0 ELSE 1 END,
+		         CASE WHEN LOWER(domain) = ? THEN 0 ELSE 1 END,
 		         CASE WHEN status = 'valid' THEN 0 ELSE 1 END,
 		         id DESC
-		LIMIT 1
-	`, domain, preferredServerID)
-
-	cert, err := scanCertificate(row)
+	`, args...)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrCertificateNotFound
-		}
 		return nil, fmt.Errorf("find deployable certificate by domain: %w", err)
 	}
-
-	return &cert, nil
+	defer rows.Close()
+	for rows.Next() {
+		cert, scanErr := scanCertificate(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("find deployable certificate by domain: %w", scanErr)
+		}
+		if certificatePEMCoversHost(cert.CertPEM, host) {
+			return &cert, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find deployable certificate by domain: %w", err)
+	}
+	return nil, ErrCertificateNotFound
 }
 
 // FindCertificateForDomain 找一张能覆盖该 FQDN 的 valid 证书,用于 DDNS 推断 DNS provider:

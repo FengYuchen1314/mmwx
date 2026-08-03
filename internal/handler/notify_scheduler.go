@@ -155,10 +155,11 @@ func StartNotifyScheduler(ctx context.Context, repo *storage.TrafficRepository) 
 				}
 			}
 
-			// 服务器续费提醒 — 与套餐到期同一时段(每天 09:00 扫一次),内存 lastServerRenewalRun 防同日重复
+			// 服务器续费提醒 — 09:00 后当天尚未执行就补跑，避免主控恰在 09:00
+			// 重启或调度延迟后整天漏掉 7/3 天提醒。
 			if cfg.NotifyServerRenewal {
 				today := now.Format("2006-01-02")
-				if now.Format("15:04") == "09:00" && lastServerRenewalRun != today {
+				if now.Hour() >= 9 && lastServerRenewalRun != today {
 					lastServerRenewalRun = today
 					go checkServerRenewal(ctx, repo)
 				}
