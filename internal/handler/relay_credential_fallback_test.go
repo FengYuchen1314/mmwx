@@ -1,10 +1,83 @@
 package handler
 
 import (
+	"encoding/base64"
 	"testing"
 
 	"miaomiaowux/internal/storage"
 )
+
+func TestRegenerateInboundCredentialsUsesNewSS2022MethodKeyLength(t *testing.T) {
+	tests := []struct {
+		name      string
+		oldMethod string
+		newMethod string
+		wantBytes int
+	}{
+		{name: "aes128 to chacha20", oldMethod: "2022-blake3-aes-128-gcm", newMethod: "2022-blake3-chacha20-poly1305", wantBytes: 32},
+		{name: "aes256 to aes128", oldMethod: "2022-blake3-aes-256-gcm", newMethod: "2022-blake3-aes-128-gcm", wantBytes: 16},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := map[string]interface{}{
+				"protocol": "shadowsocks",
+				"settings": map[string]interface{}{
+					"method":   tt.oldMethod,
+					"password": base64.StdEncoding.EncodeToString(make([]byte, shadowsocksKeyLength(tt.oldMethod))),
+					"clients": []interface{}{map[string]interface{}{
+						"email": "user__ss-test", "password": base64.StdEncoding.EncodeToString(make([]byte, shadowsocksKeyLength(tt.oldMethod))),
+					}},
+				},
+			}
+			inbound := map[string]interface{}{
+				"protocol": "shadowsocks",
+				"settings": map[string]interface{}{"method": tt.newMethod},
+			}
+			credentials, err := regenerateInboundCredentials(inbound, current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			settings := inbound["settings"].(map[string]interface{})
+			assertSS2022KeyBytes(t, settings["password"], tt.wantBytes)
+			clients := settings["clients"].([]interface{})
+			assertSS2022KeyBytes(t, clients[0].(map[string]interface{})["password"], tt.wantBytes)
+			if credentials["user__ss-test"] == "" {
+				t.Fatal("regenerated credential map is missing the client")
+			}
+		})
+	}
+}
+
+func assertSS2022KeyBytes(t *testing.T, value interface{}, want int) {
+	t.Helper()
+	decoded, err := base64.StdEncoding.DecodeString(value.(string))
+	if err != nil {
+		t.Fatalf("password is not base64: %v", err)
+	}
+	if len(decoded) != want {
+		t.Fatalf("decoded key length = %d, want %d", len(decoded), want)
+	}
+}
+
+func TestFirstInboundFlowIgnoresMissingAndNonStringValues(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings map[string]interface{}
+		want     string
+	}{
+		{name: "missing", settings: map[string]interface{}{"clients": []interface{}{map[string]interface{}{"email": "user"}}}},
+		{name: "nil", settings: map[string]interface{}{"clients": []interface{}{map[string]interface{}{"flow": nil}}}},
+		{name: "non string", settings: map[string]interface{}{"clients": []interface{}{map[string]interface{}{"flow": 1}}}},
+		{name: "trimmed string", settings: map[string]interface{}{"clients": []interface{}{map[string]interface{}{"flow": " xtls-rprx-vision "}}}, want: "xtls-rprx-vision"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firstInboundFlow(tt.settings); got != tt.want {
+				t.Fatalf("firstInboundFlow() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
 
 // 复现并回归「中转/外部节点订阅用错凭据」bug:节点 OriginalServer 为空(host 未命中已注册服务器 →
 // enforceLicenseIfNodeHostMatchesServer 不 claim,常见于外部中转 / 手动节点)时,订阅必须按

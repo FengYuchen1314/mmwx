@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"miaomiaowux/internal/util"
@@ -24,6 +25,7 @@ import (
 // ChildManageHandler 处理子服务器的管理 API 请求
 type ChildManageHandler struct {
 	configToken string // 用于身份验证的令牌
+	inboundsMu  sync.Mutex
 }
 
 // 创建一个新的子管理处理程序
@@ -1584,6 +1586,8 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 	if action == "" {
 		action = "add"
 	}
+	h.inboundsMu.Lock()
+	defer h.inboundsMu.Unlock()
 
 	// 连接到本地 Xray gRPC API
 	apiPort := h.findXrayAPIPort()
@@ -1603,6 +1607,32 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 	defer clients.Connection.Close()
 
 	switch action {
+	case "replace":
+		tag := strings.TrimSpace(req.Tag)
+		if tag == "" || req.Inbound == nil || strings.TrimSpace(fmt.Sprint(req.Inbound["tag"])) != tag {
+			childWriteError(w, http.StatusBadRequest, "replace requires an unchanged tag and inbound payload")
+			return
+		}
+		oldInbound, findErr := h.findInboundInConfig(tag)
+		if findErr != nil {
+			childWriteError(w, http.StatusNotFound, findErr.Error())
+			return
+		}
+		_ = h.removeInbound(ctx, clients.Handler, tag)
+		if err := h.addInbound(ctx, clients.Handler, req.Inbound); err != nil {
+			_ = h.addInbound(context.Background(), clients.Handler, oldInbound)
+			childWriteError(w, http.StatusInternalServerError, "replace failed; old inbound restored: "+err.Error())
+			return
+		}
+		if err := h.persistInbound(req.Inbound); err != nil {
+			_ = h.removeInbound(context.Background(), clients.Handler, tag)
+			_ = h.addInbound(context.Background(), clients.Handler, oldInbound)
+			_ = h.persistInbound(oldInbound)
+			childWriteError(w, http.StatusInternalServerError, "persist replacement failed; old inbound restored: "+err.Error())
+			return
+		}
+		childWriteJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Inbound replaced successfully"})
+
 	case "add":
 		if req.Inbound == nil {
 			childWriteError(w, http.StatusBadRequest, "Inbound payload is required")
@@ -1656,6 +1686,26 @@ func (h *ChildManageHandler) manageInbound(w http.ResponseWriter, r *http.Reques
 	default:
 		childWriteError(w, http.StatusBadRequest, "Invalid action. Must be 'add' or 'remove'")
 	}
+}
+
+func (h *ChildManageHandler) findInboundInConfig(tag string) (map[string]interface{}, error) {
+	path := h.findXrayConfigPath()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		return nil, err
+	}
+	items, _ := config["inbounds"].([]interface{})
+	for _, item := range items {
+		inbound, _ := item.(map[string]interface{})
+		if strings.TrimSpace(fmt.Sprint(inbound["tag"])) == tag {
+			return inbound, nil
+		}
+	}
+	return nil, fmt.Errorf("inbound not found: %s", tag)
 }
 
 // ================== X 射线出库管理 ==================

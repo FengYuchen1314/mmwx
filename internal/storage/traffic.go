@@ -8641,6 +8641,105 @@ func (r *TrafficRepository) UpdateUserInboundCredentialJSONByID(ctx context.Cont
 	return err
 }
 
+// UpdateInboundCredentialReferences 在入站原子替换成功后，同步普通账户、routed 子账户和
+// routed 管理员凭据。identity 是 email；SOCKS/HTTP 则是 user。
+func (r *TrafficRepository) UpdateInboundCredentialReferences(ctx context.Context, serverID int64, inboundTag, protocol string, credentials map[string]string) error {
+	if r == nil || r.db == nil || serverID <= 0 || strings.TrimSpace(inboundTag) == "" {
+		return errors.New("invalid inbound credential update")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `SELECT id, credential_json FROM user_inbound_configs WHERE server_id=? AND inbound_tag=?`, serverID, inboundTag)
+	if err != nil {
+		return err
+	}
+	type update struct {
+		id   int64
+		json string
+	}
+	var ordinary []update
+	for rows.Next() {
+		var id int64
+		var oldJSON string
+		if err := rows.Scan(&id, &oldJSON); err != nil {
+			rows.Close()
+			return err
+		}
+		var old map[string]interface{}
+		_ = json.Unmarshal([]byte(oldJSON), &old)
+		identity := strings.TrimSpace(fmt.Sprint(old["email"]))
+		if identity == "" || identity == "<nil>" {
+			identity = strings.TrimSpace(fmt.Sprint(old["user"]))
+		}
+		if replacement := credentials[identity]; replacement != "" {
+			ordinary = append(ordinary, update{id, replacement})
+		}
+	}
+	rows.Close()
+	for _, item := range ordinary {
+		if _, err := tx.ExecContext(ctx, `UPDATE user_inbound_configs SET protocol=?, credential_json=? WHERE id=?`, protocol, item.json, item.id); err != nil {
+			return err
+		}
+	}
+
+	var serverName string
+	if err := tx.QueryRowContext(ctx, `SELECT name FROM remote_servers WHERE id=?`, serverID).Scan(&serverName); err != nil {
+		return err
+	}
+	srows, err := tx.QueryContext(ctx, `SELECT sa.id, sa.email FROM user_subaccounts sa JOIN nodes n ON n.id=sa.routed_node_id WHERE n.original_server=? AND n.inbound_tag=?`, serverName, inboundTag)
+	if err != nil {
+		return err
+	}
+	var routed []update
+	for srows.Next() {
+		var id int64
+		var email string
+		if err := srows.Scan(&id, &email); err != nil {
+			srows.Close()
+			return err
+		}
+		if replacement := credentials[email]; replacement != "" {
+			routed = append(routed, update{id, replacement})
+		}
+	}
+	srows.Close()
+	for _, item := range routed {
+		if _, err := tx.ExecContext(ctx, `UPDATE user_subaccounts SET credential_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, item.json, item.id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET protocol=?, updated_at=CURRENT_TIMESTAMP WHERE original_server=? AND inbound_tag=?`, protocol, serverName, inboundTag); err != nil {
+		return err
+	}
+	for identity, replacement := range credentials {
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET protocol=?, routed_admin_credential=CASE WHEN routed_admin_email=? THEN ? ELSE routed_admin_credential END, updated_at=CURRENT_TIMESTAMP WHERE original_server=? AND inbound_tag=?`, protocol, identity, replacement, serverName, inboundTag); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (r *TrafficRepository) ListInboundSubaccountEmails(ctx context.Context, serverID int64, inboundTag string) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT DISTINCT sa.email FROM user_subaccounts sa JOIN nodes n ON n.id=sa.routed_node_id JOIN remote_servers rs ON rs.name=n.original_server WHERE rs.id=? AND n.inbound_tag=?`, serverID, inboundTag)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var email string
+		if err := rows.Scan(&email); err != nil {
+			return nil, err
+		}
+		out = append(out, email)
+	}
+	return out, rows.Err()
+}
+
 func (r *TrafficRepository) DeleteUserInboundConfig(ctx context.Context, username string, serverID int64, inboundTag string) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM user_inbound_configs WHERE username = ? AND server_id = ? AND inbound_tag = ?`, username, serverID, inboundTag)
 	return err

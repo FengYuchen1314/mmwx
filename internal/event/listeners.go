@@ -531,7 +531,68 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 			}
 		}
 	}
+	l.refreshRoutedChildrenAfterInboundUpdate(ctx, server.Name, event.Tag, clashConfig)
 	log.Printf("[NodeSync] Updated node(s) for inbound: %s/%s", server.Name, event.Tag)
+}
+
+func (l *NodeSyncListener) refreshRoutedChildrenAfterInboundUpdate(ctx context.Context, serverName, inboundTag, parentClash string) {
+	nodes, err := l.repo.ListAllNodes(ctx)
+	if err != nil {
+		return
+	}
+	for _, parent := range nodes {
+		if parent.NodeType == "routed" || parent.OriginalServer != serverName || parent.InboundTag != inboundTag {
+			continue
+		}
+		children, err := l.repo.ListRoutedNodesByParent(ctx, parent.ID)
+		if err != nil {
+			continue
+		}
+		for _, child := range children {
+			var credential map[string]interface{}
+			if json.Unmarshal([]byte(child.RoutedAdminCredential), &credential) != nil {
+				continue
+			}
+			clash := cloneClashWithCredentialForUpdate(parentClash, child.Protocol, credential, child.NodeName)
+			if err := l.repo.UpdateNodeClashCredential(ctx, child.ID, clash); err != nil {
+				log.Printf("[NodeSync] update routed child %d after inbound edit failed: %v", child.ID, err)
+			}
+		}
+	}
+}
+
+func cloneClashWithCredentialForUpdate(base, protocol string, cred map[string]interface{}, name string) string {
+	var cfg map[string]interface{}
+	if json.Unmarshal([]byte(base), &cfg) != nil {
+		return base
+	}
+	cfg["name"] = name
+	switch strings.ToLower(protocol) {
+	case "vless", "vmess":
+		cfg["uuid"] = cred["id"]
+	case "trojan", "anytls":
+		cfg["password"] = cred["password"]
+	case "hysteria", "hysteria2", "hy2":
+		cfg["password"] = cred["auth"]
+	case "snell":
+		cfg["psk"] = cred["psk"]
+	case "shadowsocks", "ss":
+		if userPass := strings.TrimSpace(fmt.Sprint(cred["password"])); userPass != "" && userPass != "<nil>" {
+			master := strings.TrimSpace(fmt.Sprint(cfg["password"]))
+			if i := strings.Index(master, ":"); i >= 0 {
+				master = master[:i]
+			}
+			cfg["password"] = master + ":" + userPass
+		}
+	case "socks", "socks5", "http":
+		cfg["username"] = cred["user"]
+		cfg["password"] = cred["pass"]
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		return base
+	}
+	return string(out)
 }
 
 // applyRelayNodesOnUpdate 处理「编辑入站时的中转节点」:该 (serverName, tag) 下若有中转节点
