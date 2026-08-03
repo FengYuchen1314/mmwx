@@ -634,6 +634,7 @@ func main() {
 	mux.Handle("/api/admin/users/traffic-limit", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserTrafficLimitHandler(repo)))
 	mux.Handle("/api/admin/users/delete", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserDeleteHandler(repo, remoteManageHandler, limiterPusher)))
 	mux.Handle("/api/admin/users/status", auth.RequireAdmin(tokenStore, userRepo, handler.NewUserStatusHandler(repo, remoteManageHandler, limiterPusher, tokenStore)))
+	mux.Handle("/api/admin/users/reset-xray-credentials", auth.RequireAdmin(tokenStore, userRepo, handler.NewAdminXrayCredentialResetHandler(repo, remoteManageHandler)))
 
 	// 用户节点管理（普通用户查看套餐节点、管理自己的出站）
 	userNodesHandler := handler.NewUserNodesHandler(repo, remoteManageHandler)

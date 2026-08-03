@@ -239,6 +239,49 @@ func (r *TrafficRepository) UpdateNodeProxyConfigs(ctx context.Context, id int64
 	return nil
 }
 
+// UpdateNodeClashCredential updates only the subscription-facing Clash config.
+// Credential rotation must not overwrite parsed_config because it describes the
+// shared inbound rather than one Xray client.
+func (r *TrafficRepository) UpdateNodeClashCredential(ctx context.Context, id int64, clashConfig string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	res, err := r.db.ExecContext(ctx, `UPDATE nodes SET clash_config = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, clashConfig, id)
+	if err != nil {
+		return fmt.Errorf("update node clash credential: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("node clash credential rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNodeNotFound
+	}
+	return nil
+}
+
+// UpdateRoutedAdminCredential keeps the routed node's stored admin credential
+// and its subscription-facing Clash config in sync.
+func (r *TrafficRepository) UpdateRoutedAdminCredential(ctx context.Context, id int64, credentialJSON, clashConfig string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	res, err := r.db.ExecContext(ctx, `UPDATE nodes
+		SET routed_admin_credential = ?, clash_config = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND node_type = 'routed'`, credentialJSON, clashConfig, id)
+	if err != nil {
+		return fmt.Errorf("update routed admin credential: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("routed admin credential rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNodeNotFound
+	}
+	return nil
+}
+
 func (r *TrafficRepository) CountNodes(ctx context.Context) (int64, error) {
 	if r == nil || r.db == nil {
 		return 0, errors.New("traffic repository not initialized")
