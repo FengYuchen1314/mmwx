@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 妙妙屋X - Xray 服务器管理与订阅拼车系统 安装脚本
-# 适用于 Debian/Ubuntu Linux 系统
+# 适用于 Debian/Ubuntu、RHEL 系及 Alpine Linux
 
 set -e
 
@@ -14,6 +14,7 @@ INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="mmwx"
 DATA_DIR="/etc/mmwx"
 CONFIG_DIR="/etc/mmwx"
+SERVICE_MANAGER=""
 
 # 颜色输出
 RED='\033[0;31m'
@@ -67,8 +68,112 @@ check_architecture() {
 # 安装依赖
 install_dependencies() {
     echo_info "检查并安装依赖..."
-    apt-get update -qq
-    apt-get install -y wget curl jq systemd >/dev/null 2>&1
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache bash wget curl jq ca-certificates openrc >/dev/null
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y wget curl jq ca-certificates >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y wget curl jq ca-certificates >/dev/null
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y wget curl jq ca-certificates >/dev/null
+    else
+        echo_error "不支持的包管理器，请先安装 wget、curl、jq 和 CA 证书"
+        exit 1
+    fi
+}
+
+detect_service_manager() {
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        SERVICE_MANAGER="systemd"
+    elif command -v rc-service >/dev/null 2>&1 && [ -e /run/openrc/softlevel ]; then
+        SERVICE_MANAGER="openrc"
+    elif command -v start-stop-daemon >/dev/null 2>&1; then
+        # Alpine/LXC 可能装有 OpenRC，但 PID 1 并未启动 OpenRC。
+        SERVICE_MANAGER="direct"
+    else
+        echo_error "未检测到可用的服务管理器（systemd 或 OpenRC）"
+        exit 1
+    fi
+    echo_info "使用服务管理器: $SERVICE_MANAGER"
+}
+
+service_stop() {
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        systemctl stop "${SERVICE_NAME}.service" || true
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        rc-service "$SERVICE_NAME" stop || true
+    elif [ -f "/run/${SERVICE_NAME}.pid" ]; then
+        kill "$(cat "/run/${SERVICE_NAME}.pid")" 2>/dev/null || true
+        rm -f "/run/${SERVICE_NAME}.pid"
+    fi
+}
+
+service_start() {
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        systemctl start "${SERVICE_NAME}.service"
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        rc-service "$SERVICE_NAME" start
+    else
+        mkdir -p /var/log
+        start-stop-daemon --start --background --make-pidfile --pidfile "/run/${SERVICE_NAME}.pid" \
+            --chdir "$DATA_DIR" --exec /usr/bin/env -- \
+            PORT="$(configured_port)" LOG_LEVEL=info "$INSTALL_DIR/$SERVICE_NAME"
+    fi
+}
+
+service_enable() {
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        systemctl enable "${SERVICE_NAME}.service"
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        rc-update add "$SERVICE_NAME" default >/dev/null
+    else
+        echo_warn "当前环境没有运行 init 系统，服务已使用后台进程启动；系统重启后需重新执行安装命令"
+    fi
+}
+
+service_disable() {
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        systemctl disable "${SERVICE_NAME}.service" || true
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+    fi
+}
+
+service_is_active() {
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        systemctl is-active --quiet "${SERVICE_NAME}.service"
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        rc-service "$SERVICE_NAME" status >/dev/null 2>&1
+    else
+        [ -s "/run/${SERVICE_NAME}.pid" ] && kill -0 "$(cat "/run/${SERVICE_NAME}.pid")" 2>/dev/null
+    fi
+}
+
+service_reload_manager() {
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        systemctl daemon-reload
+    fi
+}
+
+configured_port() {
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        grep 'Environment="PORT=' "/etc/systemd/system/${SERVICE_NAME}.service" 2>/dev/null | sed 's/.*PORT=\([0-9]*\).*/\1/'
+    else
+        sed -n 's/^PORT="\{0,1\}\([0-9]*\)"\{0,1\}$/\1/p' "/etc/conf.d/${SERVICE_NAME}" 2>/dev/null
+    fi
+}
+
+primary_ip() {
+    local ip_addr
+    ip_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [ -z "$ip_addr" ] && command -v ip >/dev/null 2>&1; then
+        ip_addr=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i == "src") {print $(i+1); exit}}')
+    fi
+    if [ -z "$ip_addr" ]; then
+        ip_addr=$(hostname -i 2>/dev/null | awk '{print $1}')
+    fi
+    echo "${ip_addr:-127.0.0.1}"
 }
 
 # 获取最新版本号
@@ -127,9 +232,9 @@ create_directories() {
     chmod 755 "$CONFIG_DIR"
 }
 
-# 创建 systemd 服务
+# 创建 systemd / OpenRC 服务
 create_systemd_service() {
-    echo_info "创建 systemd 服务..."
+    echo_info "创建服务配置..."
 
     # 询问端口号（支持非交互式环境）
     echo ""
@@ -145,7 +250,8 @@ create_systemd_service() {
         echo_info "使用端口: $PORT_INPUT"
     fi
 
-    cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
 Description=妙妙屋X - Xray 服务器管理与订阅拼车系统
 After=network.target
@@ -173,19 +279,47 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
+        systemctl daemon-reload
+    else
+        mkdir -p /etc/conf.d /var/log
+        cat > /etc/conf.d/${SERVICE_NAME} <<EOF
+PORT="$PORT_INPUT"
+LOG_LEVEL="info"
+EOF
+        cat > /etc/init.d/${SERVICE_NAME} <<EOF
+#!/sbin/openrc-run
 
-    systemctl daemon-reload
-    echo_info "systemd 服务已创建（端口: $PORT_INPUT）"
+name="妙妙屋X"
+description="妙妙屋X - Xray 服务器管理与订阅拼车系统"
+command="$INSTALL_DIR/$SERVICE_NAME"
+command_background="yes"
+directory="$DATA_DIR"
+pidfile="/run/$SERVICE_NAME.pid"
+output_log="/var/log/$SERVICE_NAME.log"
+error_log="/var/log/$SERVICE_NAME.log"
+
+PORT="\${PORT:-12889}"
+LOG_LEVEL="\${LOG_LEVEL:-info}"
+export PORT LOG_LEVEL
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod 755 /etc/init.d/${SERVICE_NAME}
+    fi
+    echo_info "$SERVICE_MANAGER 服务已创建（端口: $PORT_INPUT）"
 }
 
 # 启动服务
 start_service() {
     echo_info "启动服务..."
-    systemctl enable ${SERVICE_NAME}.service
-    systemctl start ${SERVICE_NAME}.service
+    service_enable
+    service_start
     sleep 2
 
-    if systemctl is-active --quiet ${SERVICE_NAME}.service; then
+    if service_is_active; then
         echo_info "服务启动成功！"
         return 0
     else
@@ -196,8 +330,7 @@ start_service() {
 
 # 显示状态
 show_status() {
-    # 从 systemd 服务文件中读取端口号
-    CONFIGURED_PORT=$(grep "Environment=\"PORT=" /etc/systemd/system/${SERVICE_NAME}.service | sed 's/.*PORT=\([0-9]*\).*/\1/')
+    CONFIGURED_PORT=$(configured_port)
     CONFIGURED_PORT=${CONFIGURED_PORT:-12889}
 
     echo ""
@@ -207,14 +340,26 @@ show_status() {
     echo ""
     echo "📦 安装位置: $INSTALL_DIR/$SERVICE_NAME"
     echo "💾 数据目录: $DATA_DIR"
-    echo "🌐 访问地址: http://$(hostname -I | awk '{print $1}'):$CONFIGURED_PORT"
+    echo "🌐 访问地址: http://$(primary_ip):$CONFIGURED_PORT"
     echo ""
     echo "常用命令:"
-    echo "  启动服务: systemctl start $SERVICE_NAME"
-    echo "  停止服务: systemctl stop $SERVICE_NAME"
-    echo "  重启服务: systemctl restart $SERVICE_NAME"
-    echo "  查看状态: systemctl status $SERVICE_NAME"
-    echo "  查看日志: journalctl -u $SERVICE_NAME -f"
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        echo "  启动服务: systemctl start $SERVICE_NAME"
+        echo "  停止服务: systemctl stop $SERVICE_NAME"
+        echo "  重启服务: systemctl restart $SERVICE_NAME"
+        echo "  查看状态: systemctl status $SERVICE_NAME"
+        echo "  查看日志: journalctl -u $SERVICE_NAME -f"
+    elif [ "$SERVICE_MANAGER" = "openrc" ]; then
+        echo "  启动服务: rc-service $SERVICE_NAME start"
+        echo "  停止服务: rc-service $SERVICE_NAME stop"
+        echo "  重启服务: rc-service $SERVICE_NAME restart"
+        echo "  查看状态: rc-service $SERVICE_NAME status"
+        echo "  查看日志: tail -f /var/log/$SERVICE_NAME.log"
+    else
+        echo "  停止服务: kill \$(cat /run/$SERVICE_NAME.pid)"
+        echo "  启动服务: 重新执行安装或更新命令"
+        echo "  查看日志: 查看进程标准输出或系统日志"
+    fi
     echo "  更新版本: curl -sL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | sudo bash -s update"
     echo "  覆盖安装: curl -sL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | sudo bash -s reinstall"
     echo "  卸载服务: curl -sL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh | sudo bash -s uninstall"
@@ -244,7 +389,7 @@ update_service() {
 
     # 停止服务
     echo_info "停止服务..."
-    systemctl stop ${SERVICE_NAME}.service || true
+    service_stop
 
     # 备份当前二进制文件
     if [ -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
@@ -261,7 +406,7 @@ update_service() {
     save_release_channel
 
     # 询问是否修改端口（支持非交互式环境）
-    CURRENT_PORT=$(grep "Environment=\"PORT=" /etc/systemd/system/${SERVICE_NAME}.service 2>/dev/null | sed 's/.*PORT=\([0-9]*\).*/\1/')
+    CURRENT_PORT=$(configured_port)
     CURRENT_PORT=${CURRENT_PORT:-12889}
     echo ""
     if [ -t 0 ]; then
@@ -276,11 +421,12 @@ update_service() {
         echo_info "使用端口: $PORT_INPUT"
     fi
 
-    # 更新 systemd 服务文件中的端口
-    sed -i "s/Environment=\"PORT=[0-9]*\"/Environment=\"PORT=$PORT_INPUT\"/" /etc/systemd/system/${SERVICE_NAME}.service
-
-    # 重新加载 systemd 配置
-    systemctl daemon-reload
+    if [ "$SERVICE_MANAGER" = "systemd" ]; then
+        sed -i "s/Environment=\"PORT=[0-9]*\"/Environment=\"PORT=$PORT_INPUT\"/" /etc/systemd/system/${SERVICE_NAME}.service
+    else
+        sed -i "s/^PORT=.*/PORT=\"$PORT_INPUT\"/" /etc/conf.d/${SERVICE_NAME}
+    fi
+    service_reload_manager
 
     # 启动服务
     if start_service; then
@@ -290,18 +436,18 @@ update_service() {
         echo "======================================"
         echo ""
         echo "📦 版本: $VERSION"
-        echo "🌐 访问地址: http://$(hostname -I | awk '{print $1}'):$PORT_INPUT"
+        echo "🌐 访问地址: http://$(primary_ip):$PORT_INPUT"
         echo ""
         echo "如遇问题可回滚到备份版本:"
-        echo "  sudo systemctl stop $SERVICE_NAME"
+        echo "  请先停止 $SERVICE_NAME 服务"
         echo "  sudo mv $INSTALL_DIR/${SERVICE_NAME}.bak $INSTALL_DIR/$SERVICE_NAME"
-        echo "  sudo systemctl start $SERVICE_NAME"
+        echo "  然后重新启动 $SERVICE_NAME 服务"
         echo ""
     else
         echo_error "更新后服务启动失败，正在回滚..."
         mv "$INSTALL_DIR/${SERVICE_NAME}.bak" "$INSTALL_DIR/$SERVICE_NAME"
-        systemctl start ${SERVICE_NAME}.service
-        echo_error "已回滚到之前版本，请查看日志: journalctl -u $SERVICE_NAME -n 50"
+        service_start || true
+        echo_error "已回滚到之前版本，请查看服务日志"
         exit 1
     fi
 }
@@ -326,8 +472,8 @@ uninstall_service() {
 
     # 停止并禁用服务
     echo_info "停止并禁用服务..."
-    systemctl stop ${SERVICE_NAME}.service || true
-    systemctl disable ${SERVICE_NAME}.service || true
+    service_stop
+    service_disable
     echo_info "✓ 服务已停止"
     echo ""
 
@@ -358,11 +504,10 @@ uninstall_service() {
     fi
     echo ""
 
-    # 删除 systemd 服务文件
-    echo_info "删除 systemd 服务..."
-    rm -f /etc/systemd/system/${SERVICE_NAME}.service
-    systemctl daemon-reload
-    echo_info "✓ systemd 服务已删除"
+    echo_info "删除服务配置..."
+    rm -f /etc/systemd/system/${SERVICE_NAME}.service /etc/init.d/${SERVICE_NAME} /etc/conf.d/${SERVICE_NAME}
+    service_reload_manager
+    echo_info "✓ 服务配置已删除"
     echo ""
 
     # 删除二进制文件
@@ -400,9 +545,9 @@ reinstall_service() {
     echo ""
 
     # 停止已有服务
-    if systemctl is-active --quiet ${SERVICE_NAME}.service 2>/dev/null; then
+    if service_is_active; then
         echo_info "停止现有服务..."
-        systemctl stop ${SERVICE_NAME}.service || true
+        service_stop
     fi
 
     # 备份当前二进制文件
@@ -426,18 +571,18 @@ reinstall_service() {
         echo_info "覆盖安装完成！数据已保留。"
         echo ""
         echo "如遇问题可回滚到备份版本:"
-        echo "  sudo systemctl stop $SERVICE_NAME"
+        echo "  请先停止 $SERVICE_NAME 服务"
         echo "  sudo mv $INSTALL_DIR/${SERVICE_NAME}.bak $INSTALL_DIR/$SERVICE_NAME"
-        echo "  sudo systemctl start $SERVICE_NAME"
+        echo "  然后重新启动 $SERVICE_NAME 服务"
         echo ""
     else
         echo_error "覆盖安装后服务启动失败，正在回滚..."
         if [ -f "$INSTALL_DIR/${SERVICE_NAME}.bak" ]; then
             mv "$INSTALL_DIR/${SERVICE_NAME}.bak" "$INSTALL_DIR/$SERVICE_NAME"
-            systemctl start ${SERVICE_NAME}.service || true
+            service_start || true
             echo_error "已回滚到之前版本"
         fi
-        echo_error "请查看日志: journalctl -u $SERVICE_NAME -n 50"
+        echo_error "请查看服务日志"
         exit 1
     fi
 }
@@ -459,6 +604,7 @@ main() {
         check_root
         check_architecture
         install_dependencies
+        detect_service_manager
         get_latest_version
         update_service
     elif [ "$MODE" = "reinstall" ]; then
@@ -466,11 +612,13 @@ main() {
         check_root
         check_architecture
         install_dependencies
+        detect_service_manager
         get_latest_version
         reinstall_service
     elif [ "$MODE" = "uninstall" ]; then
         echo_info "进入卸载模式..."
         check_root
+        detect_service_manager
         uninstall_service
     else
         echo_info "开始安装妙妙屋X..."
@@ -479,6 +627,7 @@ main() {
         check_root
         check_architecture
         install_dependencies
+        detect_service_manager
         get_latest_version
         download_binary
         install_binary
@@ -492,7 +641,7 @@ main() {
         if start_service; then
             show_status
         else
-            echo_error "安装过程中出现错误，请查看日志: journalctl -u $SERVICE_NAME -n 50"
+            echo_error "安装过程中出现错误，请查看 $SERVICE_MANAGER 服务日志"
             exit 1
         fi
     fi
