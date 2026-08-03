@@ -339,3 +339,11 @@ func TestNormalizePostgresTimestampWithNumericZoneName(t *testing.T) {
 		t.Fatalf("timestamp=%s", got)
 	}
 }
+
+func TestReplacePostgresScalarMax(t *testing.T) {
+	query := `SELECT MAX(id), MAX(COALESCE(rx, 0), COALESCE(tx, 0)), SUM(MAX(weighted - baseline, 0)) FROM traffic`
+	want := `SELECT MAX(id), GREATEST(COALESCE(rx, 0), COALESCE(tx, 0)), SUM(GREATEST(weighted - baseline, 0)) FROM traffic`
+	if got := replacePostgresScalarMax(query); got != want {
+		t.Fatalf("query=%s\nwant=%s", got, want)
+	}
+}

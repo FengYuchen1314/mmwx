@@ -1074,7 +1074,7 @@ func NewTrafficRepositoryFromConfig(cfg DatabaseConfig) (*TrafficRepository, err
 }
 
 func (r *TrafficRepository) DatabaseConfig() DatabaseConfig { return r.config }
-func (r *TrafficRepository) DatabaseDriver() string { return r.config.Driver }
+func (r *TrafficRepository) DatabaseDriver() string         { return r.config.Driver }
 
 // 关闭会释放底层数据库资源。
 func (r *TrafficRepository) Close() error {
@@ -3080,6 +3080,9 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 	if err := r.ensureFederatedServersTable(context.Background()); err != nil {
 		return fmt.Errorf("migrate federated_servers: %w", err)
 	}
+	if err := r.ensurePostgresRemoteServerTrafficForeignKeys(context.Background()); err != nil {
+		return fmt.Errorf("migrate PostgreSQL server traffic foreign keys: %w", err)
+	}
 
 	// 一次性数据修复:旧 ResolveUsernameByEmail 不识别 users.email 作为主账号 inbound 的 client.email,
 	// 把流量记到 username=email 的孤行(如 user_traffic.username='share@2ha.me' 而不是 'share')。
@@ -3096,6 +3099,27 @@ CREATE TABLE IF NOT EXISTS traffic_threshold_notified (
 		log.Printf("[Migrate] remove deprecated routing rules from snapshots: %v", err)
 	}
 
+	return nil
+}
+
+// ensurePostgresRemoteServerTrafficForeignKeys repairs the original schema's
+// stale xray_servers references. Collectors and all current APIs use IDs from
+// remote_servers; xray_servers is a legacy local-process table and is normally
+// empty, which made every PostgreSQL traffic write fail after migration.
+func (r *TrafficRepository) ensurePostgresRemoteServerTrafficForeignKeys(ctx context.Context) error {
+	if r.config.Driver != "postgres" {
+		return nil
+	}
+	tables := []string{"batch_inbounds", "batch_outbounds", "node_traffic", "user_traffic", "user_email_traffic", "traffic_snapshots"}
+	for _, table := range tables {
+		constraint := table + "_server_id_fkey"
+		if _, err := r.db.ExecContext(ctx, `ALTER TABLE `+quoteIdentifier(table)+` DROP CONSTRAINT IF EXISTS `+quoteIdentifier(constraint)); err != nil {
+			return err
+		}
+		if _, err := r.db.ExecContext(ctx, `ALTER TABLE `+quoteIdentifier(table)+` ADD CONSTRAINT `+quoteIdentifier(constraint)+` FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE`); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

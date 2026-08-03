@@ -113,6 +113,7 @@ func adaptSQL(driver, query string) string {
 	q = regexp.MustCompile(`(?is)^\s*INSERT\s+OR\s+REPLACE\s+INTO\s+traffic_threshold_notified\s*\(server_id,\s*notified_at\)\s*VALUES\s*\(\?,\s*CURRENT_TIMESTAMP\)`).ReplaceAllString(q,
 		`INSERT INTO traffic_threshold_notified (server_id, notified_at) VALUES (?, CURRENT_TIMESTAMP) ON CONFLICT (server_id) DO UPDATE SET notified_at = EXCLUDED.notified_at`)
 	q = strings.ReplaceAll(q, `instr(?, username || '__')`, `strpos(?, username || '__')`)
+	q = replacePostgresScalarMax(q)
 	if insertOrIgnore.MatchString(q) {
 		q = insertOrIgnore.ReplaceAllString(q, "INSERT ")
 		trimmed := strings.TrimSpace(q)
@@ -124,6 +125,60 @@ func adaptSQL(driver, query string) string {
 		}
 	}
 	return rebindPostgres(q)
+}
+
+// SQLite uses MAX(a, b) as a scalar function while PostgreSQL reserves MAX
+// for a one-argument aggregate and calls the scalar equivalent GREATEST.
+// Detect a comma at the top level of each MAX call so aggregate MAX(expr)
+// remains untouched, including when either scalar argument is nested SQL.
+func replacePostgresScalarMax(query string) string {
+	var result strings.Builder
+	for index := 0; index < len(query); {
+		if index+4 <= len(query) && strings.EqualFold(query[index:index+4], "MAX(") && (index == 0 || !isSQLIdentifierByte(query[index-1])) {
+			depth, commaDepthOne := 0, false
+			inSingle := false
+			end := -1
+			for cursor := index + 3; cursor < len(query); cursor++ {
+				switch query[cursor] {
+				case '\'':
+					if inSingle && cursor+1 < len(query) && query[cursor+1] == '\'' {
+						cursor++
+						continue
+					}
+					inSingle = !inSingle
+				case '(':
+					if !inSingle {
+						depth++
+					}
+				case ')':
+					if !inSingle {
+						depth--
+						if depth == 0 {
+							end = cursor
+							cursor = len(query)
+						}
+					}
+				case ',':
+					if !inSingle && depth == 1 {
+						commaDepthOne = true
+					}
+				}
+			}
+			if end >= 0 && commaDepthOne {
+				result.WriteString("GREATEST(")
+				result.WriteString(query[index+4 : end+1])
+				index = end + 1
+				continue
+			}
+		}
+		result.WriteByte(query[index])
+		index++
+	}
+	return result.String()
+}
+
+func isSQLIdentifierByte(value byte) bool {
+	return value == '_' || value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9'
 }
 
 // rebindPostgres replaces placeholders outside SQL string literals. The
