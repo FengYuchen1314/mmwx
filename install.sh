@@ -8,6 +8,7 @@ set -e
 # 配置
 GITHUB_REPO="iluobei/miaomiaowuX"
 VERSION=""  # 将自动获取最新版本
+RELEASE_CHANNEL="${MMWX_RELEASE_CHANNEL:-stable}" # stable | prerelease
 BINARY_NAME=""  # 将根据架构自动设置
 INSTALL_DIR="/usr/local/bin"
 SERVICE_NAME="mmwx"
@@ -73,14 +74,26 @@ install_dependencies() {
 # 获取最新版本号
 get_latest_version() {
     if [ -z "$VERSION" ]; then
-        echo_info "获取最新版本..."
-        VERSION=$(curl -sL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name')
+        echo_info "获取最新${RELEASE_CHANNEL}版本..."
+        if [ "$RELEASE_CHANNEL" = "prerelease" ]; then
+            # /releases/latest 会排除预发布版本。预发布通道取最近发布的非 draft 版本：
+            # 新 beta/rc 会被选中；正式版发布在它之后时也会自然成为该通道的新版本。
+            VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=30" | jq -r '[.[] | select(.draft == false)][0].tag_name // empty' || true)
+        else
+            VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | jq -r '.tag_name // empty' || true)
+        fi
         if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo_error "无法获取最新版本号，请检查网络连接"
+            echo_error "无法获取${RELEASE_CHANNEL}版本号，请检查网络连接或 GitHub API 限流"
             exit 1
         fi
+        echo_info "目标通道: $RELEASE_CHANNEL"
         echo_info "最新版本: $VERSION"
     fi
+}
+
+save_release_channel() {
+    mkdir -p "$DATA_DIR"
+    echo "$RELEASE_CHANNEL" > "$DATA_DIR/.update-channel"
 }
 
 # 下载二进制文件
@@ -245,6 +258,7 @@ update_service() {
 
     # 保存版本信息
     echo "$VERSION" > "$DATA_DIR/.version"
+    save_release_channel
 
     # 询问是否修改端口（支持非交互式环境）
     CURRENT_PORT=$(grep "Environment=\"PORT=" /etc/systemd/system/${SERVICE_NAME}.service 2>/dev/null | sed 's/.*PORT=\([0-9]*\).*/\1/')
@@ -405,6 +419,7 @@ reinstall_service() {
 
     # 保存版本信息
     echo "$VERSION" > "$DATA_DIR/.version"
+    save_release_channel
 
     if start_service; then
         show_status
@@ -429,22 +444,31 @@ reinstall_service() {
 
 # 主函数
 main() {
+    MODE="${1:-install}"
+    if [ "$MODE" = "prerelease" ]; then
+        RELEASE_CHANNEL="prerelease"
+        if [ -f "$INSTALL_DIR/$SERVICE_NAME" ]; then
+            MODE="update"
+        else
+            MODE="install"
+        fi
+    fi
     # 检查命令行参数
-    if [ "$1" = "update" ]; then
+    if [ "$MODE" = "update" ]; then
         echo_info "进入更新模式..."
         check_root
         check_architecture
         install_dependencies
         get_latest_version
         update_service
-    elif [ "$1" = "reinstall" ]; then
+    elif [ "$MODE" = "reinstall" ]; then
         echo_info "进入覆盖安装模式..."
         check_root
         check_architecture
         install_dependencies
         get_latest_version
         reinstall_service
-    elif [ "$1" = "uninstall" ]; then
+    elif [ "$MODE" = "uninstall" ]; then
         echo_info "进入卸载模式..."
         check_root
         uninstall_service
@@ -463,6 +487,7 @@ main() {
 
         # 保存版本信息
         echo "$VERSION" > "$DATA_DIR/.version"
+        save_release_channel
 
         if start_service; then
             show_status

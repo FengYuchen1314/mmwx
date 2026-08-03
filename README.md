@@ -45,6 +45,12 @@ curl -sL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install.sh |
 curl -sL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install.sh | sudo bash -s update
 ```
 
+切换到最新预发布版本（保留现有配置和数据库）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-prerelease.sh | sudo bash
+```
+
 卸载：
 ```bash
 curl -sL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install.sh | sudo bash -s uninstall
