@@ -170,6 +170,12 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.4-beta.3 (2026-08-03)
+- 🌈 优化用户禁用启用流程
+- 🌈 写扩散优化
+- 🌈 备份支持pg数据库
+- 🌈 支持postgresql数据库
+- 🌈 支持从主控更新测速端
 ### v0.4.4-beta.2 (2026-08-03)
 - 🌈 优化普通用户的miniapp续费
 - 🌈 服务器视图流量支持日期筛选
