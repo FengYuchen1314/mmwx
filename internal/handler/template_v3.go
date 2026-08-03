@@ -265,6 +265,7 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 
 	// 中转组:生成 url-test 组(成员按 ID 取当前名);补全被过滤但被组引用的成员。
 	relayGroupMap := make(map[string]map[string]any)
+	var relayGroupOrder []string
 	var extraProxies []map[string]any
 	for _, node := range nodes {
 		if !node.Enabled || len(node.RelayGroupNodeIDs) == 0 || node.RelayGroupName == "" {
@@ -295,11 +296,12 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 				"name": node.RelayGroupName, "type": "url-test", "proxies": groupProxies,
 				"url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50,
 			}
+			relayGroupOrder = append(relayGroupOrder, node.RelayGroupName)
 		}
 	}
 	var relayGroups []map[string]any
-	for _, rg := range relayGroupMap {
-		relayGroups = append(relayGroups, rg)
+	for _, groupName := range relayGroupOrder {
+		relayGroups = append(relayGroups, relayGroupMap[groupName])
 	}
 	proxies = append(proxies, extraProxies...)
 
@@ -347,8 +349,85 @@ func (h *TemplateV3Handler) processV3Template(templateContent string, proxies []
 	if err != nil {
 		return "", err
 	}
+	result, err = restoreTemplateProxyGroupOrder(templateContent, result)
+	if err != nil {
+		return "", err
+	}
 
 	return result, nil
+}
+
+// restoreTemplateProxyGroupOrder treats the bound template's proxy-groups
+// sequence as authoritative. Processing may expand or remove groups and later
+// stages may append generated groups, but existing template groups must never
+// be reordered. Generated groups retain their relative order at the end.
+func restoreTemplateProxyGroupOrder(templateContent, generatedContent string) (string, error) {
+	var templateDoc, generatedDoc yaml.Node
+	if err := yaml.Unmarshal([]byte(templateContent), &templateDoc); err != nil {
+		return generatedContent, err
+	}
+	if err := yaml.Unmarshal([]byte(generatedContent), &generatedDoc); err != nil {
+		return generatedContent, err
+	}
+	templateGroups := findYAMLSequence(&templateDoc, "proxy-groups")
+	generatedGroups := findYAMLSequence(&generatedDoc, "proxy-groups")
+	if templateGroups == nil || generatedGroups == nil || len(generatedGroups.Content) < 2 {
+		return generatedContent, nil
+	}
+
+	desiredNames := make([]string, 0, len(templateGroups.Content))
+	for _, group := range templateGroups.Content {
+		if name := yamlMappingString(group, "name"); name != "" {
+			desiredNames = append(desiredNames, name)
+		}
+	}
+	used := make([]bool, len(generatedGroups.Content))
+	reordered := make([]*yaml.Node, 0, len(generatedGroups.Content))
+	for _, name := range desiredNames {
+		for index, group := range generatedGroups.Content {
+			if !used[index] && yamlMappingString(group, "name") == name {
+				used[index] = true
+				reordered = append(reordered, group)
+				break
+			}
+		}
+	}
+	for index, group := range generatedGroups.Content {
+		if !used[index] {
+			reordered = append(reordered, group)
+		}
+	}
+	generatedGroups.Content = reordered
+	out, err := MarshalYAMLWithIndent(&generatedDoc)
+	if err != nil {
+		return generatedContent, err
+	}
+	return RemoveUnicodeEscapeQuotes(string(out)), nil
+}
+
+func findYAMLSequence(doc *yaml.Node, key string) *yaml.Node {
+	if doc == nil || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	root := doc.Content[0]
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		if root.Content[index].Value == key && root.Content[index+1].Kind == yaml.SequenceNode {
+			return root.Content[index+1]
+		}
+	}
+	return nil
+}
+
+func yamlMappingString(node *yaml.Node, key string) string {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return ""
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		if node.Content[index].Value == key {
+			return node.Content[index+1].Value
+		}
+	}
+	return ""
 }
 
 // looksLikeSurgeTemplate 通过 Surge 特有的段头判断内容是否为 Surge 配置(预览按内容判断时用)。

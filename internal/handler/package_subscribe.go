@@ -94,6 +94,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	// 这样 dialer-proxy 能引用倍率改名后的最终名字,且只在目标真的出现在输出里时才注入。
 	finalNameByNodeID := make(map[int64]string)
 	relayGroupSpecs := make(map[string][]int64) // 组名 → 成员节点 ID(按 ID 存,收齐后按最终名建组)
+	var relayGroupOrder []string
 	var dialerRefs []dialerRef
 	noteProxy := func(node storage.Node, proxyConfig map[string]any) {
 		if nm, ok := proxyConfig["name"].(string); ok && nm != "" {
@@ -107,6 +108,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 			proxyConfig["dialer-proxy"] = node.RelayGroupName
 			if _, seen := relayGroupSpecs[node.RelayGroupName]; !seen {
 				relayGroupSpecs[node.RelayGroupName] = node.RelayGroupNodeIDs
+				relayGroupOrder = append(relayGroupOrder, node.RelayGroupName)
 			}
 		}
 	}
@@ -170,7 +172,8 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 
 	// 中转组:按最终名(倍率改名后)建 url-test 组;成员缺席(未下发到本订阅)则跳过,防悬空
 	var relayGroups []map[string]any
-	for groupName, memberIDs := range relayGroupSpecs {
+	for _, groupName := range relayGroupOrder {
+		memberIDs := relayGroupSpecs[groupName]
 		var groupProxies []string
 		for _, rid := range memberIDs {
 			if nm, ok := finalNameByNodeID[rid]; ok {
@@ -228,6 +231,11 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 	}
 
 	result, err = injectProxiesIntoTemplate(result, proxies)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	result, err = restoreTemplateProxyGroupOrder(templateContent, result)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -494,6 +502,11 @@ func (h *PackageSubscribeHandler) serveAllNodes(w http.ResponseWriter, r *http.R
 		return
 	}
 	result, err = injectProxiesIntoTemplate(result, proxies)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	result, err = restoreTemplateProxyGroupOrder(templateContent, result)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

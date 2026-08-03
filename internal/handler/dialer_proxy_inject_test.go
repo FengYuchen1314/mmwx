@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	"miaomiaowux/internal/storage"
 )
 
@@ -292,5 +293,55 @@ func TestUserIsAdminRecognizesAPITokenAdmin(t *testing.T) {
 	}
 	if userIsAdmin(t.Context(), nil, "") {
 		t.Error("空用户名不应是管理员")
+	}
+}
+
+func TestRestoreTemplateProxyGroupOrder(t *testing.T) {
+	template := `
+proxy-groups:
+  - name: first
+    type: select
+    proxies: [DIRECT]
+  - name: second
+    type: select
+    proxies: [DIRECT]
+  - name: third
+    type: select
+    proxies: [DIRECT]
+`
+	generated := `
+proxy-groups:
+  - name: third
+    type: select
+    proxies: [DIRECT]
+  - name: generated-relay
+    type: url-test
+    proxies: [node-a]
+  - name: first
+    type: select
+    proxies: [DIRECT]
+  - name: second
+    type: select
+    proxies: [DIRECT]
+`
+	result, err := restoreTemplateProxyGroupOrder(template, generated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(result), &doc); err != nil {
+		t.Fatal(err)
+	}
+	groups := findYAMLSequence(&doc, "proxy-groups")
+	if groups == nil {
+		t.Fatal("proxy-groups missing")
+	}
+	var names []string
+	for _, group := range groups.Content {
+		names = append(names, yamlMappingString(group, "name"))
+	}
+	want := []string{"first", "second", "third", "generated-relay"}
+	if fmt.Sprint(names) != fmt.Sprint(want) {
+		t.Fatalf("group order=%v, want %v", names, want)
 	}
 }

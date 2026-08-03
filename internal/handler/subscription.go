@@ -1020,6 +1020,7 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 	// 中转组:按组名去重生成 url-test 代理组(成员按 ID 取当前名);被过滤(标签/ID)但被中转组
 	// 引用的底层成员补入根 proxies,避免组内悬空引用。成员删除/禁用则从组剔除。
 	relayGroupMap := make(map[string]map[string]any)
+	var relayGroupOrder []string
 	var extraProxies []map[string]any
 	for _, node := range nodes {
 		if !node.Enabled || len(node.RelayGroupNodeIDs) == 0 || node.RelayGroupName == "" {
@@ -1057,11 +1058,12 @@ func (h *SubscriptionHandler) generateFromTemplate(ctx context.Context, subscrib
 				"interval":  300,
 				"tolerance": 50,
 			}
+			relayGroupOrder = append(relayGroupOrder, node.RelayGroupName)
 		}
 	}
 	var relayGroups []map[string]any
-	for _, rg := range relayGroupMap {
-		relayGroups = append(relayGroups, rg)
+	for _, groupName := range relayGroupOrder {
+		relayGroups = append(relayGroups, relayGroupMap[groupName])
 	}
 	proxies = append(proxies, extraProxies...)
 	logger.Info("[模板生成] 节点筛选完成", "total", len(nodes), "filtered", len(proxies), "node_filter", hasNodeFilter, "tag_filter", hasTagFilter, "restricted_to_package", restrictToPackage)
@@ -2673,6 +2675,7 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 	// 源 proxy 名 → dialer-proxy 目标(链式=目标当前名;中转组=组名)。源名登记 NodeName 与 ClashConfig.name 双键。
 	nameToTarget := make(map[string]string)
 	relayGroupMap := make(map[string]map[string]any)
+	var relayGroupOrder []string
 	addSrc := func(node storage.Node, target string) {
 		nameToTarget[node.NodeName] = target
 		if cn := clashConfigName(node.ClashConfig); cn != "" && cn != node.NodeName {
@@ -2700,6 +2703,7 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 						"name": node.RelayGroupName, "type": "url-test", "proxies": members,
 						"url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50,
 					}
+					relayGroupOrder = append(relayGroupOrder, node.RelayGroupName)
 				}
 			}
 		}
@@ -2757,8 +2761,8 @@ func injectChainProxy(ctx context.Context, repo *storage.TrafficRepository, user
 	// 中转组静态兜底:把 url-test 组追加进 proxy-groups
 	if len(relayGroupMap) > 0 {
 		relayGroups := make([]map[string]any, 0, len(relayGroupMap))
-		for _, rg := range relayGroupMap {
-			relayGroups = append(relayGroups, rg)
+		for _, groupName := range relayGroupOrder {
+			relayGroups = append(relayGroups, relayGroupMap[groupName])
 		}
 		if injectRelayGroupsIntoRootMap(rootMap, relayGroups) {
 			modified = true
