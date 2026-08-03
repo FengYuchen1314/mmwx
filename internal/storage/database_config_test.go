@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -345,5 +346,42 @@ func TestReplacePostgresScalarMax(t *testing.T) {
 	want := `SELECT MAX(id), GREATEST(COALESCE(rx, 0), COALESCE(tx, 0)), SUM(GREATEST(weighted - baseline, 0)) FROM traffic`
 	if got := replacePostgresScalarMax(query); got != want {
 		t.Fatalf("query=%s\nwant=%s", got, want)
+	}
+}
+
+func TestRoutingRulePresetsUpsertDeduplicatesAndPrunes(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+	if err := repo.CreateUser(ctx, "preset-admin", "preset-admin@example.com", "Admin", "hash", RoleAdmin, ""); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+
+	first, err := repo.UpsertRoutingRulePreset(ctx, "preset-admin", "first", `{"type":"field","domain":["example.com"],"outboundTag":"direct"}`)
+	if err != nil {
+		t.Fatalf("UpsertRoutingRulePreset: %v", err)
+	}
+	updated, err := repo.UpsertRoutingRulePreset(ctx, "preset-admin", "renamed", first.RuleJSON)
+	if err != nil {
+		t.Fatalf("deduplicate preset: %v", err)
+	}
+	if updated.ID != first.ID || updated.Name != "renamed" {
+		t.Fatalf("dedup result=%+v, first=%+v", updated, first)
+	}
+
+	for index := 0; index < maxRoutingRulePresets+3; index++ {
+		rule := fmt.Sprintf(`{"type":"field","domain":["%d.example.com"],"outboundTag":"direct"}`, index)
+		if _, err := repo.UpsertRoutingRulePreset(ctx, "preset-admin", fmt.Sprintf("rule-%d", index), rule); err != nil {
+			t.Fatalf("insert preset %d: %v", index, err)
+		}
+	}
+	presets, err := repo.ListRoutingRulePresets(ctx, "preset-admin")
+	if err != nil {
+		t.Fatalf("ListRoutingRulePresets: %v", err)
+	}
+	if len(presets) != maxRoutingRulePresets {
+		t.Fatalf("preset count=%d, want %d", len(presets), maxRoutingRulePresets)
+	}
+	if err := repo.DeleteRoutingRulePreset(ctx, "preset-admin", presets[0].ID); err != nil {
+		t.Fatalf("DeleteRoutingRulePreset: %v", err)
 	}
 }

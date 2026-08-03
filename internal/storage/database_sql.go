@@ -68,6 +68,7 @@ var generatedIDTables = map[string]bool{
 	"certificates": true, "custom_rules": true, "dns_providers": true,
 	"external_subscriptions": true, "nodes": true, "override_scripts": true,
 	"packages": true, "proxy_provider_configs": true, "remote_servers": true,
+	"routing_rule_presets":         true,
 	"server_xray_config_snapshots": true, "shared_servers": true,
 	"speed_test_results": true, "speed_testers": true, "subscribe_files": true,
 	"subscription_links": true, "task_runs": true, "templates": true,

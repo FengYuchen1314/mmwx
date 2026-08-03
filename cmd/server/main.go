@@ -365,6 +365,7 @@ func main() {
 	mux.Handle("/api/user/sync-external-subscription", auth.RequireToken(tokenStore, userRepo, handler.NewSyncSingleExternalSubscriptionHandler(repo, subscribeDir)))
 	mux.Handle("/api/user/sync-external-subscriptions/confirm", auth.RequireToken(tokenStore, userRepo, handler.NewConfirmExternalSyncHandler(repo)))
 	mux.Handle("/api/admin/rules/latest", auth.RequireAdmin(tokenStore, userRepo, handler.NewRuleMetadataHandler(subscribeDir, repo)))
+	mux.Handle("/api/admin/routing-rule-presets", auth.RequireAdmin(tokenStore, userRepo, handler.NewRoutingRulePresetsHandler(repo)))
 	mux.Handle("/api/admin/custom-rules", auth.RequireToken(tokenStore, userRepo, handler.NewCustomRulesHandler(repo)))
 	mux.Handle("/api/admin/custom-rules/", auth.RequireToken(tokenStore, userRepo, handler.NewCustomRuleHandler(repo)))
 	mux.Handle("/api/admin/apply-custom-rules", auth.RequireToken(tokenStore, userRepo, handler.NewApplyCustomRulesHandler(repo)))

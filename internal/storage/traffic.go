@@ -1705,6 +1705,27 @@ CREATE TABLE IF NOT EXISTS user_settings (
 		return fmt.Errorf("migrate user_settings: %w", err)
 	}
 
+	// Xray 路由规则快速添加预设。按创建者隔离，rule_json 使用后端规范化后的
+	// JSON，并以 (username, rule_json) 唯一约束实现跨服务器去重。
+	const routingRulePresetsSchema = `
+CREATE TABLE IF NOT EXISTS routing_rule_presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    name TEXT NOT NULL,
+    rule_json TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE,
+    UNIQUE(username, rule_json)
+);
+CREATE INDEX IF NOT EXISTS idx_routing_rule_presets_username_updated
+    ON routing_rule_presets(username, updated_at DESC);
+`
+
+	if _, err := r.db.Exec(routingRulePresetsSchema); err != nil {
+		return fmt.Errorf("migrate routing_rule_presets: %w", err)
+	}
+
 	// 如果不存在，则将 match_rule 列添加到 user_settings 表中
 	if err := r.ensureUserSettingsColumn("match_rule", "TEXT NOT NULL DEFAULT 'node_name'"); err != nil {
 		return err
