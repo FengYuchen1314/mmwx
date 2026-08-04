@@ -41,8 +41,12 @@ const (
 	// PathChildNginxWebsites scans and safely manages domain configs deployed in
 	// the active nginx servers directory. GET=list/environment, DELETE=remove a
 	// managed standalone website with nginx -t/reload rollback.
-	PathChildNginxWebsites    = "/api/child/nginx/websites"
-	PathChildDomainProbe      = "/api/child/domains/latency"
+	PathChildNginxWebsites = "/api/child/nginx/websites"
+	PathChildDomainProbe   = "/api/child/domains/latency"
+	// PathChildReturnRouteTest runs a bounded three-carrier return-route probe.
+	// The same handler is reachable through the authenticated WebSocket RPC mux,
+	// so an agent does not need to expose its HTTP listen port.
+	PathChildReturnRouteTest  = "/api/child/network/return-route-test"
 	PathChildNginxClearStream = "/api/child/nginx/clear-stream-port"
 	PathChildValidateSite     = "/api/child/validate-site"
 	PathChildLimiter          = "/api/child/limiter"

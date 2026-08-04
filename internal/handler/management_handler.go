@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1576,8 +1577,9 @@ func (h *ManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Request)
 	}
 
 	info := map[string]interface{}{
-		"success":       true,
-		"agent_version": version.Version, // 主控用这个对比 GitHub latest tag 决定是否提示升级
+		"success":              true,
+		"agent_version":        version.Version, // 主控用这个对比 GitHub latest tag 决定是否提示升级
+		"tcp_fast_open_server": tcpFastOpenServerSupported(),
 	}
 
 	if hostname, err := os.Hostname(); err == nil {
@@ -1612,6 +1614,17 @@ func (h *ManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, info)
+}
+
+// tcpFastOpenServerSupported 检测 Linux 内核是否允许服务端 TFO。
+// /proc/sys/net/ipv4/tcp_fastopen 是位掩码：1=客户端，2=服务端。
+func tcpFastOpenServerSupported() bool {
+	raw, err := os.ReadFile("/proc/sys/net/ipv4/tcp_fastopen")
+	if err != nil {
+		return false
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	return err == nil && value&2 != 0
 }
 
 // HandleSystemNICs 列出本机可用于 xray 出站 sendThrough 绑定的网卡地址。
@@ -2185,9 +2198,11 @@ func mergeInboundClients(dst, src map[string]interface{}) {
 		}
 		dup := false
 		for _, dc := range dstArr {
-			if dm, ok := dc.(map[string]interface{}); ok && matchClientCredential(dm, sm, proto) {
-				dup = true
-				break
+			if dm, ok := dc.(map[string]interface{}); ok {
+				if matchClientCredential(dm, sm, proto) || sameNonEmptyClientEmail(dm, sm) {
+					dup = true
+					break
+				}
 			}
 		}
 		if !dup {
@@ -2476,6 +2491,9 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 	case "add-sniffing-exclude":
 		h.manageInboundSniffingExclude(w, ctx, &req)
 		return
+	case "replace":
+		h.manageInboundReplace(w, ctx, &req)
+		return
 	}
 
 	if h.xrayMode == "embedded" && h.embeddedXray != nil {
@@ -2569,6 +2587,38 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusBadRequest, "Invalid action. Must be 'add' or 'remove'")
 	}
+}
+
+// manageInboundReplace 在同一把 inboundsMu 内替换入站；任一步失败都恢复旧运行态和配置文件。
+func (h *ManageHandler) manageInboundReplace(w http.ResponseWriter, ctx context.Context, req *InboundRequest) {
+	tag := strings.TrimSpace(req.Tag)
+	if tag == "" || req.Inbound == nil || strings.TrimSpace(fmt.Sprint(req.Inbound["tag"])) != tag {
+		writeError(w, http.StatusBadRequest, "replace requires an unchanged tag and inbound payload")
+		return
+	}
+	var oldInbound map[string]interface{}
+	for _, inbound := range h.getInboundsFromConfig() {
+		if strings.TrimSpace(fmt.Sprint(inbound["tag"])) == tag {
+			oldInbound = inbound
+			break
+		}
+	}
+	if oldInbound == nil {
+		writeError(w, http.StatusNotFound, "inbound not found: "+tag)
+		return
+	}
+	if err := h.replaceRuntimeInbound(ctx, tag, req.Inbound); err != nil {
+		_ = h.replaceRuntimeInbound(context.Background(), tag, oldInbound)
+		writeError(w, http.StatusInternalServerError, "replace inbound failed; old inbound restored: "+err.Error())
+		return
+	}
+	if err := h.persistInbound(req.Inbound); err != nil {
+		_ = h.replaceRuntimeInbound(context.Background(), tag, oldInbound)
+		_ = h.persistInbound(oldInbound)
+		writeError(w, http.StatusInternalServerError, "persist replacement failed; old inbound restored: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Inbound replaced successfully"})
 }
 
 func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context.Context, action string, req *InboundRequest) {
@@ -2739,7 +2789,21 @@ func (h *ManageHandler) manageInboundClient(w http.ResponseWriter, ctx context.C
 				return
 			}
 		}
-		arr = append(arr, req.Client)
+		// Xray requires email to be unique within one inbound. Older masters
+		// could race and send the same email with two UUIDs; primary-key-only
+		// idempotency appended both and made Xray fail to start. The newest
+		// request is DB-authoritative, so replace the stale email entry.
+		replacedByEmail := false
+		for i, c := range arr {
+			if m, ok := c.(map[string]interface{}); ok && sameNonEmptyClientEmail(m, req.Client) {
+				arr[i] = req.Client
+				replacedByEmail = true
+				break
+			}
+		}
+		if !replacedByEmail {
+			arr = append(arr, req.Client)
+		}
 	case "remove-client":
 		filtered := arr[:0:0]
 		removed := 0
@@ -3012,6 +3076,12 @@ func matchClientCredential(a, b map[string]interface{}, protocol string) bool {
 	// 任一方缺 primary key — 典型是主控 removeClientFromInbound 只传 {email: ...}
 	// 这种"按 email 删 client"路径需要保留,降级用 email 匹配。
 	return bothNonEmptyEq("email")
+}
+
+func sameNonEmptyClientEmail(a, b map[string]interface{}) bool {
+	ae := strings.TrimSpace(fmt.Sprint(a["email"]))
+	be := strings.TrimSpace(fmt.Sprint(b["email"]))
+	return ae != "" && ae != "<nil>" && ae == be
 }
 
 // ================== Xray 出站管理 ==================
@@ -3666,7 +3736,17 @@ func applyAddClientToConfig(config map[string]interface{}, tag string, client ma
 				return m, false, nil // 已存在,inbound 未变
 			}
 		}
-		arr = append(arr, client)
+		replacedByEmail := false
+		for i, c := range arr {
+			if cm, ok := c.(map[string]interface{}); ok && sameNonEmptyClientEmail(cm, client) {
+				arr[i] = client
+				replacedByEmail = true
+				break
+			}
+		}
+		if !replacedByEmail {
+			arr = append(arr, client)
+		}
 		settings[arrKey] = arr
 		return m, true, nil
 	}

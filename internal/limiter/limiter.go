@@ -48,12 +48,71 @@ var KickCounter sync.Map // map[string]*int64
 // AcquireConn 进连接 +1、ReleaseConn 出连接 -1;精确并发(靠 dispatcher 的 ctx AfterFunc 释放)。
 var connCount sync.Map // map[string]*atomic.Int64
 
+// activeConnKickers 保存每个连接组当前存量连接的中断函数。主控禁用用户、用户
+// 超额或套餐过期后会把该 group 从 limiter 配置中移除；SyncInboundLimiter 检测到
+// group 消失时立即中断这些连接，而不是只阻止下一次认证、等待长连接自然结束。
+type connKickerSet struct {
+	mu   sync.Mutex
+	next uint64
+	all  map[uint64]func()
+}
+
+var activeConnKickers sync.Map // map[group]*connKickerSet
+
 func connCounter(group string) *atomic.Int64 {
 	if v, ok := connCount.Load(group); ok {
 		return v.(*atomic.Int64)
 	}
 	v, _ := connCount.LoadOrStore(group, new(atomic.Int64))
 	return v.(*atomic.Int64)
+}
+
+// TrackConn 注册一条已放行连接的中断函数，返回的 cleanup 必须在连接结束时调用。
+func (l *Limiter) TrackConn(group string, kick func()) func() {
+	if group == "" || kick == nil {
+		return func() {}
+	}
+	value, _ := activeConnKickers.LoadOrStore(group, &connKickerSet{all: make(map[uint64]func())})
+	set := value.(*connKickerSet)
+	set.mu.Lock()
+	set.next++
+	id := set.next
+	set.all[id] = kick
+	set.mu.Unlock()
+	return func() {
+		set.mu.Lock()
+		delete(set.all, id)
+		empty := len(set.all) == 0
+		set.mu.Unlock()
+		if empty {
+			activeConnKickers.CompareAndDelete(group, set)
+		}
+	}
+}
+
+func kickConnGroup(group string) {
+	value, ok := activeConnKickers.LoadAndDelete(group)
+	if !ok {
+		return
+	}
+	set := value.(*connKickerSet)
+	set.mu.Lock()
+	kickers := make([]func(), 0, len(set.all))
+	for _, kick := range set.all {
+		kickers = append(kickers, kick)
+	}
+	set.all = make(map[uint64]func())
+	set.mu.Unlock()
+	for _, kick := range kickers {
+		kick()
+	}
+}
+
+func userConnGroup(u UserInfo) string {
+	if u.ConnGroup != "" {
+		return u.ConnGroup
+	}
+	return u.Email
 }
 
 // lookupUserInfo 按 (tag,email) 前缀扫描找到该用户的限流配置。
@@ -175,6 +234,18 @@ func (l *Limiter) SyncInboundLimiter(tag string, nodeSpeedLimit uint64, users []
 		return
 	}
 	prev := old.(*InboundInfo)
+	nextGroups := make(map[string]struct{}, len(users))
+	for _, u := range users {
+		nextGroups[userConnGroup(u)] = struct{}{}
+	}
+	removedGroups := make(map[string]struct{})
+	prev.UserInfo.Range(func(_, value any) bool {
+		group := userConnGroup(value.(UserInfo))
+		if _, retained := nextGroups[group]; !retained {
+			removedGroups[group] = struct{}{}
+		}
+		return true
+	})
 
 	// 仍然整体换 InboundInfo 而不是原地改 NodeSpeedLimit:后者会与 GetUserBucket
 	// 的无锁读构成数据竞争。换指针由 sync.Map.Store 保证可见性。
@@ -189,6 +260,9 @@ func (l *Limiter) SyncInboundLimiter(tag string, nodeSpeedLimit uint64, users []
 		info.UserInfo.Store(fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID), u)
 	}
 	l.InboundInfo.Store(tag, info)
+	for group := range removedGroups {
+		kickConnGroup(group)
+	}
 
 	// 把新速率写进存量桶,存量连接立刻感知。
 	// limit==0(无限制)不动:同 UpdateInboundLimiter 的说明 —— 删桶或原地置无限

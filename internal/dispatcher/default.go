@@ -155,7 +155,16 @@ func (d *Dispatcher) getLink(ctx context.Context) (*transport.Link, *transport.L
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, errors.New("connection limit reached: ", user.Email)
 		} else if group != "" {
-			context.AfterFunc(ctx, func() { d.Limiter.ReleaseConn(group) })
+			untrack := d.Limiter.TrackConn(group, func() {
+				common.Close(outboundLink.Writer)
+				common.Close(inboundLink.Writer)
+				common.Interrupt(outboundLink.Reader)
+				common.Interrupt(inboundLink.Reader)
+			})
+			context.AfterFunc(ctx, func() {
+				untrack()
+				d.Limiter.ReleaseConn(group)
+			})
 		}
 
 		bucket, hasLimit, _ := d.Limiter.GetUserBucket(
@@ -321,7 +330,14 @@ func (d *Dispatcher) DispatchLink(ctx context.Context, destination net.Destinati
 				common.Close(outbound.Writer)
 				return errors.New("connection limit reached: ", si.User.Email)
 			} else if group != "" {
-				context.AfterFunc(ctx, func() { d.Limiter.ReleaseConn(group) })
+				untrack := d.Limiter.TrackConn(group, func() {
+					common.Interrupt(outbound.Reader)
+					common.Close(outbound.Writer)
+				})
+				context.AfterFunc(ctx, func() {
+					untrack()
+					d.Limiter.ReleaseConn(group)
+				})
 			}
 		}
 	}
