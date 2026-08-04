@@ -304,7 +304,7 @@ func classifyReturnRoute(entry *returnRouteHop, path []string) (string, string) 
 	case has("4837"):
 		route = "4837"
 	case has("58453") || has("9808"):
-		route = "CMIN"
+		route = "CMI"
 	case entry.ASN == "4538":
 		route = "CERNET"
 	case entry.ASN == "7497":
