@@ -94,6 +94,30 @@ func initTimezone() {
 	logger.Warn("无法确定本地时区,按 UTC 运行;每日通知等按本地时间的功能会偏移,请设置环境变量 TZ(如 TZ=Asia/Shanghai)")
 }
 
+// resolveRuntimeDataDir uses known persistent paths before considering the
+// process working directory. Some upgraded systemd units have an incorrect
+// WorkingDirectory, but the real database remains /etc/mmwx/data/mmwx.db.
+func resolveRuntimeDataDir() string {
+	if configured := strings.TrimSpace(os.Getenv("MMWX_DATA_DIR")); configured != "" {
+		if absolute, err := filepath.Abs(configured); err == nil {
+			return absolute
+		}
+		return filepath.Clean(configured)
+	}
+	for _, knownDir := range []string{"/etc/mmwx/data", "/app/data"} {
+		for _, marker := range []string{"mmwx.db", storage.DatabaseConfigFilename, "mmwx_master.key"} {
+			if _, statErr := os.Stat(filepath.Join(knownDir, marker)); statErr == nil {
+				return knownDir
+			}
+		}
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "data"
+	}
+	return filepath.Join(cwd, "data")
+}
+
 func main() {
 	// 初始化logger
 	logger.Init()
@@ -118,10 +142,9 @@ func main() {
 		log.Printf("Loaded configuration from %s", *configPath)
 	}
 
-	// WorkingDirectory is /etc/mmwx for bare metal and /app in the image, so
-	// the shared relative data directory resolves to the documented persistent
-	// paths /etc/mmwx/data and /app/data respectively.
-	dataDir := "data"
+	// Resolve an absolute persistent path so a systemd WorkingDirectory change
+	// cannot silently create and select a nested empty database.
+	dataDir := resolveRuntimeDataDir()
 	databaseConfig, databaseConfigPath, err := storage.LoadDatabaseConfig(dataDir)
 	if err != nil {
 		logger.Error("数据库配置加载失败", "path", databaseConfigPath, "error", err)
@@ -139,7 +162,14 @@ func main() {
 		logger.Error("数据库初始化失败", "driver", databaseConfig.Driver, "error", err)
 		os.Exit(1)
 	}
-	logger.Info("数据库连接成功", "driver", databaseConfig.Driver, "config", databaseConfigPath)
+	databaseTarget := databaseConfig.Database
+	if databaseConfig.Driver == "sqlite" {
+		databaseTarget = databaseConfig.Path
+		if absolutePath, absErr := filepath.Abs(databaseConfig.Path); absErr == nil {
+			databaseTarget = absolutePath
+		}
+	}
+	logger.Info("数据库连接成功", "driver", databaseConfig.Driver, "config", databaseConfigPath, "database", databaseTarget)
 	if recoveredFromBackup {
 		logger.Warn("主数据库损坏或无法启动，已使用最近的每小时备份恢复；故障数据库及 WAL/SHM 已归档到 data/database-recovery-*，请检查磁盘和文件系统")
 	}
@@ -156,7 +186,7 @@ func main() {
 
 	addr := getAddr(config, repo)
 
-	masterIdentity, err := securechan.LoadOrGenerate(filepath.Join("data", "mmwx_master.key"))
+	masterIdentity, err := securechan.LoadOrGenerate(filepath.Join(dataDir, "mmwx_master.key"))
 	if err != nil {
 		logger.Error("加密密钥初始化失败", "error", err)
 		os.Exit(1)
@@ -1301,7 +1331,7 @@ func main() {
 	// 前端 dist 是编译进二进制的只读 embed.FS,用户无法往里放图片;这是唯一能在 Docker/二进制
 	// 部署里放自定义壁纸等图片的位置:把图片丢进 data/public/,再在设置里引用 /public/xxx.jpg。
 	// ServeMux 里 "/public/" 比 "/" 更具体 → 优先命中,不会被 SPA 兜底吞掉。
-	publicDir := filepath.Join("data", "public")
+	publicDir := filepath.Join(dataDir, "public")
 	_ = os.MkdirAll(publicDir, 0755)
 	mux.Handle("/public/", http.StripPrefix("/public/", http.FileServer(http.Dir(publicDir))))
 

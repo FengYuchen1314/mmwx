@@ -118,7 +118,7 @@ service_start() {
         mkdir -p /var/log
         start-stop-daemon --start --background --make-pidfile --pidfile "/run/${SERVICE_NAME}.pid" \
             --chdir "$DATA_DIR" --exec /usr/bin/env -- \
-            PORT="$(configured_port)" LOG_LEVEL=info "$INSTALL_DIR/$SERVICE_NAME"
+            PORT="$(configured_port)" MMWX_DATA_DIR="$DATA_DIR/data" LOG_LEVEL=info "$INSTALL_DIR/$SERVICE_NAME"
     fi
 }
 
@@ -227,6 +227,7 @@ install_binary() {
 create_directories() {
     echo_info "创建数据目录..."
     mkdir -p "$DATA_DIR"
+    mkdir -p "$DATA_DIR/data"
     mkdir -p "$CONFIG_DIR"
     chmod 755 "$DATA_DIR"
     chmod 755 "$CONFIG_DIR"
@@ -270,6 +271,7 @@ SyslogIdentifier=$SERVICE_NAME
 
 # 环境变量
 Environment="PORT=$PORT_INPUT"
+Environment="MMWX_DATA_DIR=$DATA_DIR/data"
 Environment="LOG_LEVEL=info"
 
 # 安全选项
@@ -284,6 +286,7 @@ EOF
         mkdir -p /etc/conf.d /var/log
         cat > /etc/conf.d/${SERVICE_NAME} <<EOF
 PORT="$PORT_INPUT"
+MMWX_DATA_DIR="$DATA_DIR/data"
 LOG_LEVEL="info"
 EOF
         cat > /etc/init.d/${SERVICE_NAME} <<EOF
@@ -299,8 +302,9 @@ output_log="/var/log/$SERVICE_NAME.log"
 error_log="/var/log/$SERVICE_NAME.log"
 
 PORT="\${PORT:-12889}"
+MMWX_DATA_DIR="\${MMWX_DATA_DIR:-$DATA_DIR/data}"
 LOG_LEVEL="\${LOG_LEVEL:-info}"
-export PORT LOG_LEVEL
+export PORT MMWX_DATA_DIR LOG_LEVEL
 
 depend() {
     need net
@@ -422,9 +426,21 @@ update_service() {
     fi
 
     if [ "$SERVICE_MANAGER" = "systemd" ]; then
-        sed -i "s/Environment=\"PORT=[0-9]*\"/Environment=\"PORT=$PORT_INPUT\"/" /etc/systemd/system/${SERVICE_NAME}.service
+        SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+        sed -i "s|^WorkingDirectory=.*|WorkingDirectory=$DATA_DIR|" "$SERVICE_FILE"
+        sed -i "s/Environment=\"PORT=[0-9]*\"/Environment=\"PORT=$PORT_INPUT\"/" "$SERVICE_FILE"
+        if grep -q '^Environment="MMWX_DATA_DIR=' "$SERVICE_FILE"; then
+            sed -i "s|^Environment=\"MMWX_DATA_DIR=.*|Environment=\"MMWX_DATA_DIR=$DATA_DIR/data\"|" "$SERVICE_FILE"
+        else
+            sed -i "/^Environment=\"PORT=/a Environment=\"MMWX_DATA_DIR=$DATA_DIR/data\"" "$SERVICE_FILE"
+        fi
     else
         sed -i "s/^PORT=.*/PORT=\"$PORT_INPUT\"/" /etc/conf.d/${SERVICE_NAME}
+        if grep -q '^MMWX_DATA_DIR=' /etc/conf.d/${SERVICE_NAME}; then
+            sed -i "s|^MMWX_DATA_DIR=.*|MMWX_DATA_DIR=\"$DATA_DIR/data\"|" /etc/conf.d/${SERVICE_NAME}
+        else
+            printf '\nMMWX_DATA_DIR="%s/data"\n' "$DATA_DIR" >> /etc/conf.d/${SERVICE_NAME}
+        fi
     fi
     service_reload_manager
 

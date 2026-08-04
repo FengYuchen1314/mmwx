@@ -14,7 +14,7 @@ import (
 const DatabaseConfigFilename = "database.json"
 
 var databaseEnvironmentKeys = []string{
-	"MMWX_DATABASE_DRIVER", "MMWX_DATABASE_HOST",
+	"MMWX_DATABASE_DRIVER", "MMWX_DATABASE_PATH", "MMWX_DATABASE_HOST",
 	"MMWX_DATABASE_PORT", "MMWX_DATABASE_NAME", "MMWX_DATABASE_USER", "MMWX_DATABASE_PASSWORD",
 	"MMWX_DATABASE_SSLMODE",
 }
@@ -95,7 +95,7 @@ func preferPopulatedCanonicalSQLite(dataDir, configuredPath string) string {
 	}
 	legacyUsers, legacyOK := sqliteUserCount(legacyPath)
 	canonicalUsers, canonicalOK := sqliteUserCount(canonicalPath)
-	if legacyOK && canonicalOK && legacyUsers == 0 && canonicalUsers > 0 {
+	if canonicalOK && canonicalUsers > 0 && (!legacyOK || legacyUsers == 0) {
 		return canonicalPath
 	}
 	return configuredPath

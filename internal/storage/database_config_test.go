@@ -94,6 +94,32 @@ func TestDatabaseConfigRepairsStaleLegacyEnvironment(t *testing.T) {
 	}
 }
 
+func TestDatabaseConfigIgnoresMissingStaleLegacyEnvironment(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	legacyPath := filepath.Join(root, "mmwx.db")
+	canonicalPath := filepath.Join(dataDir, "mmwx.db")
+	canonical, err := NewTrafficRepository(canonicalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := canonical.CreateUser(context.Background(), "admin", "", "Admin", "hash", RoleAdmin, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := canonical.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DATABASE_PATH", legacyPath)
+
+	cfg, _, err := LoadDatabaseConfig(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Path != canonicalPath {
+		t.Fatalf("path=%q want=%q", cfg.Path, canonicalPath)
+	}
+}
+
 func TestDatabaseConfigKeepsPopulatedExplicitLegacyDatabase(t *testing.T) {
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")

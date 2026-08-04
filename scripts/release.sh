@@ -4,7 +4,7 @@
 # 流程：bump version -> 更新 README changelog -> commit -> tag -> push -> 创建 GitHub Release
 #
 # 用法:
-#   bash scripts/release.sh           # bump patch (0.2.4 -> 0.2.5)
+#   bash scripts/release.sh           # 稳定版 bump patch；beta/rc 转同版本稳定版
 #   bash scripts/release.sh minor     # bump minor (0.2.4 -> 0.3.0)
 #   bash scripts/release.sh major     # bump major (0.2.4 -> 1.0.0)
 #   bash scripts/release.sh 0.5.0     # 直接指定版本号
@@ -29,7 +29,30 @@ if [ -z "$CURRENT_VERSION" ]; then
   exit 1
 fi
 
-BUMP_ARG="${1:-patch}"
+# 无参数是最常用的正式发布入口：
+#   0.4.3          -> 0.4.4
+#   0.4.4-beta.3   -> 0.4.4
+# 旧逻辑无条件走 patch，awk 会把 0.4.4-beta.3 的第三段按数字 4 解析，错误发布成 0.4.5。
+if [ "$#" -eq 0 ]; then
+  if [[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(beta|rc)\.[0-9]+$ ]]; then
+    BUMP_ARG="stable"
+  else
+    BUMP_ARG="patch"
+  fi
+else
+  BUMP_ARG="$1"
+fi
+
+# major/minor/patch 只针对核心 X.Y.Z 计算，避免预发布后缀被 awk 隐式转成数字。
+CORE_VERSION="${CURRENT_VERSION%%-*}"
+if [[ ! "$CORE_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  echo "[ERROR] 当前版本格式无效: $CURRENT_VERSION"
+  exit 1
+fi
+CURRENT_MAJOR="${BASH_REMATCH[1]}"
+CURRENT_MINOR="${BASH_REMATCH[2]}"
+CURRENT_PATCH="${BASH_REMATCH[3]}"
+
 RELEASE_KIND="stable"
 case "$BUMP_ARG" in
   prerelease)
@@ -52,13 +75,13 @@ case "$BUMP_ARG" in
     fi
     ;;
   major)
-    NEW_VERSION=$(echo "$CURRENT_VERSION" | awk -F. '{printf "%d.0.0", $1+1}')
+    NEW_VERSION="$((CURRENT_MAJOR + 1)).0.0"
     ;;
   minor)
-    NEW_VERSION=$(echo "$CURRENT_VERSION" | awk -F. '{printf "%d.%d.0", $1, $2+1}')
+    NEW_VERSION="${CURRENT_MAJOR}.$((CURRENT_MINOR + 1)).0"
     ;;
   patch)
-    NEW_VERSION=$(echo "$CURRENT_VERSION" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}')
+    NEW_VERSION="${CURRENT_MAJOR}.${CURRENT_MINOR}.$((CURRENT_PATCH + 1))"
     ;;
   [0-9]*.[0-9]*.[0-9]*)
     # 直接指定 X.Y.Z
