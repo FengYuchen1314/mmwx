@@ -47,6 +47,15 @@ func TestDatabaseConfigEnvironmentOverride(t *testing.T) {
 	}
 }
 
+func TestAdaptSQLPostgresParameterizedIs(t *testing.T) {
+	query := `SELECT 1 FROM users WHERE package_id IS NOT ? OR telegram_id IS ?`
+	got := adaptSQL("postgres", query)
+	want := `SELECT 1 FROM users WHERE package_id IS DISTINCT FROM $1 OR telegram_id IS NOT DISTINCT FROM $2`
+	if got != want {
+		t.Fatalf("adapted query mismatch:\n got: %s\nwant: %s", got, want)
+	}
+}
+
 func TestDatabaseConfigUsesLegacyBareMetalPath(t *testing.T) {
 	root := t.TempDir()
 	legacy := filepath.Join(root, "mmwx.db")

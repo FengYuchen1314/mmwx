@@ -61,6 +61,8 @@ var (
 	insertOrIgnore          = regexp.MustCompile(`(?i)^\s*INSERT\s+OR\s+IGNORE\s+`)
 	pragmaTableInfo         = regexp.MustCompile(`(?i)^\s*PRAGMA\s+table_info\((?:'|\")?([a-zA-Z0-9_]+)(?:'|\")?\)\s*;?\s*$`)
 	insertTable             = regexp.MustCompile(`(?i)^\s*INSERT(?:\s+OR\s+\w+)?\s+INTO\s+["']?([a-zA-Z0-9_]+)`)
+	parameterizedIsNot      = regexp.MustCompile(`(?i)\bIS\s+NOT\s+\?`)
+	parameterizedIs         = regexp.MustCompile(`(?i)\bIS\s+\?`)
 )
 
 var generatedIDTables = map[string]bool{
@@ -111,6 +113,12 @@ func adaptSQL(driver, query string) string {
 	q = regexp.MustCompile(`(?i)json_set\(([^,]+),\s*'\$\.([a-zA-Z0-9_-]+)',\s*\?\)`).ReplaceAllString(q, `jsonb_set(($1)::jsonb, '{$2}', to_jsonb(?::text))::text`)
 	q = strings.ReplaceAll(q, "datetime('now')", "CURRENT_TIMESTAMP")
 	q = strings.ReplaceAll(q, "datetime('now', '+' || ? || ' days')", "(CURRENT_TIMESTAMP + (? || ' days')::interval)")
+	// SQLite allows null-safe parameter comparisons such as `value IS ?` and
+	// `value IS NOT ?`. PostgreSQL does not accept `IS $1`/`IS NOT $1`; its
+	// equivalent operators are IS [NOT] DISTINCT FROM. Do this before rebinding
+	// so future repository queries cannot reproduce the runtime SQLSTATE 42601.
+	q = parameterizedIsNot.ReplaceAllString(q, "IS DISTINCT FROM ?")
+	q = parameterizedIs.ReplaceAllString(q, "IS NOT DISTINCT FROM ?")
 	q = regexp.MustCompile(`(?is)^\s*INSERT\s+OR\s+REPLACE\s+INTO\s+traffic_threshold_notified\s*\(server_id,\s*notified_at\)\s*VALUES\s*\(\?,\s*CURRENT_TIMESTAMP\)`).ReplaceAllString(q,
 		`INSERT INTO traffic_threshold_notified (server_id, notified_at) VALUES (?, CURRENT_TIMESTAMP) ON CONFLICT (server_id) DO UPDATE SET notified_at = EXCLUDED.notified_at`)
 	q = strings.ReplaceAll(q, `instr(?, username || '__')`, `strpos(?, username || '__')`)

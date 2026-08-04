@@ -8475,14 +8475,16 @@ func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username st
 	// 拿它跟新 packageID 比即可区分两种调用:
 	//   旧 == 新 → 续期/改到期 → 保留覆写
 	//   旧 != 新 → 换套餐;旧为 NULL(过期后续费)→ 清除覆写
-	// 必须用 IS NOT(null-safe)而非 != :`NULL != 5` 求值为 NULL(falsy),会让过期后续费漏清。
+	// 用 CASE WHEN package_id = ? 保持 SQLite/PostgreSQL 兼容:旧值为 NULL 时条件
+	// 不成立,同样进入 ELSE 清除覆写。不要写 `IS NOT ?`,它在 PostgreSQL 重绑定
+	// 为 `IS NOT $1` 后属于非法语法。
 	//
 	// 清除逻辑刻意下沉到这里而不是放 handler 层的 AssignAndProvision(它已有 samePackage 判断):
 	// tgbot_admin.go 的 assignPackage 有一条 h.assign == nil 时直接调本函数的兜底路径,
 	// 放 handler 层会漏。这里是所有调用方的必经之路。
 	const query = `
 		UPDATE users
-		SET traffic_limit_override = CASE WHEN package_id IS NOT ? THEN NULL ELSE traffic_limit_override END,
+		SET traffic_limit_override = CASE WHEN package_id = ? THEN traffic_limit_override ELSE NULL END,
 		    package_id = ?, package_start_date = ?, package_end_date = ?, last_package_id = ?, last_package_end_date = ?,
 		    is_reset = ?, reset_day = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE username = ?
