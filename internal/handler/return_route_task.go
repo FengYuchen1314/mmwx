@@ -102,6 +102,14 @@ func (t *ReturnRouteTester) RunAsync(serverIDs []int64) (int64, error) {
 }
 
 func (t *ReturnRouteTester) runAsync(serverIDs []int64, requireAllSupported bool) (int64, error) {
+	var err error
+	serverIDs, err = t.probeServerIDs(context.Background(), serverIDs)
+	if err != nil {
+		return 0, err
+	}
+	if len(serverIDs) == 0 {
+		return 0, errors.New("探针未配置展示服务器，没有可检测的 Agent")
+	}
 	if names, err := t.unsupportedConnectedAgents(context.Background(), serverIDs); err != nil {
 		return 0, err
 	} else if requireAllSupported && len(names) > 0 {
@@ -119,6 +127,43 @@ func (t *ReturnRouteTester) runAsync(serverIDs []int64, requireAllSupported bool
 	return runID, nil
 }
 
+// probeServerIDs returns the exact set of servers exposed by the probe. A
+// caller-provided list can only narrow that set; it can never make this task
+// trace a hidden server. An empty configured list therefore means no work,
+// rather than the historical "all servers" behavior.
+func (t *ReturnRouteTester) probeServerIDs(ctx context.Context, requested []int64) ([]int64, error) {
+	raw, err := t.repo.GetSystemSetting(ctx, probeDisguiseServerIDsKey)
+	if err != nil {
+		return nil, fmt.Errorf("读取探针展示服务器失败: %w", err)
+	}
+	var configured []int64
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &configured); err != nil {
+			return nil, fmt.Errorf("探针展示服务器配置无效: %w", err)
+		}
+	}
+	allowed := make(map[int64]bool, len(configured))
+	for _, id := range configured {
+		if id > 0 {
+			allowed[id] = true
+		}
+	}
+	requestedSet := make(map[int64]bool, len(requested))
+	for _, id := range requested {
+		if id > 0 {
+			requestedSet[id] = true
+		}
+	}
+	result := make([]int64, 0, len(allowed))
+	for id := range allowed {
+		if len(requestedSet) == 0 || requestedSet[id] {
+			result = append(result, id)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result, nil
+}
+
 func (t *ReturnRouteTester) unsupportedConnectedAgents(ctx context.Context, serverIDs []int64) ([]string, error) {
 	servers, err := t.repo.ListRemoteServers(ctx)
 	if err != nil {
@@ -130,7 +175,7 @@ func (t *ReturnRouteTester) unsupportedConnectedAgents(ctx context.Context, serv
 	}
 	names := make([]string, 0)
 	for _, server := range servers {
-		if len(selected) > 0 && !selected[server.ID] {
+		if !selected[server.ID] {
 			continue
 		}
 		if server.IsFederated || server.Status != storage.RemoteServerStatusConnected {
@@ -178,7 +223,7 @@ func (t *ReturnRouteTester) run(ctx context.Context, runID int64, serverIDs []in
 	}
 	count := 0
 	for _, server := range servers {
-		if len(selected) > 0 && !selected[server.ID] {
+		if !selected[server.ID] {
 			continue
 		}
 		if server.IsFederated {
