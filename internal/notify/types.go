@@ -66,4 +66,10 @@ type Event struct {
 	Type    EventType
 	Title   string
 	Message string
+	Buttons []Button
+}
+
+type Button struct {
+	Text string
+	URL  string
 }

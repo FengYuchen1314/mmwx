@@ -10,9 +10,11 @@ import (
 )
 
 type IPRegion struct {
-	Country string `json:"country"`
-	Region  string `json:"region"`
-	City    string `json:"city"`
+	Country      string `json:"country"`
+	Region       string `json:"region"`
+	City         string `json:"city"`
+	ProviderName string `json:"provider_name,omitempty"`
+	ProviderURL  string `json:"provider_url,omitempty"`
 }
 
 func (r IPRegion) Label() string {

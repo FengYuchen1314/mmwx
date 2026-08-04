@@ -857,15 +857,18 @@ type RemoteServer struct {
 	// 动态出口 IP,只有用户填的静态入口 IP 能连。
 	LockEntryIP bool `json:"lock_entry_ip"`
 	// PortRangeMin/Max 随机端口范围:都 >0 且 min<=max 时,该服务器加节点自动分配的随机端口必须落在此区间。
-	PortRangeMin    int        `json:"port_range_min,omitempty"`
-	PortRangeMax    int        `json:"port_range_max,omitempty"`
-	TrafficLimit    int64      `json:"traffic_limit"`
-	TrafficResetDay int        `json:"traffic_reset_day"`
-	Region          string     `json:"region,omitempty"`
-	RenewalPrice    float64    `json:"renewal_price,omitempty"`
-	RenewalCycle    string     `json:"renewal_cycle,omitempty"`
-	RenewalCurrency string     `json:"renewal_currency,omitempty"`
-	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	PortRangeMin      int        `json:"port_range_min,omitempty"`
+	PortRangeMax      int        `json:"port_range_max,omitempty"`
+	TrafficLimit      int64      `json:"traffic_limit"`
+	TrafficResetDay   int        `json:"traffic_reset_day"`
+	Region            string     `json:"region,omitempty"`
+	ProviderName      string     `json:"provider_name,omitempty"`
+	ProviderURL       string     `json:"provider_url,omitempty"`
+	ProviderUpdatedAt *time.Time `json:"provider_updated_at,omitempty"`
+	RenewalPrice      float64    `json:"renewal_price,omitempty"`
+	RenewalCycle      string     `json:"renewal_cycle,omitempty"`
+	RenewalCurrency   string     `json:"renewal_currency,omitempty"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
 	// 双令牌系统字段
 	AgentToken            string     `json:"agent_token,omitempty"` // 代理令牌（服务器持有，用于从代理拉取）
 	AgentTokenExpiresAt   *time.Time `json:"agent_token_expires_at,omitempty"`
@@ -2536,6 +2539,15 @@ CREATE INDEX IF NOT EXISTS idx_remote_servers_status ON remote_servers(status);
 		return err
 	}
 	if err := r.ensureRemoteServerColumn("renewal_currency", "TEXT NOT NULL DEFAULT 'CNY'"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("provider_name", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("provider_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("provider_updated_at", "TIMESTAMP"); err != nil {
 		return err
 	}
 	if err := r.ensureRemoteServerColumn("expires_at", "TIMESTAMP"); err != nil {
@@ -10489,22 +10501,28 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 			}
 		}
 		// 探针元数据独立补查，避免继续扩张上方易错的 positional Scan。
-		if mrows, merr := r.db.QueryContext(ctx, `SELECT id, COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at FROM remote_servers`); merr == nil {
+		if mrows, merr := r.db.QueryContext(ctx, `SELECT id, COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at, COALESCE(provider_name,''), COALESCE(provider_url,''), provider_updated_at FROM remote_servers`); merr == nil {
 			byID := make(map[int64]*RemoteServer, len(servers))
 			for i := range servers {
 				byID[servers[i].ID] = &servers[i]
 			}
 			for mrows.Next() {
 				var id int64
-				var expires sql.NullTime
+				var expires, providerUpdated sql.NullTime
 				var region, cycle, currency string
+				var providerName, providerURL string
 				var price float64
-				if mrows.Scan(&id, &region, &price, &cycle, &currency, &expires) == nil {
+				if mrows.Scan(&id, &region, &price, &cycle, &currency, &expires, &providerName, &providerURL, &providerUpdated) == nil {
 					if s := byID[id]; s != nil {
 						s.Region, s.RenewalPrice, s.RenewalCycle, s.RenewalCurrency = region, price, cycle, currency
+						s.ProviderName, s.ProviderURL = providerName, providerURL
 						if expires.Valid {
 							t := expires.Time
 							s.ExpiresAt = &t
+						}
+						if providerUpdated.Valid {
+							t := providerUpdated.Time
+							s.ProviderUpdatedAt = &t
 						}
 					}
 				}
@@ -10607,12 +10625,16 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		server.LockEntryIP = lockEntryInt != 0
 		server.IncludeInTrafficStats = includeStatsInt != 0
 	}
-	var expires sql.NullTime
-	_ = r.db.QueryRowContext(ctx, `SELECT COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at FROM remote_servers WHERE id = ?`, id).
-		Scan(&server.Region, &server.RenewalPrice, &server.RenewalCycle, &server.RenewalCurrency, &expires)
+	var expires, providerUpdated sql.NullTime
+	_ = r.db.QueryRowContext(ctx, `SELECT COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at, COALESCE(provider_name,''), COALESCE(provider_url,''), provider_updated_at FROM remote_servers WHERE id = ?`, id).
+		Scan(&server.Region, &server.RenewalPrice, &server.RenewalCycle, &server.RenewalCurrency, &expires, &server.ProviderName, &server.ProviderURL, &providerUpdated)
 	if expires.Valid {
 		t := expires.Time
 		server.ExpiresAt = &t
+	}
+	if providerUpdated.Valid {
+		t := providerUpdated.Time
+		server.ProviderUpdatedAt = &t
 	}
 
 	server.XrayRunning = xrayRunningInt != 0
@@ -10666,6 +10688,17 @@ func (r *TrafficRepository) UpdateRemoteServerProbeMeta(ctx context.Context, id 
 		strings.TrimSpace(region), price, cycle, currency, expiresAt, id)
 	if err != nil {
 		return fmt.Errorf("update server probe metadata: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return ErrRemoteServerNotFound
+	}
+	return nil
+}
+
+func (r *TrafficRepository) UpdateRemoteServerProvider(ctx context.Context, id int64, name, websiteURL string) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET provider_name=?, provider_url=?, provider_updated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, strings.TrimSpace(name), strings.TrimSpace(websiteURL), id)
+	if err != nil {
+		return fmt.Errorf("update server provider: %w", err)
 	}
 	if n, _ := result.RowsAffected(); n == 0 {
 		return ErrRemoteServerNotFound

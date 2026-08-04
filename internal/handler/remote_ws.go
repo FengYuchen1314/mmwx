@@ -1183,6 +1183,7 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 					return
 				}
 				_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, s.ID, region.Flag(), s.RenewalPrice, s.RenewalCycle, s.RenewalCurrency, s.ExpiresAt)
+				_ = h.repo.UpdateRemoteServerProvider(lookupCtx, s.ID, region.ProviderName, region.ProviderURL)
 			}(server, ip)
 		}
 	}

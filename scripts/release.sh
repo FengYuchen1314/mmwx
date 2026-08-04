@@ -21,24 +21,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-# 获取上一个 tag
-PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-if [ -z "$PREV_TAG" ]; then
-  echo "[ERROR] 没有找到上一个 tag，无法生成 changelog"
-  exit 1
-fi
-
-# 收集自上个 tag 以来的 commit messages（排除版本号 commit 和 merge commit）
-COMMITS=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" --no-merges | grep -v "^- v[0-9]" | sort -u || true)
-if [ -z "$COMMITS" ]; then
-  echo "[SKIP] 没有新的 commit，跳过发布"
-  exit 0
-fi
-
-echo "=== 变更内容 ==="
-echo "$COMMITS"
-echo ""
-
 # 1. bump version
 echo "[1/6] 升级版本号..."
 CURRENT_VERSION=$(grep 'const Version' "${PROJECT_ROOT}/internal/version/version.go" | sed -n 's/.*"\(.*\)".*/\1/p')
@@ -87,6 +69,35 @@ case "$BUMP_ARG" in
     exit 1
     ;;
 esac
+
+# 选择 changelog 基线：
+# - stable 必须回到最近一个稳定版 tag，不能被中间 beta/rc 截断；
+# - prerelease 使用最近 tag，只展示相对上一预发布版本的增量。
+# tag 必须位于当前 HEAD 历史上，避免其它分支的 tag 被误选。
+if [ "$RELEASE_KIND" = "stable" ]; then
+  PREV_TAG=$(git tag --merged HEAD --sort=-version:refname \
+    | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+    | head -1 || true)
+else
+  PREV_TAG=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || true)
+fi
+if [ -z "$PREV_TAG" ]; then
+  echo "[ERROR] 没有找到可用的上一个 ${RELEASE_KIND} tag，无法生成 changelog"
+  exit 1
+fi
+
+# 保留 git log 的提交顺序和每一条提交；不能 sort -u，否则同名提交会丢失且顺序被打乱。
+# 只排除脚本自身生成的纯版本号 commit 和 merge commit。
+COMMITS=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" --no-merges \
+  | grep -Ev '^- v?[0-9]+\.[0-9]+\.[0-9]+([.-](beta|rc)\.[0-9]+)?$' || true)
+if [ -z "$COMMITS" ]; then
+  echo "[SKIP] ${PREV_TAG} 之后没有新的 commit，跳过发布"
+  exit 0
+fi
+
+echo "=== 变更内容（${PREV_TAG}..HEAD）==="
+echo "$COMMITS"
+echo ""
 
 # 写新版本到 version.go + install.sh + quick-install.sh
 bash scripts/sync-version.sh "$NEW_VERSION"

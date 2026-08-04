@@ -1406,6 +1406,7 @@ func main() {
 	remoteWSHandler.StartCleanupLoop(collectorCtx, 1*time.Minute)
 	// 启动通知调度器
 	go handler.StartNotifyScheduler(collectorCtx, repo)
+	go handler.StartServerProviderSync(collectorCtx, repo, licenseManager)
 	handler.FinishPendingMasterHTTPSRecovery(collectorCtx, repo)
 	recoveryPort := "12889"
 	if config != nil && config.Port != "" {

@@ -70,14 +70,18 @@ func shouldThrottleServerNotify(serverName string, event notify.EventType) bool 
 //
 // 异步 fire-and-forget:调用方零阻塞,适合订阅获取这类响应热路径。
 func notifyAsync(ctx context.Context, t notify.EventType, title, msg string) {
+	notifyAsyncEvent(ctx, notify.Event{Type: t, Title: title, Message: msg})
+}
+
+func notifyAsyncEvent(ctx context.Context, event notify.Event) {
 	n := GetNotifier()
 	if n == nil {
-		logNotifyReasonThrottled(t, "notifier_nil")
+		logNotifyReasonThrottled(event.Type, "notifier_nil")
 		return
 	}
-	ok, reason := n.CheckEnabled(t)
+	ok, reason := n.CheckEnabled(event.Type)
 	if !ok {
-		logNotifyReasonThrottled(t, string(reason))
+		logNotifyReasonThrottled(event.Type, string(reason))
 		return
 	}
 	// 异步 send 必须脱离请求生命周期:调用方多为 HTTP handler(如订阅获取),响应写完后
@@ -86,8 +90,8 @@ func notifyAsync(ctx context.Context, t notify.EventType, title, msg string) {
 	// 实际超时由 httpClient.Timeout(10s)兜底。
 	sendCtx := context.WithoutCancel(ctx)
 	go func() {
-		if err := n.Send(sendCtx, notify.Event{Type: t, Title: title, Message: msg}); err != nil {
-			log.Printf("[Notify] send failed event=%s: %v", t, err)
+		if err := n.Send(sendCtx, event); err != nil {
+			log.Printf("[Notify] send failed event=%s: %v", event.Type, err)
 		}
 	}()
 }

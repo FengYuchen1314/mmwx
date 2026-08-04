@@ -147,14 +147,14 @@ func checkServerRenewal(ctx context.Context, repo *storage.TrafficRepository) {
 			}
 		case plan.DueInDays > 0:
 			if markRenewalNotified(s.ID, plan.Cycle, fmt.Sprintf("d%d", plan.DueInDays)) {
-				SendServerRenewalDueNotification(ctx, s.Name, plan.DueInDays, plan.Cycle, online, plan.ByExpiry)
+				SendServerRenewalDueNotification(ctx, s.Name, plan.DueInDays, plan.Cycle, online, plan.ByExpiry, s.ProviderName, s.ProviderURL)
 			}
 		}
 	}
 }
 
 // SendServerRenewalDueNotification 服务器将在 N 天后到重置日(=续费日)。
-func SendServerRenewalDueNotification(ctx context.Context, serverName string, daysLeft int, resetDate string, online bool, byExpiry bool) {
+func SendServerRenewalDueNotification(ctx context.Context, serverName string, daysLeft int, resetDate string, online bool, byExpiry bool, providerName, providerURL string) {
 	state := "在线"
 	if !online {
 		state = "离线"
@@ -163,10 +163,15 @@ func SendServerRenewalDueNotification(ctx context.Context, serverName string, da
 	if byExpiry {
 		dateLabel = "到期日"
 	}
-	notifyAsync(ctx, notify.EventServerRenewalDue,
-		"⏰ 服务器即将到期",
-		fmt.Sprintf("服务器: `%s`\n%s: %s\n剩余: %d 天\n当前状态: %s", serverName, dateLabel, resetDate, daysLeft, state),
-	)
+	message := fmt.Sprintf("服务器: `%s`\n%s: %s\n剩余: %d 天\n当前状态: %s", notify.EscapeMarkdown(serverName), dateLabel, resetDate, daysLeft, state)
+	if providerName != "" {
+		message += "\n服务商: `" + notify.EscapeMarkdown(providerName) + "`"
+	}
+	event := notify.Event{Type: notify.EventServerRenewalDue, Title: "⏰ 服务器即将到期", Message: message}
+	if providerURL = safeProviderURL(providerURL); providerURL != "" {
+		event.Buttons = []notify.Button{{Text: "💳 去续费", URL: providerURL}}
+	}
+	notifyAsyncEvent(ctx, event)
 }
 
 // SendServerRenewedNotification 重置日已过、服务器仍在线 → 续费成功。

@@ -610,6 +610,7 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			region, err := h.licenseManager.ResolveIPRegion(lookupCtx, publicIP)
 			if err == nil && region.Flag() != "" {
 				_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, serverID, region.Flag(), 0, "month", "CNY", expiresAt)
+				_ = h.repo.UpdateRemoteServerProvider(lookupCtx, serverID, region.ProviderName, region.ProviderURL)
 			}
 		}(server.ID, server.IPAddress, defaultExpiry)
 	}

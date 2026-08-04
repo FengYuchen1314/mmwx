@@ -15,7 +15,7 @@ const telegramAPIBase = "https://api.telegram.org/bot"
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-func sendTelegram(ctx context.Context, botToken, chatID, text string) error {
+func sendTelegram(ctx context.Context, botToken, chatID, text string, buttons []Button) error {
 	if botToken == "" || chatID == "" {
 		return fmt.Errorf("bot token or chat ID is empty")
 	}
@@ -25,6 +25,20 @@ func sendTelegram(ctx context.Context, botToken, chatID, text string) error {
 		"chat_id":    {chatID},
 		"text":       {text},
 		"parse_mode": {"Markdown"},
+	}
+	if len(buttons) > 0 {
+		rows := make([][]map[string]string, 0, len(buttons))
+		for _, button := range buttons {
+			u, err := url.Parse(strings.TrimSpace(button.URL))
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				continue
+			}
+			rows = append(rows, []map[string]string{{"text": button.Text, "url": u.String()}})
+		}
+		if len(rows) > 0 {
+			markup, _ := json.Marshal(map[string]any{"inline_keyboard": rows})
+			params.Set("reply_markup", string(markup))
+		}
 	}
 
 	// 参数放进 POST body(而非 query string):否则 chat_id、通知正文(含用户名/IP)会进 URL,

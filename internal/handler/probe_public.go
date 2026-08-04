@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -58,8 +59,10 @@ type probeHourBucket struct {
 // probeServer 是对外暴露的白名单字段集合(刻意不含 id/ip/token/host/reset_day 等)。
 // 新增的 cpu/mem/disk/ping 全用指针/切片 + omitempty:未开启或无数据时整个字段消失,不泄露 0 值。
 type probeServer struct {
-	Name   string `json:"name,omitempty"` // show_name 关闭时省略
-	Region string `json:"region,omitempty"`
+	Name         string `json:"name,omitempty"` // show_name 关闭时省略
+	Region       string `json:"region,omitempty"`
+	ProviderName string `json:"provider_name,omitempty"`
+	ProviderURL  string `json:"provider_url,omitempty"`
 	// 网速/流量是展示开关控制的:关闭时置 nil + omitempty,整个字段消失,前端据此隐藏。
 	UploadSpeed   *int64 `json:"upload_speed,omitempty"`   // B/s(当前上行速率)
 	DownloadSpeed *int64 `json:"download_speed,omitempty"` // B/s(当前下行速率)
@@ -180,6 +183,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
 		}
 		if showExpiry {
+			ps.ProviderName, ps.ProviderURL = s.ProviderName, safeProviderURL(s.ProviderURL)
 			if s.ExpiresAt != nil {
 				ps.ExpiresAt = s.ExpiresAt.Format("2006-01-02")
 			} else if s.TrafficResetDay >= 1 && s.TrafficResetDay <= 31 {
@@ -231,6 +235,14 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		"show_globe":  showGlobe,
 		"servers":     out,
 	}, nil
+}
+
+func safeProviderURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return ""
+	}
+	return u.String()
 }
 
 func (h *ProbePublicHandler) setting(ctx context.Context, key string) bool {
