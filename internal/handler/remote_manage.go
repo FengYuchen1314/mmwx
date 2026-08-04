@@ -177,11 +177,29 @@ func (h *RemoteManageHandler) HandleMasterMigration(w http.ResponseWriter, r *ht
 			remoteWriteError(w, http.StatusInternalServerError, "保存主控地址失败")
 			return
 		}
+		// Turnstile widgets are restricted by the hostnames configured in
+		// Cloudflare.  After a domain migration the old widget can make the new
+		// login page unusable, so disable it before redirecting the administrator
+		// to the new origin.  Keep the secret key: clearing the public site key is
+		// sufficient to disable verification and lets the administrator replace
+		// both values from Security Settings after logging in.
+		if req.ChangeDomain {
+			if err := h.repo.SetSystemSetting(r.Context(), "turnstile_site_key", ""); err != nil {
+				remoteWriteError(w, http.StatusInternalServerError, "主控地址已更新，但关闭 Cloudflare 验证码失败；请通过旧会话手动关闭")
+				return
+			}
+		}
 		if h.onMasterMigrated != nil {
 			go h.onMasterMigrated(context.Background(), req.NewMasterURL)
 		}
 	}
-	remoteWriteJSON(w, http.StatusOK, map[string]interface{}{"success": true, "ready": ready, "committed": req.Action == "commit", "agents": results})
+	remoteWriteJSON(w, http.StatusOK, map[string]interface{}{
+		"success":            true,
+		"ready":              ready,
+		"committed":          req.Action == "commit",
+		"agents":             results,
+		"turnstile_disabled": req.Action == "commit" && req.ChangeDomain,
+	})
 }
 
 // SetLicenseManager 注入 license 管理器供 syncInboundsToNodes 做节点数量上限检查。
