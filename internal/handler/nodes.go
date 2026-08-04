@@ -1498,8 +1498,23 @@ func (h *nodesHandler) handleDelete(w http.ResponseWriter, r *http.Request, idSe
 
 	// 远程闭环:routed 清 rule+outbound+client,physical 清 inbound(并兜底刷 nginx)。单删 / 批删共用 helper。
 	// excludeIDs=[本节点]:双栈时若同入站还有兄弟节点,则只删本节点、保留远程入站(cleanup 在删节点前跑,兄弟仍在 DB)。
+	deletionNodes := []storage.Node(nil)
 	if !nodeNotFound {
-		h.cleanupRemoteForNode(r.Context(), &node, []int64{node.ID}, nil)
+		deletionNodes = h.expandNodeDeletionClosure(r.Context(), []storage.Node{node})
+		deletionIDs := nodeIDs(deletionNodes)
+		h.cleanupOutboundsTargetingNodes(r.Context(), deletionNodes)
+		h.cleanupTunnelsTargetingNodes(r.Context(), deletionNodes)
+		cleaned := map[string]bool{}
+		for i := range deletionNodes {
+			h.cleanupRemoteInboundForNode(r.Context(), &deletionNodes[i], deletionIDs, cleaned)
+		}
+		// Child routed nodes have their own rule/outbound/client resources and
+		// must be removed before the physical parent disappears from the DB.
+		for _, child := range deletionNodes {
+			if child.ID != node.ID {
+				_ = h.repo.DeleteNodeByID(r.Context(), child.ID)
+			}
+		}
 	}
 
 	// 删除节点(按权限:管理员任意,普通用户仅自己的)
@@ -1512,8 +1527,14 @@ func (h *nodesHandler) handleDelete(w http.ResponseWriter, r *http.Request, idSe
 	}
 
 	// 使用同步管理器将删除同步到 YAML 文件
-	if !nodeNotFound && node.NodeName != "" {
-		if err := h.yamlSyncManager.DeleteNode(node.NodeName); err != nil {
+	if !nodeNotFound {
+		names := make([]string, 0, len(deletionNodes))
+		for _, n := range deletionNodes {
+			if n.NodeName != "" {
+				names = append(names, n.NodeName)
+			}
+		}
+		if err := h.yamlSyncManager.BatchDeleteNodes(names); err != nil {
 			// 记录错误但不要使请求失败
 		}
 	}
@@ -1640,6 +1661,11 @@ func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request)
 		nodes = append(nodes, node)
 	}
 
+	// Include every routed descendant. Deleting only the selected physical row
+	// was the source of stale child nodes, subaccounts and duplicate clients.
+	nodes = h.expandNodeDeletionClosure(r.Context(), nodes)
+	closureIDs := nodeIDs(nodes)
+
 	// 远程闭环。先「整批一次」清理各服务器上以这些节点为落地出口的出站(每台服务器只 GET 一次 outbounds
 	// + 并发 + 短超时),避免旧实现「每节点 × 每服务器」的 O(N×M) 串行远程调用 —— 那会让批量删外部节点
 	// 撞上 N×M×(HTTP 30s 兜底)= 几分钟并超时失败。再逐节点清各自 OriginalServer 上的 inbound/routed
@@ -1649,16 +1675,33 @@ func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request)
 	// excludeIDs=整批 ID:双栈时同入站两节点都在批内才删入站,只删一个则保留;cleaned 去重同一入站的删除请求。
 	cleaned := map[string]bool{}
 	for i := range nodes {
-		h.cleanupRemoteInboundForNode(r.Context(), &nodes[i], accessibleIDs, cleaned)
+		h.cleanupRemoteInboundForNode(r.Context(), &nodes[i], closureIDs, cleaned)
+	}
+	requested := make(map[int64]bool, len(accessibleIDs))
+	for _, id := range accessibleIDs {
+		requested[id] = true
+	}
+	for _, n := range nodes {
+		if !requested[n.ID] {
+			_ = h.repo.DeleteNodeByID(r.Context(), n.ID)
+		}
 	}
 
 	// 从数据库中删除节点(按权限)
 	deletedCount := 0
-	for _, id := range accessibleIDs {
-		if err := h.deleteNodeForAccess(r.Context(), id, username, isAdmin); err != nil {
-			continue
+	// Routed children first. If a selected parent were deleted first, the DB
+	// fallback cascade would remove its selected child and make the response
+	// under-count it as "not found".
+	for _, routedFirst := range []bool{true, false} {
+		for _, n := range nodes {
+			if !requested[n.ID] || (n.NodeType == "routed") != routedFirst {
+				continue
+			}
+			if err := h.deleteNodeForAccess(r.Context(), n.ID, username, isAdmin); err != nil {
+				continue
+			}
+			deletedCount++
 		}
-		deletedCount++
 	}
 
 	// 使用同步管理器批量同步删除 YAML 文件
@@ -1679,6 +1722,42 @@ func (h *nodesHandler) handleBatchDelete(w http.ResponseWriter, r *http.Request)
 		"deleted": deletedCount,
 		"total":   len(req.NodeIDs),
 	})
+}
+
+func nodeIDs(nodes []storage.Node) []int64 {
+	ids := make([]int64, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
+	}
+	return ids
+}
+
+// expandNodeDeletionClosure returns selected nodes plus all routed descendants.
+// It is deliberately handler-side (in addition to the DB fallback cascade), so
+// every child's remote rule, outbound and client can be removed before rows are
+// deleted. The seen set also handles corrupt/cyclic legacy parent references.
+func (h *nodesHandler) expandNodeDeletionClosure(ctx context.Context, roots []storage.Node) []storage.Node {
+	out := make([]storage.Node, 0, len(roots))
+	seen := make(map[int64]bool, len(roots))
+	queue := append([]storage.Node(nil), roots...)
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		if n.ID <= 0 || seen[n.ID] {
+			continue
+		}
+		seen[n.ID] = true
+		out = append(out, n)
+		children, err := h.repo.ListRoutedNodesByParent(ctx, n.ID)
+		if err != nil {
+			log.Printf("[Nodes] list routed children for node %d failed: %v", n.ID, err)
+			continue
+		}
+		for _, child := range children {
+			queue = append(queue, child.Node)
+		}
+	}
+	return out
 }
 
 // cleanupRemoteForNode 删节点(单删/批删)统一闭环入口:按节点类型选清理路径。

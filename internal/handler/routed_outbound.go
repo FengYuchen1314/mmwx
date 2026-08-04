@@ -760,6 +760,7 @@ func computeRoutedNodeUserCred(ctx context.Context, rm *RemoteManageHandler, rep
 	// 复用已存子账号凭据(续费/恢复路径) or 新建
 	var credJSON string
 	var credential map[string]interface{}
+	newCredential := false
 	existing, _ := repo.GetUserSubaccount(ctx, routedNodeID, user.Username)
 	if existing != nil {
 		json.Unmarshal([]byte(existing.CredentialJSON), &credential)
@@ -778,6 +779,7 @@ func computeRoutedNodeUserCred(ctx context.Context, rm *RemoteManageHandler, rep
 			}
 		}
 	} else {
+		newCredential = true
 		// 用 generateRoutedClientCred 按 routed 节点继承的 protocol 选对字段(vless=id / trojan=password / ...)
 		newCred, newCredJSON, gerr := generateRoutedClientCred(routed.Protocol, "", userEmail)
 		if gerr != nil {
@@ -805,6 +807,27 @@ func computeRoutedNodeUserCred(ctx context.Context, rm *RemoteManageHandler, rep
 			if b, err := json.Marshal(credential); err == nil {
 				credJSON = string(b)
 			}
+		}
+	}
+	if newCredential {
+		claimed, claimErr := repo.ClaimUserSubaccount(ctx, storage.UserSubaccount{
+			Username:       user.Username,
+			RoutedNodeID:   routedNodeID,
+			Email:          userEmail,
+			CredentialJSON: credJSON,
+			IsActive:       true,
+		})
+		if claimErr != nil {
+			return nil, fmt.Errorf("claim routed user credential: %w", claimErr)
+		}
+		if claimed == nil {
+			return nil, errors.New("claim routed user credential returned no row")
+		}
+		// A concurrent request may have won. Always send the DB winner so Agent
+		// sees one deterministic credential for this email.
+		userEmail, credJSON = claimed.Email, claimed.CredentialJSON
+		if err := json.Unmarshal([]byte(credJSON), &credential); err != nil || credential == nil {
+			return nil, fmt.Errorf("decode claimed routed credential: %w", err)
 		}
 	}
 

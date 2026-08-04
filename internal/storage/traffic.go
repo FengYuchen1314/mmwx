@@ -9447,6 +9447,26 @@ func (r *TrafficRepository) UpsertUserSubaccount(ctx context.Context, sa UserSub
 	return id, nil
 }
 
+// ClaimUserSubaccount atomically creates a routed credential or returns the
+// winner stored by another concurrent package assignment. It is intentionally
+// insert-only: overwriting the credential after another request already sent
+// its UUID to Agent is what creates duplicate-email Xray clients.
+func (r *TrafficRepository) ClaimUserSubaccount(ctx context.Context, sa UserSubaccount) (*UserSubaccount, error) {
+	active := 0
+	if sa.IsActive {
+		active = 1
+	}
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO user_subaccounts (username, routed_node_id, email, credential_json, is_active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		ON CONFLICT(routed_node_id, username) DO NOTHING
+	`, sa.Username, sa.RoutedNodeID, sa.Email, sa.CredentialJSON, active)
+	if err != nil {
+		return nil, fmt.Errorf("claim user subaccount: %w", err)
+	}
+	return r.GetUserSubaccount(ctx, sa.RoutedNodeID, sa.Username)
+}
+
 func (r *TrafficRepository) GetUserSubaccount(ctx context.Context, routedNodeID int64, username string) (*UserSubaccount, error) {
 	var sa UserSubaccount
 	var active int
@@ -9685,6 +9705,15 @@ func (r *TrafficRepository) SetSubaccountActive(ctx context.Context, id int64, a
 
 func (r *TrafficRepository) DeleteUserSubaccount(ctx context.Context, id int64) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE id = ?`, id)
+	return err
+}
+
+// DeleteUserSubaccountByIdentity removes one routed credential without relying
+// on SQLite foreign-key enforcement. Some upgraded databases were created
+// before foreign_keys was enabled, so deleting the routed node alone is not a
+// reliable cascade.
+func (r *TrafficRepository) DeleteUserSubaccountByIdentity(ctx context.Context, routedNodeID int64, email string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE routed_node_id = ? AND email = ?`, routedNodeID, email)
 	return err
 }
 

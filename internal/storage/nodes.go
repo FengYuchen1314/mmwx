@@ -616,6 +616,11 @@ func (r *TrafficRepository) DeleteNode(ctx context.Context, id int64, username s
 		}
 		return fmt.Errorf("get node raw_url: %w", err)
 	}
+	// DB-level cascade for every caller, including sync/import paths which do
+	// not pass through the HTTP handler. SQLite upgrades cannot rely on FK
+	// cascades here because user_subaccounts historically had no node FK.
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE routed_node_id = ? OR routed_node_id IN (SELECT id FROM nodes WHERE parent_node_id = ? AND node_type = 'routed')`, id, id)
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM nodes WHERE parent_node_id = ? AND node_type = 'routed'`, id)
 
 	res, err := r.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ? AND username = ?`, id, username)
 	if err != nil {
@@ -682,6 +687,15 @@ func (r *TrafficRepository) DeleteNodeForSync(ctx context.Context, id int64, use
 		return errors.New("username is required")
 	}
 
+	var owned int
+	if err := r.db.QueryRowContext(ctx, `SELECT 1 FROM nodes WHERE id = ? AND username = ?`, id, username).Scan(&owned); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNodeNotFound
+		}
+		return fmt.Errorf("check node ownership for sync delete: %w", err)
+	}
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE routed_node_id = ? OR routed_node_id IN (SELECT id FROM nodes WHERE parent_node_id = ? AND node_type = 'routed')`, id, id)
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM nodes WHERE parent_node_id = ? AND node_type = 'routed'`, id)
 	res, err := r.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ? AND username = ?`, id, username)
 	if err != nil {
 		return fmt.Errorf("delete node for sync: %w", err)
@@ -721,6 +735,8 @@ func (r *TrafficRepository) DeleteNodeByID(ctx context.Context, id int64) error 
 		}
 		return fmt.Errorf("get node info: %w", err)
 	}
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE routed_node_id = ? OR routed_node_id IN (SELECT id FROM nodes WHERE parent_node_id = ? AND node_type = 'routed')`, id, id)
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM nodes WHERE parent_node_id = ? AND node_type = 'routed'`, id)
 
 	res, err := r.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
 	if err != nil {
@@ -862,6 +878,10 @@ func (r *TrafficRepository) DeleteAllUserNodes(ctx context.Context, username str
 		return errors.New("username is required")
 	}
 
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE routed_node_id IN (
+		SELECT id FROM nodes WHERE username = ? OR parent_node_id IN (SELECT id FROM nodes WHERE username = ?)
+	)`, username, username)
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM nodes WHERE node_type = 'routed' AND parent_node_id IN (SELECT id FROM nodes WHERE username = ?)`, username)
 	_, err := r.db.ExecContext(ctx, `DELETE FROM nodes WHERE username = ?`, username)
 	if err != nil {
 		return fmt.Errorf("delete all user nodes: %w", err)
@@ -883,6 +903,7 @@ func (r *TrafficRepository) DeleteNodesByInboundTag(ctx context.Context, serverN
 		return 0, errors.New("server name and inbound tag are required")
 	}
 
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE routed_node_id IN (SELECT id FROM nodes WHERE original_server = ? AND inbound_tag = ?)`, serverName, inboundTag)
 	res, err := r.db.ExecContext(ctx, `DELETE FROM nodes WHERE original_server = ? AND inbound_tag = ?`, serverName, inboundTag)
 	if err != nil {
 		return 0, fmt.Errorf("delete nodes by inbound tag: %w", err)
@@ -1487,6 +1508,7 @@ func (r *TrafficRepository) DeleteRoutedNode(ctx context.Context, id int64) erro
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
+	_, _ = r.db.ExecContext(ctx, `DELETE FROM user_subaccounts WHERE routed_node_id = ?`, id)
 	_, err := r.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ? AND node_type = 'routed'`, id)
 	return err
 }

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -41,7 +42,9 @@ func NewOrphanXrayClientCleaner(repo *storage.TrafficRepository, rm *RemoteManag
 	return &OrphanXrayClientCleaner{repo: repo, remoteManage: rm}
 }
 
-// Start 起一个 goroutine,等到下一个 03:30 跑首次,之后每 24h 一次。ctx 取消即退出。
+// Start starts one startup repair after five minutes, then runs at 03:30 every
+// day. The startup pass is important after upgrading from a version that may
+// already have left duplicate clients preventing Xray from starting.
 func (c *OrphanXrayClientCleaner) Start(ctx context.Context) {
 	go c.loop(ctx)
 }
@@ -52,17 +55,9 @@ func (c *OrphanXrayClientCleaner) loop(ctx context.Context) {
 		return
 	}
 
-	// 对齐到下一个本地时间 03:30
-	now := time.Now()
-	target := time.Date(now.Year(), now.Month(), now.Day(), 3, 30, 0, 0, now.Location())
-	if !target.After(now) {
-		target = target.Add(24 * time.Hour)
-	}
-	firstDelay := time.Until(target)
-	log.Printf("[OrphanXrayClientCleaner] scheduler started, first run at %s (in %s)",
-		target.Format("2006-01-02 15:04:05"), firstDelay.Round(time.Second))
-
-	firstTimer := time.NewTimer(firstDelay)
+	const startupDelay = 5 * time.Minute
+	log.Printf("[OrphanXrayClientCleaner] scheduler started, startup repair in %s", startupDelay)
+	firstTimer := time.NewTimer(startupDelay)
 	select {
 	case <-ctx.Done():
 		firstTimer.Stop()
@@ -70,14 +65,18 @@ func (c *OrphanXrayClientCleaner) loop(ctx context.Context) {
 	case <-firstTimer.C:
 		c.recordedRun(ctx)
 	}
-
-	ticker := time.NewTicker(24 * time.Hour)
-	defer ticker.Stop()
 	for {
+		now := time.Now()
+		target := time.Date(now.Year(), now.Month(), now.Day(), 3, 30, 0, 0, now.Location())
+		if !target.After(now) {
+			target = target.AddDate(0, 0, 1)
+		}
+		timer := time.NewTimer(time.Until(target))
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			c.recordedRun(ctx)
 		}
 	}
@@ -86,12 +85,11 @@ func (c *OrphanXrayClientCleaner) loop(ctx context.Context) {
 // recordedRun 跑一次清理并记入 task_runs（P3）。
 func (c *OrphanXrayClientCleaner) recordedRun(ctx context.Context) {
 	taskrun.Record(ctx, "orphan_xray_cleaner", func() (string, error) {
-		c.runOnce(ctx)
-		return "", nil
+		return c.runOnce(ctx)
 	})
 }
 
-func (c *OrphanXrayClientCleaner) runOnce(ctx context.Context) {
+func (c *OrphanXrayClientCleaner) runOnce(ctx context.Context) (string, error) {
 	start := time.Now()
 	log.Printf("[OrphanXrayClientCleaner] scan started")
 
@@ -99,54 +97,49 @@ func (c *OrphanXrayClientCleaner) runOnce(ctx context.Context) {
 	users, err := c.repo.ListUsers(ctx, 100000)
 	if err != nil {
 		log.Printf("[OrphanXrayClientCleaner] list users failed: %v", err)
-		return
+		return "", err
 	}
 	usernameSet := make(map[string]bool, len(users))
 	for _, u := range users {
 		usernameSet[u.Username] = true
 	}
 
-	subaccountEmails, err := c.repo.ListSubaccountEmailToUsername(ctx)
+	subaccounts, err := c.repo.ListAllSubaccounts(ctx)
 	if err != nil {
-		log.Printf("[OrphanXrayClientCleaner] list subaccount emails failed: %v", err)
-		return
+		log.Printf("[OrphanXrayClientCleaner] list subaccounts failed: %v", err)
+		return "", err
 	}
 
 	servers, err := c.repo.ListRemoteServers(ctx)
 	if err != nil {
 		log.Printf("[OrphanXrayClientCleaner] list servers failed: %v", err)
-		return
+		return "", err
 	}
 
-	// 2) 收集 routed_admin_email(占位 admin client,routed_owner='shared' 时存在)
-	routedAdminEmails, err := c.repo.ListRoutedAdminEmails(ctx)
+	allNodes, err := c.repo.ListAllNodes(ctx)
 	if err != nil {
-		log.Printf("[OrphanXrayClientCleaner] list routed admin emails failed (continue): %v", err)
-		routedAdminEmails = make(map[string]bool)
+		log.Printf("[OrphanXrayClientCleaner] list nodes failed: %v", err)
+		return "", err
+	}
+	nodesByID := make(map[int64]storage.Node, len(allNodes))
+	serverIDByName := make(map[string]int64, len(servers))
+	for _, n := range allNodes {
+		nodesByID[n.ID] = n
+	}
+	for _, s := range servers {
+		serverIDByName[s.Name] = s.ID
 	}
 
-	shouldKeep := func(email string) bool {
-		if email == "" || strings.HasPrefix(email, "_admin__") {
-			return true
-		}
-		if _, ok := subaccountEmails[email]; ok {
-			return true
-		}
-		if routedAdminEmails[email] {
-			return true
-		}
-		username := c.repo.ResolveUsernameByEmail(ctx, email)
-		if username == "" {
-			return false
-		}
-		return usernameSet[username]
+	// Parse every trustworthy snapshot once. Besides avoiding repeated JSON
+	// work, this gives us the authoritative inbound set used to purge DB
+	// subaccounts whose parent inbound no longer exists.
+	type inboundSnapshot struct {
+		clients []map[string]interface{}
 	}
-
-	// 3) 遍历 server snapshot,识别孤儿,逐个 remove
-	var totalScanned, totalOrphan, totalRemoved, totalFailed int
+	snapshots := make(map[int64]map[string]inboundSnapshot, len(servers))
 	for _, srv := range servers {
-		snap, err := c.repo.GetCurrentXraySnapshot(ctx, srv.ID)
-		if err != nil || snap == nil {
+		snap, serr := c.repo.GetCurrentXraySnapshot(ctx, srv.ID)
+		if serr != nil || snap == nil || snap.ConfigJSON == "" {
 			continue
 		}
 		var cfg struct {
@@ -161,34 +154,151 @@ func (c *OrphanXrayClientCleaner) runOnce(ctx context.Context) {
 			log.Printf("[OrphanXrayClientCleaner] server=%d parse snapshot failed: %v", srv.ID, jerr)
 			continue
 		}
+		byTag := make(map[string]inboundSnapshot, len(cfg.Inbounds))
 		for _, ib := range cfg.Inbounds {
-			if ib.Tag == "" || ib.Tag == "api" {
+			byTag[ib.Tag] = inboundSnapshot{clients: ib.Settings.Clients}
+		}
+		snapshots[srv.ID] = byTag
+	}
+
+	// First repair the DB side. A subaccount is valid only while its routed node,
+	// server and parent inbound all exist. A missing snapshot means "unknown"
+	// (server may be offline), so it is deliberately not treated as deletion.
+	subaccountEmails := make(map[string]string, len(subaccounts))
+	subaccountByEmail := make(map[string]storage.SubaccountRef, len(subaccounts))
+	var dbSubaccountsRemoved int
+	for _, sa := range subaccounts {
+		node, nodeOK := nodesByID[sa.RoutedNodeID]
+		invalid := !nodeOK || node.NodeType != "routed"
+		if !invalid {
+			if serverID, ok := serverIDByName[node.OriginalServer]; ok {
+				if byTag, snapshotKnown := snapshots[serverID]; snapshotKnown {
+					_, inboundExists := byTag[node.InboundTag]
+					invalid = !inboundExists
+				}
+			} else {
+				invalid = true
+			}
+		}
+		if invalid {
+			if derr := c.repo.DeleteUserSubaccountByIdentity(ctx, sa.RoutedNodeID, sa.Email); derr != nil {
+				log.Printf("[OrphanXrayClientCleaner] delete stale subaccount node=%d email=%s failed: %v", sa.RoutedNodeID, sa.Email, derr)
+			} else {
+				dbSubaccountsRemoved++
+			}
+			continue
+		}
+		subaccountEmails[sa.Email] = sa.Username
+		subaccountByEmail[sa.Email] = sa
+	}
+
+	// 2) 收集 routed_admin_email(占位 admin client,routed_owner='shared' 时存在)
+	routedAdminEmails, err := c.repo.ListRoutedAdminEmails(ctx)
+	if err != nil {
+		log.Printf("[OrphanXrayClientCleaner] list routed admin emails failed (continue): %v", err)
+		routedAdminEmails = make(map[string]bool)
+	}
+
+	shouldKeep := func(email string) bool {
+		if email == "" {
+			return true
+		}
+		if _, ok := subaccountEmails[email]; ok {
+			return true
+		}
+		if routedAdminEmails[email] {
+			return true
+		}
+		// Routed identities are DB-authoritative. Never fall back to parsing their
+		// username: that was the bug which kept test-routed:* forever after its
+		// user_subaccounts row had gone away.
+		if looksLikeRoutedClientEmail(email) {
+			return false
+		}
+		username := c.repo.ResolveUsernameByEmail(ctx, email)
+		if username == "" {
+			return false
+		}
+		return usernameSet[username]
+	}
+
+	// 3) 遍历 snapshot。相同 inbound+email 出现多次时先全部移除，再只加回
+	// 第一份凭据；这样即使旧的 routed 批处理重复执行，也不会把 Xray 留在
+	// "User already exists"、无法启动的状态。
+	var totalScanned, totalOrphan, totalRemoved, totalFailed, totalDeduplicated int
+	for _, srv := range servers {
+		byTag, ok := snapshots[srv.ID]
+		if !ok {
+			continue
+		}
+		for tag, ib := range byTag {
+			if tag == "" || tag == "api" {
 				continue
 			}
-			for _, client := range ib.Settings.Clients {
+			grouped := make(map[string][]map[string]interface{}, len(ib.clients))
+			for _, client := range ib.clients {
 				email, _ := client["email"].(string)
 				totalScanned++
-				if shouldKeep(email) {
+				grouped[email] = append(grouped[email], client)
+			}
+			for email, copies := range grouped {
+				keep := shouldKeep(email)
+				if keep && len(copies) == 1 {
 					continue
 				}
-				totalOrphan++
-				// remove 给 30s 超时(agent 离线 / 弱网时不卡死)
+				if !keep {
+					totalOrphan += len(copies)
+				} else {
+					totalDeduplicated += len(copies) - 1
+				}
+				// Remove once per copy: agent remove-client removes one matching
+				// credential at a time. For duplicates, add exactly one copy back.
 				rmCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				err := removeClientFromInbound(rmCtx, c.remoteManage, srv.ID, ib.Tag, email)
+				var removeErr error
+				for range copies {
+					if err := removeClientFromInbound(rmCtx, c.remoteManage, srv.ID, tag, email); err != nil {
+						removeErr = err
+						break
+					}
+					totalRemoved++
+				}
+				if removeErr == nil && keep {
+					restore := copies[0]
+					// For routed clients, DB is authoritative. The first duplicate in
+					// the file may be the stale UUID while user_subaccounts contains
+					// the credential already distributed in subscriptions.
+					if ref, exists := subaccountByEmail[email]; exists {
+						if sub, serr := c.repo.GetUserSubaccount(rmCtx, ref.RoutedNodeID, ref.Username); serr == nil && sub != nil {
+							var dbCredential map[string]interface{}
+							if json.Unmarshal([]byte(sub.CredentialJSON), &dbCredential) == nil && dbCredential != nil {
+								restore = dbCredential
+							}
+						}
+					}
+					removeErr = addClientToInbound(rmCtx, c.remoteManage, srv.ID, tag, restore)
+				}
 				cancel()
-				if err != nil {
+				if removeErr != nil {
 					log.Printf("[OrphanXrayClientCleaner] remove FAILED server=%d tag=%s email=%s: %v",
-						srv.ID, ib.Tag, email, err)
+						srv.ID, tag, email, removeErr)
 					totalFailed++
 					continue
 				}
-				log.Printf("[OrphanXrayClientCleaner] removed orphan server=%d tag=%s email=%s",
-					srv.ID, ib.Tag, email)
-				totalRemoved++
+				log.Printf("[OrphanXrayClientCleaner] reconciled server=%d tag=%s email=%s copies=%d keep=%v",
+					srv.ID, tag, email, len(copies), keep)
 			}
 		}
 	}
 
-	log.Printf("[OrphanXrayClientCleaner] scan done in %s: scanned=%d orphan=%d removed=%d failed=%d",
-		time.Since(start).Round(time.Millisecond), totalScanned, totalOrphan, totalRemoved, totalFailed)
+	log.Printf("[OrphanXrayClientCleaner] scan done in %s: scanned=%d orphan=%d deduplicated=%d removed=%d stale_subaccounts=%d failed=%d",
+		time.Since(start).Round(time.Millisecond), totalScanned, totalOrphan, totalDeduplicated, totalRemoved, dbSubaccountsRemoved, totalFailed)
+	return fmt.Sprintf("scanned=%d orphan=%d deduplicated=%d removed=%d stale_subaccounts=%d failed=%d",
+		totalScanned, totalOrphan, totalDeduplicated, totalRemoved, dbSubaccountsRemoved, totalFailed), nil
+}
+
+func looksLikeRoutedClientEmail(email string) bool {
+	if strings.HasPrefix(email, "_admin__") || strings.Contains(email, "-routed:") {
+		return true
+	}
+	return strings.Count(email, "__") >= 2
 }
