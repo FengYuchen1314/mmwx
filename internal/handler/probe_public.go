@@ -74,18 +74,26 @@ type probeServer struct {
 	CumulativeDown *int64 `json:"cumulative_down,omitempty"` // 累计下行(SystemRxCycle)
 	Online         bool   `json:"online"`
 	// 真探针字段(聚合数值,用户已接受公开;不含任何主机标识)
-	CPUPct          *float64          `json:"cpu_pct,omitempty"`
-	LoadAvg         string            `json:"loadavg,omitempty"`
-	MemUsed         *int64            `json:"mem_used,omitempty"`
-	MemTotal        *int64            `json:"mem_total,omitempty"`
-	DiskUsed        *int64            `json:"disk_used,omitempty"`
-	DiskTotal       *int64            `json:"disk_total,omitempty"`
-	Ping            []probePingSeries `json:"ping,omitempty"`
-	ExpiresAt       string            `json:"expires_at,omitempty"`
-	RenewalPrice    *float64          `json:"renewal_price,omitempty"`
-	RenewalCycle    string            `json:"renewal_cycle,omitempty"`
-	RenewalCurrency string            `json:"renewal_currency,omitempty"`
-	RenewalPriceCNY *float64          `json:"renewal_price_cny,omitempty"`
+	CPUPct          *float64           `json:"cpu_pct,omitempty"`
+	LoadAvg         string             `json:"loadavg,omitempty"`
+	MemUsed         *int64             `json:"mem_used,omitempty"`
+	MemTotal        *int64             `json:"mem_total,omitempty"`
+	DiskUsed        *int64             `json:"disk_used,omitempty"`
+	DiskTotal       *int64             `json:"disk_total,omitempty"`
+	Ping            []probePingSeries  `json:"ping,omitempty"`
+	ExpiresAt       string             `json:"expires_at,omitempty"`
+	RenewalPrice    *float64           `json:"renewal_price,omitempty"`
+	RenewalCycle    string             `json:"renewal_cycle,omitempty"`
+	RenewalCurrency string             `json:"renewal_currency,omitempty"`
+	RenewalPriceCNY *float64           `json:"renewal_price_cny,omitempty"`
+	ReturnRoutes    []probeReturnRoute `json:"return_routes,omitempty"`
+}
+
+type probeReturnRoute struct {
+	Carrier   string `json:"carrier"`
+	Region    string `json:"region,omitempty"`
+	RouteType string `json:"route_type"`
+	TestedAt  string `json:"tested_at,omitempty"`
 }
 
 // ServeHTTP 处理 GET /api/public/probe-servers(无鉴权)。
@@ -141,6 +149,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	showExpiry := h.setting(ctx, probeDisguiseShowExpiryKey)
 	showPrice := h.setting(ctx, probeDisguiseShowPriceKey)
 	showGlobe := h.setting(ctx, probeDisguiseShowGlobeKey)
+	showReturnRoute := h.setting(ctx, probeDisguiseShowReturnRouteKey)
 	var exchangeRates map[string]float64
 	if showPrice && h.licenseManager != nil {
 		rateCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -168,6 +177,14 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	}
 
 	servers, _ := h.repo.ListRemoteServers(ctx)
+	var returnRoutes map[int64][]storage.ServerReturnRoute
+	if showReturnRoute {
+		ids := make([]int64, 0, len(idSet))
+		for id := range idSet {
+			ids = append(ids, id)
+		}
+		returnRoutes, _ = h.repo.ListServerReturnRoutes(ctx, ids)
+	}
 	out := make([]probeServer, 0, len(idSet))
 	for i := range servers {
 		s := &servers[i]
@@ -209,6 +226,16 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		}
 		if showName {
 			ps.Name = s.Name
+		}
+		if showReturnRoute {
+			order := map[string]int{"telecom": 0, "unicom": 1, "mobile": 2}
+			for _, route := range returnRoutes[s.ID] {
+				ps.ReturnRoutes = append(ps.ReturnRoutes, probeReturnRoute{
+					Carrier: route.Carrier, Region: route.Region, RouteType: route.RouteType,
+					TestedAt: route.TestedAt.Format(time.RFC3339),
+				})
+			}
+			sort.Slice(ps.ReturnRoutes, func(i, j int) bool { return order[ps.ReturnRoutes[i].Carrier] < order[ps.ReturnRoutes[j].Carrier] })
 		}
 		// 从 ring 填真探针字段(用 s.ID 查,s.ID 不入响应)。仅在「开关开 且 agent 报了该项」时才带。
 		if h.probeStore != nil {

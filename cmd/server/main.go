@@ -895,7 +895,8 @@ func main() {
 	securityLogHandler := handler.NewSecurityLogHandler(repo)
 	mux.Handle("/api/admin/security/", auth.RequireAdmin(tokenStore, userRepo, securityLogHandler))
 	// 定时任务运行记录:runs(列表,后端分页) / types(下拉筛选清单)。
-	taskLogHandler := handler.NewTaskLogHandler(repo)
+	returnRouteTester := handler.NewReturnRouteTester(repo, remoteManageHandler)
+	taskLogHandler := handler.NewTaskLogHandler(repo, returnRouteTester)
 	mux.Handle("/api/admin/tasks/", auth.RequireAdmin(tokenStore, userRepo, taskLogHandler))
 	// Agent 日志:转发到指定 agent 拉取远程机器日志(agent 自身/xray/nginx)。旧版 agent 降级提示。
 	mux.Handle("/api/admin/logs/agent", auth.RequireAdmin(tokenStore, userRepo, handler.NewAgentLogHandler(remoteManageHandler)))
@@ -1378,6 +1379,8 @@ func main() {
 	}
 
 	collectorCtx, stopCollector := context.WithCancel(context.Background())
+	returnRouteTester.Start(collectorCtx)
+	returnRouteTester.LogTargets()
 	if err := tgBotManager.Restart(collectorCtx); err != nil {
 		logger.Error("内置 TGBot 启动失败", "error", err.Error())
 	}

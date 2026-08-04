@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -12,11 +14,16 @@ import (
 //	GET /api/admin/tasks/runs?task=&status=&limit=&offset=  运行记录（后端分页）
 //	GET /api/admin/tasks/types                              任务类型清单（下拉筛选用）
 type TaskLogHandler struct {
-	repo *storage.TrafficRepository
+	repo        *storage.TrafficRepository
+	returnRoute *ReturnRouteTester
 }
 
-func NewTaskLogHandler(repo *storage.TrafficRepository) *TaskLogHandler {
-	return &TaskLogHandler{repo: repo}
+func NewTaskLogHandler(repo *storage.TrafficRepository, returnRoute ...*ReturnRouteTester) *TaskLogHandler {
+	h := &TaskLogHandler{repo: repo}
+	if len(returnRoute) > 0 {
+		h.returnRoute = returnRoute[0]
+	}
+	return h
 }
 
 // taskType 是一个任务的机器名 + 中文显示名。前端筛选下拉的唯一数据源，避免前端硬编码漂移。
@@ -38,18 +45,50 @@ var taskTypes = []taskType{
 	{"cert_renewal", "证书续期"},
 	{"node_tls_fingerprint_backfill", "节点证书指纹补全"},
 	{"probe_quality_alert", "探针质量告警"},
+	{returnRouteTaskName, "三网回程测试"},
 }
 
 func (h *TaskLogHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/api/admin/tasks/")
 	switch path {
+	case "run":
+		if r.Method != http.MethodPost || h.returnRoute == nil {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+		var req struct {
+			Task      string  `json:"task"`
+			ServerIDs []int64 `json:"server_ids"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10)).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("请求格式无效"))
+			return
+		}
+		if req.Task != returnRouteTaskName {
+			writeError(w, http.StatusBadRequest, errors.New("该任务不支持手动运行"))
+			return
+		}
+		id, err := h.returnRoute.RunAsync(req.ServerIDs)
+		if err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		respondJSON(w, http.StatusAccepted, map[string]any{"run_id": id})
 	case "types":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		respondJSON(w, http.StatusOK, map[string]any{"types": taskTypes})
 	case "runs":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		task := strings.TrimSpace(r.URL.Query().Get("task"))
 		status := strings.TrimSpace(r.URL.Query().Get("status"))
 		limit := atoiDefault(r.URL.Query().Get("limit"), 200)

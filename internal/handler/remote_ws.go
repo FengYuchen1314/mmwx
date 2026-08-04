@@ -97,6 +97,9 @@ type AgentCapabilities struct {
 	// Stream 表示 agent 实现了 rpc_call (Stream=true) → rpc_stream_data ... → rpc_reply 流式协议。
 	// master 可以用 WS 通道替代 /api/child/xxx-stream 这类 SSE endpoint(install / remove / upgrade)。
 	Stream bool `json:"stream,omitempty"`
+	// ReturnRouteTest 表示 Agent 已实现三网回程 child handler。旧 Agent 即使
+	// 支持通用 RPC 也不会声明该位，主控据此在创建任务前提示升级。
+	ReturnRouteTest bool `json:"return_route_test,omitempty"`
 }
 
 // WSAuthResultPayload 表示身份验证结果消息负载

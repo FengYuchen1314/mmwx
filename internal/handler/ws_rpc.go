@@ -50,9 +50,9 @@ type WSRPCCallPayload struct {
 // WSRPCReplyPayload agent → master。流式调用里也用它作为"end 帧"。
 type WSRPCReplyPayload struct {
 	RequestID string          `json:"request_id"`
-	Status    int             `json:"status"`           // HTTP-like:200 / 400 / 500
+	Status    int             `json:"status"` // HTTP-like:200 / 400 / 500
 	Body      json.RawMessage `json:"body,omitempty"`
-	Error     string          `json:"error,omitempty"`  // agent 端非业务异常(panic / decode 失败)
+	Error     string          `json:"error,omitempty"` // agent 端非业务异常(panic / decode 失败)
 }
 
 // WSRPCStreamDataPayload 流式调用中间数据帧 — agent handler 每次 Flush 时产生一帧。
@@ -89,10 +89,10 @@ func nextRPCRequestID(serverID int64) string {
 //   - 必须已经通过 GetConnectionByServerID 拿到 wsConn 且 wsConn.Capabilities.RPC=true(调用方负责检查)
 //   - timeout 是 master 端 channel select 的总等待,agent 内部超时 = timeout - 2s
 //   - 返回 (status, body, err):
-//     - WS 通道异常(连接断 / pending timeout)→ err = ErrWSRPCUnavailable,调用方 fallback HTTP
-//     - agent reply.Error 非空(agent 内部 panic 等)→ err 含 reply.Error,**不** fallback
-//     - status >= 400 → 把 (status, body) 包成 *HTTPLikeError 返回,**不** fallback
-//     - status 2xx → status, body, nil
+//   - WS 通道异常(连接断 / pending timeout)→ err = ErrWSRPCUnavailable,调用方 fallback HTTP
+//   - agent reply.Error 非空(agent 内部 panic 等)→ err 含 reply.Error,**不** fallback
+//   - status >= 400 → 把 (status, body) 包成 *HTTPLikeError 返回,**不** fallback
+//   - status 2xx → status, body, nil
 func (h *RemoteWSHandler) CallAgent(
 	ctx context.Context,
 	serverID int64,
@@ -109,7 +109,7 @@ func (h *RemoteWSHandler) CallAgent(
 	}
 
 	reqID := nextRPCRequestID(serverID)
-	innerTimeoutMs := int(timeout / time.Millisecond) - 2000
+	innerTimeoutMs := int(timeout/time.Millisecond) - 2000
 	if innerTimeoutMs < 1000 {
 		innerTimeoutMs = 1000
 	}
@@ -180,7 +180,13 @@ func (h *RemoteManageHandler) tryWSRPC(ctx context.Context, serverID int64, meth
 	cleanPath, query := splitPathQuery(path)
 	// 30s 总超时与 doPlainPullRequest / doEncryptedPullRequest 的 http.Client 默认 timeout 同款,
 	// 跨长 op(xray restart)够用,跨短 op 也不会拖延 fallback。
-	const wsRPCTimeout = 30 * time.Second
+	wsRPCTimeout := 30 * time.Second
+	// 三网回程需要顺序执行三个 traceroute。单次探测受 Agent 端约束，
+	// 但总耗时可能超过通用 RPC 的 30 秒，必须保留 WS 通道而不是回退到
+	// Agent 并未监听的 HTTP 端口。
+	if cleanPath == "/api/child/network/return-route-test" {
+		wsRPCTimeout = 110 * time.Second
+	}
 	status, respBody, err := h.wsHandler.CallAgent(ctx, serverID, method, cleanPath, query, body, wsRPCTimeout)
 	if err != nil {
 		if errors.Is(err, ErrWSRPCUnavailable) {
@@ -316,7 +322,7 @@ func (h *RemoteWSHandler) CallAgentStream(
 	}
 
 	reqID := nextRPCRequestID(serverID)
-	innerTimeoutMs := int(timeout / time.Millisecond) - 2000
+	innerTimeoutMs := int(timeout/time.Millisecond) - 2000
 	if innerTimeoutMs < 5000 {
 		innerTimeoutMs = 5000
 	}
@@ -427,4 +433,3 @@ func (h *RemoteManageHandler) tryWSRPCStream(
 	// 已经写过部分给前端 → 不可 fallback,报错给上层
 	return true, err
 }
-

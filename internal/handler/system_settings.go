@@ -342,12 +342,13 @@ const (
 	probeDisguiseMetricDiskKey = "probe_disguise_metric_disk" // "1"/"" 采集硬盘
 	probeDisguiseMetricPingKey = "probe_disguise_metric_ping" // "1"/"" 采集 ping
 	// 流量/网速是展示开关(数据来自主控实时,不需 agent 采集):"1"/"" 控制伪装页是否显示该块。
-	probeDisguiseMetricTrafficKey = "probe_disguise_metric_traffic" // "1"/"" 伪装页显示流量
-	probeDisguiseMetricSpeedKey   = "probe_disguise_metric_speed"   // "1"/"" 伪装页显示网速
-	probeDisguiseShowExpiryKey    = "probe_disguise_show_expiry"
-	probeDisguiseShowPriceKey     = "probe_disguise_show_price"
-	probeDisguiseShowGlobeKey     = "probe_disguise_show_globe"
-	probeDisguisePingTargetsKey   = "probe_disguise_ping_targets" // JSON [{key,label,isp,host,port}]
+	probeDisguiseMetricTrafficKey   = "probe_disguise_metric_traffic" // "1"/"" 伪装页显示流量
+	probeDisguiseMetricSpeedKey     = "probe_disguise_metric_speed"   // "1"/"" 伪装页显示网速
+	probeDisguiseShowExpiryKey      = "probe_disguise_show_expiry"
+	probeDisguiseShowPriceKey       = "probe_disguise_show_price"
+	probeDisguiseShowGlobeKey       = "probe_disguise_show_globe"
+	probeDisguiseShowReturnRouteKey = "probe_disguise_show_return_route"
+	probeDisguisePingTargetsKey     = "probe_disguise_ping_targets" // JSON [{key,label,isp,host,port}]
 	// per-server 覆盖:JSON {"<serverID>": [{key,label,isp,host,port}]}。
 	// key 存在且为 [] = 该机不做 ping 探测;key 不存在 = 跟随全局 probeDisguisePingTargetsKey。
 	// 这两种状态必须可区分,所以用 map 的键存在性而不是空数组来表达"跟随全局"。
@@ -390,6 +391,7 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	showExpiry, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowExpiryKey)
 	showPrice, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowPriceKey)
 	showGlobe, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowGlobeKey)
+	showReturnRoute, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowReturnRouteKey)
 	pingTargetsRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguisePingTargetsKey)
 	pingIntervalRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguisePingIntervalKey)
 
@@ -428,6 +430,7 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 		"show_expiry":               showExpiry == "1",
 		"show_price":                showPrice == "1",
 		"show_globe":                showGlobe == "1",
+		"show_return_route":         showReturnRoute == "1",
 		"ping_targets":              pingTargets,
 		"ping_targets_override":     pingTargetsOverride,
 		"ping_interval_ms":          pingInterval,
@@ -449,16 +452,17 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		ServerIDs  []int64 `json:"server_ids"`
 		ShowName   bool    `json:"show_name"`
 		// 新字段用指针:nil=不改。旧前端 PUT 不带这些字段时,它们保持原值不被冲成零值。
-		MetricCPU     *bool              `json:"metric_cpu"`
-		MetricMem     *bool              `json:"metric_mem"`
-		MetricDisk    *bool              `json:"metric_disk"`
-		MetricPing    *bool              `json:"metric_ping"`
-		MetricTraffic *bool              `json:"metric_traffic"`
-		MetricSpeed   *bool              `json:"metric_speed"`
-		ShowExpiry    *bool              `json:"show_expiry"`
-		ShowPrice     *bool              `json:"show_price"`
-		ShowGlobe     *bool              `json:"show_globe"`
-		PingTargets   *[]ProbePingTarget `json:"ping_targets"`
+		MetricCPU       *bool              `json:"metric_cpu"`
+		MetricMem       *bool              `json:"metric_mem"`
+		MetricDisk      *bool              `json:"metric_disk"`
+		MetricPing      *bool              `json:"metric_ping"`
+		MetricTraffic   *bool              `json:"metric_traffic"`
+		MetricSpeed     *bool              `json:"metric_speed"`
+		ShowExpiry      *bool              `json:"show_expiry"`
+		ShowPrice       *bool              `json:"show_price"`
+		ShowGlobe       *bool              `json:"show_globe"`
+		ShowReturnRoute *bool              `json:"show_return_route"`
+		PingTargets     *[]ProbePingTarget `json:"ping_targets"`
 		// per-server 覆盖:键为 serverID 字符串。键存在(值可为空数组)=该机单独指定,
 		// 不存在=跟随全局。整个字段为 nil 时不改(旧前端 PUT 不带它)。
 		PingTargetsOverride *map[string][]ProbePingTarget `json:"ping_targets_override"`
@@ -590,7 +594,8 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		!setBoolPtr(probeDisguiseMetricPingKey, req.MetricPing) ||
 		!setBoolPtr(probeDisguiseShowExpiryKey, req.ShowExpiry) ||
 		!setBoolPtr(probeDisguiseShowPriceKey, req.ShowPrice) ||
-		!setBoolPtr(probeDisguiseShowGlobeKey, req.ShowGlobe) {
+		!setBoolPtr(probeDisguiseShowGlobeKey, req.ShowGlobe) ||
+		!setBoolPtr(probeDisguiseShowReturnRouteKey, req.ShowReturnRoute) {
 		fail()
 		return
 	}

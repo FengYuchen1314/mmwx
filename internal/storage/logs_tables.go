@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,20 @@ type TaskRun struct {
 	Detail     string    `json:"detail"`
 }
 
+// ServerReturnRoute is the latest three-carrier return-route classification
+// for one server. Only the route type is exposed by the public probe API; hop
+// evidence remains private for task diagnostics.
+type ServerReturnRoute struct {
+	ServerID  int64     `json:"server_id"`
+	Carrier   string    `json:"carrier"`
+	Region    string    `json:"region"`
+	RouteType string    `json:"route_type"`
+	EntryIP   string    `json:"entry_ip"`
+	EntryASN  string    `json:"entry_asn"`
+	Reason    string    `json:"reason"`
+	TestedAt  time.Time `json:"tested_at"`
+}
+
 func (r *TrafficRepository) migrateLogTables() error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS security_events (
@@ -82,11 +97,64 @@ CREATE TABLE IF NOT EXISTS task_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_task_runs_name_started ON task_runs(task_name, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_runs_started ON task_runs(started_at DESC);
+
+CREATE TABLE IF NOT EXISTS server_return_routes (
+    server_id  INTEGER NOT NULL,
+    carrier    TEXT NOT NULL,
+    region     TEXT NOT NULL DEFAULT '',
+    route_type TEXT NOT NULL DEFAULT 'Unknown',
+    entry_ip   TEXT NOT NULL DEFAULT '',
+    entry_asn  TEXT NOT NULL DEFAULT '',
+    reason     TEXT NOT NULL DEFAULT '',
+    tested_at  TIMESTAMP NOT NULL,
+    PRIMARY KEY (server_id, carrier)
+);
+CREATE INDEX IF NOT EXISTS idx_server_return_routes_tested ON server_return_routes(tested_at DESC);
 `
 	if _, err := r.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate log tables: %w", err)
 	}
 	return nil
+}
+
+func (r *TrafficRepository) UpsertServerReturnRoute(ctx context.Context, route ServerReturnRoute) error {
+	_, err := r.db.ExecContext(ctx, `INSERT INTO server_return_routes
+		(server_id, carrier, region, route_type, entry_ip, entry_asn, reason, tested_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(server_id, carrier) DO UPDATE SET
+		region=excluded.region, route_type=excluded.route_type, entry_ip=excluded.entry_ip,
+		entry_asn=excluded.entry_asn, reason=excluded.reason, tested_at=excluded.tested_at`,
+		route.ServerID, route.Carrier, route.Region, route.RouteType, route.EntryIP,
+		route.EntryASN, route.Reason, route.TestedAt)
+	return err
+}
+
+func (r *TrafficRepository) ListServerReturnRoutes(ctx context.Context, serverIDs []int64) (map[int64][]ServerReturnRoute, error) {
+	out := make(map[int64][]ServerReturnRoute)
+	if len(serverIDs) == 0 {
+		return out, nil
+	}
+	placeholders := make([]string, len(serverIDs))
+	args := make([]any, len(serverIDs))
+	for i, id := range serverIDs {
+		placeholders[i], args[i] = "?", id
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT server_id, carrier, region, route_type,
+		entry_ip, entry_asn, reason, tested_at FROM server_return_routes WHERE server_id IN (`+
+		strings.Join(placeholders, ",")+`) ORDER BY server_id, carrier`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var route ServerReturnRoute
+		if err := rows.Scan(&route.ServerID, &route.Carrier, &route.Region, &route.RouteType,
+			&route.EntryIP, &route.EntryASN, &route.Reason, &route.TestedAt); err != nil {
+			return nil, err
+		}
+		out[route.ServerID] = append(out[route.ServerID], route)
+	}
+	return out, rows.Err()
 }
 
 // ---- security_events ----
