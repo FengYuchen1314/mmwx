@@ -56,4 +56,5 @@ miaomiaowux-frontend
 MCP_PLAN.md
 *_test.go
 !internal/storage/database_config_test.go
+!internal/license/ip_region_test.go
 AGENTS.md

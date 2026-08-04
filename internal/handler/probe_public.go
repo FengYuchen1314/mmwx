@@ -59,10 +59,11 @@ type probeHourBucket struct {
 // probeServer 是对外暴露的白名单字段集合(刻意不含 id/ip/token/host/reset_day 等)。
 // 新增的 cpu/mem/disk/ping 全用指针/切片 + omitempty:未开启或无数据时整个字段消失,不泄露 0 值。
 type probeServer struct {
-	Name         string `json:"name,omitempty"` // show_name 关闭时省略
-	Region       string `json:"region,omitempty"`
-	ProviderName string `json:"provider_name,omitempty"`
-	ProviderURL  string `json:"provider_url,omitempty"`
+	Name            string `json:"name,omitempty"` // show_name 关闭时省略
+	Region          string `json:"region,omitempty"`
+	ProviderName    string `json:"provider_name,omitempty"`
+	ProviderURL     string `json:"provider_url,omitempty"`
+	TelecomPaidPeer bool   `json:"telecom_paid_peer,omitempty"`
 	// 网速/流量是展示开关控制的:关闭时置 nil + omitempty,整个字段消失,前端据此隐藏。
 	UploadSpeed   *int64 `json:"upload_speed,omitempty"`   // B/s(当前上行速率)
 	DownloadSpeed *int64 `json:"download_speed,omitempty"` // B/s(当前下行速率)
@@ -150,6 +151,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	showPrice := h.setting(ctx, probeDisguiseShowPriceKey)
 	showGlobe := h.setting(ctx, probeDisguiseShowGlobeKey)
 	showReturnRoute := h.setting(ctx, probeDisguiseShowReturnRouteKey)
+	showExternalLicense := h.setting(ctx, probeDisguiseShowExternalLicenseKey)
 	var exchangeRates map[string]float64
 	if showPrice && h.licenseManager != nil {
 		rateCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -194,7 +196,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		used, _ := h.repo.GetServerTrafficUsed(ctx, s.ID)
 		used += s.TrafficUsedOffset
 		online := (h.wsHandler != nil && h.wsHandler.IsConnected(s.Token)) || s.Status == "connected"
-		ps := probeServer{Online: online, Region: s.Region}
+		ps := probeServer{Online: online, Region: s.Region, TelecomPaidPeer: s.TelecomPaidPeer}
 		if onSpeed {
 			up, down := s.CurrentUploadSpeed, s.CurrentDownloadSpeed
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
@@ -246,7 +248,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		out = append(out, ps)
 	}
 
-	return map[string]any{
+	payload := map[string]any{
 		"enabled": true,
 		"title":   title,
 		"logo":    logo,
@@ -261,7 +263,17 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		"show_name":   showName,
 		"show_globe":  showGlobe,
 		"servers":     out,
-	}, nil
+	}
+	if showExternalLicense && h.licenseManager != nil {
+		status := h.licenseManager.GetStatus()
+		if status.Valid && status.Plan != nil && status.Plan.Name != "TRIAL" && (status.Plan.Name != "" || status.Plan.DisplayName != "") {
+			payload["license_badge"] = map[string]string{
+				"name":         status.Plan.Name,
+				"display_name": status.Plan.DisplayName,
+			}
+		}
+	}
+	return payload, nil
 }
 
 func safeProviderURL(raw string) string {

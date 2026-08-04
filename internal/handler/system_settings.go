@@ -342,20 +342,21 @@ const (
 	probeDisguiseMetricDiskKey = "probe_disguise_metric_disk" // "1"/"" 采集硬盘
 	probeDisguiseMetricPingKey = "probe_disguise_metric_ping" // "1"/"" 采集 ping
 	// 流量/网速是展示开关(数据来自主控实时,不需 agent 采集):"1"/"" 控制伪装页是否显示该块。
-	probeDisguiseMetricTrafficKey   = "probe_disguise_metric_traffic" // "1"/"" 伪装页显示流量
-	probeDisguiseMetricSpeedKey     = "probe_disguise_metric_speed"   // "1"/"" 伪装页显示网速
-	probeDisguiseShowExpiryKey      = "probe_disguise_show_expiry"
-	probeDisguiseShowPriceKey       = "probe_disguise_show_price"
-	probeDisguiseShowGlobeKey       = "probe_disguise_show_globe"
-	probeDisguiseShowReturnRouteKey = "probe_disguise_show_return_route"
-	probeDisguisePingTargetsKey     = "probe_disguise_ping_targets" // JSON [{key,label,isp,host,port}]
+	probeDisguiseMetricTrafficKey       = "probe_disguise_metric_traffic" // "1"/"" 伪装页显示流量
+	probeDisguiseMetricSpeedKey         = "probe_disguise_metric_speed"   // "1"/"" 伪装页显示网速
+	probeDisguiseShowExpiryKey          = "probe_disguise_show_expiry"
+	probeDisguiseShowPriceKey           = "probe_disguise_show_price"
+	probeDisguiseShowGlobeKey           = "probe_disguise_show_globe"
+	probeDisguiseShowReturnRouteKey     = "probe_disguise_show_return_route"
+	probeDisguiseShowExternalLicenseKey = "probe_disguise_show_external_license"
+	probeDisguisePingTargetsKey         = "probe_disguise_ping_targets" // JSON [{key,label,isp,host,port}]
 	// per-server 覆盖:JSON {"<serverID>": [{key,label,isp,host,port}]}。
 	// key 存在且为 [] = 该机不做 ping 探测;key 不存在 = 跟随全局 probeDisguisePingTargetsKey。
 	// 这两种状态必须可区分,所以用 map 的键存在性而不是空数组来表达"跟随全局"。
 	probeDisguisePingTargetsOverrideKey = "probe_disguise_ping_targets_override"
 	probeDisguisePingIntervalKey        = "probe_disguise_ping_interval_ms" // int 字符串,默认 5000
 	probeCDNRegionsEndpointKey          = "probe_cdn_regions_endpoint"      // CDN 数据端点(可配置)
-	// 独立探针源站保护:开启后，三个公开探针接口必须携带 Worker 专用密钥。
+	// 探针源站保护:开启后允许同源内置探针或携带 Worker 专用密钥的独立探针。
 	probeExternalOnlyKey      = "probe_external_access_only"
 	probeExternalTokenHashKey = "probe_external_token_sha256"
 )
@@ -392,6 +393,7 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	showPrice, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowPriceKey)
 	showGlobe, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowGlobeKey)
 	showReturnRoute, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowReturnRouteKey)
+	showExternalLicense, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowExternalLicenseKey)
 	pingTargetsRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguisePingTargetsKey)
 	pingIntervalRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguisePingIntervalKey)
 
@@ -431,6 +433,7 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 		"show_price":                showPrice == "1",
 		"show_globe":                showGlobe == "1",
 		"show_return_route":         showReturnRoute == "1",
+		"show_external_license":     showExternalLicense == "1",
 		"ping_targets":              pingTargets,
 		"ping_targets_override":     pingTargetsOverride,
 		"ping_interval_ms":          pingInterval,
@@ -452,17 +455,18 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		ServerIDs  []int64 `json:"server_ids"`
 		ShowName   bool    `json:"show_name"`
 		// 新字段用指针:nil=不改。旧前端 PUT 不带这些字段时,它们保持原值不被冲成零值。
-		MetricCPU       *bool              `json:"metric_cpu"`
-		MetricMem       *bool              `json:"metric_mem"`
-		MetricDisk      *bool              `json:"metric_disk"`
-		MetricPing      *bool              `json:"metric_ping"`
-		MetricTraffic   *bool              `json:"metric_traffic"`
-		MetricSpeed     *bool              `json:"metric_speed"`
-		ShowExpiry      *bool              `json:"show_expiry"`
-		ShowPrice       *bool              `json:"show_price"`
-		ShowGlobe       *bool              `json:"show_globe"`
-		ShowReturnRoute *bool              `json:"show_return_route"`
-		PingTargets     *[]ProbePingTarget `json:"ping_targets"`
+		MetricCPU           *bool              `json:"metric_cpu"`
+		MetricMem           *bool              `json:"metric_mem"`
+		MetricDisk          *bool              `json:"metric_disk"`
+		MetricPing          *bool              `json:"metric_ping"`
+		MetricTraffic       *bool              `json:"metric_traffic"`
+		MetricSpeed         *bool              `json:"metric_speed"`
+		ShowExpiry          *bool              `json:"show_expiry"`
+		ShowPrice           *bool              `json:"show_price"`
+		ShowGlobe           *bool              `json:"show_globe"`
+		ShowReturnRoute     *bool              `json:"show_return_route"`
+		ShowExternalLicense *bool              `json:"show_external_license"`
+		PingTargets         *[]ProbePingTarget `json:"ping_targets"`
 		// per-server 覆盖:键为 serverID 字符串。键存在(值可为空数组)=该机单独指定,
 		// 不存在=跟随全局。整个字段为 nil 时不改(旧前端 PUT 不带它)。
 		PingTargetsOverride *map[string][]ProbePingTarget `json:"ping_targets_override"`
@@ -504,16 +508,6 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 			return
 		}
 	}
-	if req.ExternalAccessOnly != nil && *req.ExternalAccessOnly && newExternalToken == "" {
-		existing, _ := h.repo.GetSystemSetting(ctx, probeExternalTokenHashKey)
-		if strings.TrimSpace(existing) == "" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请先生成独立探针访问密钥"})
-			return
-		}
-	}
-
 	// 现有 4 字段:值语义,每次写(兼容旧前端整对象 PUT)。
 	for _, kv := range []struct{ k, v string }{
 		{probeDisguiseEnabledKey, boolStr(req.Enabled)},
@@ -595,7 +589,8 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		!setBoolPtr(probeDisguiseShowExpiryKey, req.ShowExpiry) ||
 		!setBoolPtr(probeDisguiseShowPriceKey, req.ShowPrice) ||
 		!setBoolPtr(probeDisguiseShowGlobeKey, req.ShowGlobe) ||
-		!setBoolPtr(probeDisguiseShowReturnRouteKey, req.ShowReturnRoute) {
+		!setBoolPtr(probeDisguiseShowReturnRouteKey, req.ShowReturnRoute) ||
+		!setBoolPtr(probeDisguiseShowExternalLicenseKey, req.ShowExternalLicense) {
 		fail()
 		return
 	}

@@ -38,7 +38,7 @@ func StartServerProviderSync(ctx context.Context, repo *storage.TrafficRepositor
 			if server.Region == "" && region.Flag() != "" {
 				_ = repo.UpdateRemoteServerProbeMeta(ctx, server.ID, region.Flag(), server.RenewalPrice, server.RenewalCycle, server.RenewalCurrency, server.ExpiresAt)
 			}
-			if err := repo.UpdateRemoteServerProvider(ctx, server.ID, region.ProviderName, region.ProviderURL); err != nil {
+			if err := repo.UpdateRemoteServerProvider(ctx, server.ID, region.ProviderName, region.ProviderURL, region.TelecomPaidPeer); err != nil {
 				log.Printf("[ProviderSync] update server %d: %v", server.ID, err)
 			}
 		}

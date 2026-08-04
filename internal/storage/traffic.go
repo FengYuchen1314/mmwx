@@ -864,6 +864,7 @@ type RemoteServer struct {
 	Region            string     `json:"region,omitempty"`
 	ProviderName      string     `json:"provider_name,omitempty"`
 	ProviderURL       string     `json:"provider_url,omitempty"`
+	TelecomPaidPeer   bool       `json:"telecom_paid_peer,omitempty"`
 	ProviderUpdatedAt *time.Time `json:"provider_updated_at,omitempty"`
 	RenewalPrice      float64    `json:"renewal_price,omitempty"`
 	RenewalCycle      string     `json:"renewal_cycle,omitempty"`
@@ -2545,6 +2546,9 @@ CREATE INDEX IF NOT EXISTS idx_remote_servers_status ON remote_servers(status);
 		return err
 	}
 	if err := r.ensureRemoteServerColumn("provider_url", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := r.ensureRemoteServerColumn("telecom_paid_peer", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := r.ensureRemoteServerColumn("provider_updated_at", "TIMESTAMP"); err != nil {
@@ -10530,7 +10534,7 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 			}
 		}
 		// 探针元数据独立补查，避免继续扩张上方易错的 positional Scan。
-		if mrows, merr := r.db.QueryContext(ctx, `SELECT id, COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at, COALESCE(provider_name,''), COALESCE(provider_url,''), provider_updated_at FROM remote_servers`); merr == nil {
+		if mrows, merr := r.db.QueryContext(ctx, `SELECT id, COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at, COALESCE(provider_name,''), COALESCE(provider_url,''), COALESCE(telecom_paid_peer,0), provider_updated_at FROM remote_servers`); merr == nil {
 			byID := make(map[int64]*RemoteServer, len(servers))
 			for i := range servers {
 				byID[servers[i].ID] = &servers[i]
@@ -10541,10 +10545,12 @@ func (r *TrafficRepository) ListRemoteServers(ctx context.Context) ([]RemoteServ
 				var region, cycle, currency string
 				var providerName, providerURL string
 				var price float64
-				if mrows.Scan(&id, &region, &price, &cycle, &currency, &expires, &providerName, &providerURL, &providerUpdated) == nil {
+				var telecomPaidPeer bool
+				if mrows.Scan(&id, &region, &price, &cycle, &currency, &expires, &providerName, &providerURL, &telecomPaidPeer, &providerUpdated) == nil {
 					if s := byID[id]; s != nil {
 						s.Region, s.RenewalPrice, s.RenewalCycle, s.RenewalCurrency = region, price, cycle, currency
 						s.ProviderName, s.ProviderURL = providerName, providerURL
+						s.TelecomPaidPeer = telecomPaidPeer
 						if expires.Valid {
 							t := expires.Time
 							s.ExpiresAt = &t
@@ -10655,8 +10661,8 @@ func (r *TrafficRepository) GetRemoteServer(ctx context.Context, id int64) (*Rem
 		server.IncludeInTrafficStats = includeStatsInt != 0
 	}
 	var expires, providerUpdated sql.NullTime
-	_ = r.db.QueryRowContext(ctx, `SELECT COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at, COALESCE(provider_name,''), COALESCE(provider_url,''), provider_updated_at FROM remote_servers WHERE id = ?`, id).
-		Scan(&server.Region, &server.RenewalPrice, &server.RenewalCycle, &server.RenewalCurrency, &expires, &server.ProviderName, &server.ProviderURL, &providerUpdated)
+	_ = r.db.QueryRowContext(ctx, `SELECT COALESCE(region,''), COALESCE(renewal_price,0), COALESCE(renewal_cycle,'month'), COALESCE(renewal_currency,'CNY'), expires_at, COALESCE(provider_name,''), COALESCE(provider_url,''), COALESCE(telecom_paid_peer,0), provider_updated_at FROM remote_servers WHERE id = ?`, id).
+		Scan(&server.Region, &server.RenewalPrice, &server.RenewalCycle, &server.RenewalCurrency, &expires, &server.ProviderName, &server.ProviderURL, &server.TelecomPaidPeer, &providerUpdated)
 	if expires.Valid {
 		t := expires.Time
 		server.ExpiresAt = &t
@@ -10724,8 +10730,8 @@ func (r *TrafficRepository) UpdateRemoteServerProbeMeta(ctx context.Context, id 
 	return nil
 }
 
-func (r *TrafficRepository) UpdateRemoteServerProvider(ctx context.Context, id int64, name, websiteURL string) error {
-	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET provider_name=?, provider_url=?, provider_updated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, strings.TrimSpace(name), strings.TrimSpace(websiteURL), id)
+func (r *TrafficRepository) UpdateRemoteServerProvider(ctx context.Context, id int64, name, websiteURL string, telecomPaidPeer bool) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE remote_servers SET provider_name=?, provider_url=?, telecom_paid_peer=?, provider_updated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?`, strings.TrimSpace(name), strings.TrimSpace(websiteURL), telecomPaidPeer, id)
 	if err != nil {
 		return fmt.Errorf("update server provider: %w", err)
 	}

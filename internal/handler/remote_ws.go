@@ -1176,17 +1176,20 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 	// 推送许可证状态给 Agent
 	if h.licenseManager != nil {
 		go h.SendLicenseStatus(wsConn)
-		// 地域只在尚未配置时预填。查询由许可证服务按 IP 网段缓存，绝不覆盖管理员修改。
-		if server.Region == "" && ip != "" {
+		// 地域只在尚未配置时预填；服务商则必须在每次有效 IP 上线时刷新。
+		// 否则服务器换 IP、复用旧服务器记录后会残留上一个服务商及其线路标记。
+		if ip != "" {
 			go func(s *storage.RemoteServer, publicIP string) {
 				lookupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				region, err := h.licenseManager.ResolveIPRegion(lookupCtx, publicIP)
-				if err != nil || region.Flag() == "" {
+				if err != nil {
 					return
 				}
-				_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, s.ID, region.Flag(), s.RenewalPrice, s.RenewalCycle, s.RenewalCurrency, s.ExpiresAt)
-				_ = h.repo.UpdateRemoteServerProvider(lookupCtx, s.ID, region.ProviderName, region.ProviderURL)
+				if s.Region == "" && region.Flag() != "" {
+					_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, s.ID, region.Flag(), s.RenewalPrice, s.RenewalCycle, s.RenewalCurrency, s.ExpiresAt)
+				}
+				_ = h.repo.UpdateRemoteServerProvider(lookupCtx, s.ID, region.ProviderName, region.ProviderURL, region.TelecomPaidPeer)
 			}(server, ip)
 		}
 	}
