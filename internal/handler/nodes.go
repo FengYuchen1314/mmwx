@@ -1142,10 +1142,19 @@ func (h *nodesHandler) handleCopyWithRelay(w http.ResponseWriter, r *http.Reques
 	if strings.TrimSpace(copyNode.RelayOrigServer) != "" {
 		cancelRelayOnNode(&copyNode)
 	}
+	// Tunnel 副本仍然使用源节点的业务入站凭据。源节点是完整受管物理节点时，必须继承
+	// (original_server, inbound_tag)，否则前端会把副本判成外部节点，套餐用户订阅也无法
+	// 注入自己的入站凭据。不能改成 tunnel 自己的 dokodemo tag：它不是可添加 client 的业务入站。
+	// routed 节点使用独立子账户凭据，强行降成 physical 后继承 tag 会被错误替换凭据，因此仍按外部副本处理。
+	managedOriginalServer, managedInboundTag := "", ""
+	if source.NodeType != "routed" && strings.TrimSpace(source.OriginalServer) != "" && strings.TrimSpace(source.InboundTag) != "" {
+		managedOriginalServer = source.OriginalServer
+		managedInboundTag = source.InboundTag
+	}
 	copyNode.ID = 0
 	copyNode.RawURL = "" // 隧道副本不再由外部订阅同步覆盖。
-	copyNode.OriginalServer = ""
-	copyNode.InboundTag = ""
+	copyNode.OriginalServer = managedOriginalServer
+	copyNode.InboundTag = managedInboundTag
 	copyNode.ChainProxyNodeID = nil
 	copyNode.RelayGroupName = ""
 	copyNode.RelayGroupNodeIDs = nil
