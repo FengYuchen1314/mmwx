@@ -390,7 +390,7 @@ func buildDailyIncrementData(ctx context.Context, repo *storage.TrafficRepositor
 	type bytePair struct{ up, down int64 }
 	nodeBase := make(map[string]bytePair, len(nodeBefore))
 	for _, s := range nodeBefore {
-		if s.Type == "inbound" {
+		if s.Type == "inbound" && !strings.EqualFold(strings.TrimSpace(s.Tag), "api") {
 			nodeBase[strconv.FormatInt(s.ServerID, 10)+"\x00"+s.Tag] = bytePair{s.Uplink, s.Downlink}
 		}
 	}
@@ -400,7 +400,7 @@ func buildDailyIncrementData(ctx context.Context, repo *storage.TrafficRepositor
 	}
 	var nodeUsage []usage
 	for _, s := range nodeAfter {
-		if s.Type != "inbound" {
+		if s.Type != "inbound" || strings.EqualFold(strings.TrimSpace(s.Tag), "api") {
 			continue
 		}
 		key := strconv.FormatInt(s.ServerID, 10) + "\x00" + s.Tag
@@ -474,6 +474,9 @@ func buildDailyIncrementData(ctx context.Context, repo *storage.TrafficRepositor
 	}
 	var users []usage
 	for username, used := range userUsage {
+		if used <= 0 {
+			continue
+		}
 		users = append(users, usage{name: username, used: used})
 		out.UserTotal += used
 	}

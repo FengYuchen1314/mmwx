@@ -757,15 +757,12 @@ func (h *TGBotAPIHandler) userSummary(w http.ResponseWriter, r *http.Request) {
 	if user.PackageID > 0 {
 		pkg, perr := h.repo.GetPackage(r.Context(), user.PackageID)
 		if perr == nil && pkg != nil {
-			limit := pkg.TrafficLimitBytes
-			if limit <= 0 {
-				limit = int64(pkg.TrafficLimitGB * 1024 * 1024 * 1024)
-			}
+			limit := resolveTrafficLimitBytes(&user, pkg)
 			out["package"] = map[string]any{
 				"id":               pkg.ID,
 				"name":             pkg.Name,
 				"traffic_limit":    limit,
-				"traffic_limit_gb": pkg.TrafficLimitGB,
+				"traffic_limit_gb": float64(limit) / (1024 * 1024 * 1024),
 				"cycle_days":       pkg.CycleDays,
 				"traffic_mode":     pkg.TrafficMode,
 				"speed_limit_mbps": pkg.SpeedLimitMbps,
@@ -963,21 +960,29 @@ func (h *TGBotAPIHandler) notifyDigest(w http.ResponseWriter, r *http.Request) {
 	users := make([]digestUser, 0, len(targets))
 	for _, t := range targets {
 		du := digestUser{Username: t.Username, TelegramID: t.TelegramID}
+		user, userErr := h.repo.GetUser(ctx, t.Username)
+		var pkg *storage.Package
 		if t.PackageID > 0 {
-			if pkg, perr := h.repo.GetPackage(ctx, t.PackageID); perr == nil && pkg != nil {
+			if loaded, perr := h.repo.GetPackage(ctx, t.PackageID); perr == nil && loaded != nil {
+				pkg = loaded
 				du.PackageName = pkg.Name
-				du.TrafficLimitGB = pkg.TrafficLimitGB
 			}
+		}
+		if userErr == nil {
+			du.TrafficLimitGB = float64(resolveTrafficLimitBytes(&user, pkg)) / (1024 * 1024 * 1024)
 		}
 		if t.PackageEndDate != nil {
 			du.PackageEndDate = t.PackageEndDate.Format(time.RFC3339)
 		}
 		rows, _ := h.repo.GetUserTrafficByUsername(ctx, t.Username)
 		for _, tr := range rows {
-			du.CycleUplink += tr.Uplink
-			du.CycleDownlink += tr.Downlink
 			du.TotalUplink += tr.TotalUplink
 			du.TotalDownlink += tr.TotalDownlink
+		}
+		// 每日 Bot 推送与 Web/超限判定使用同一份计费流量。手动重置会抬升
+		// user_email_traffic 的周期基线，因此这里会立即归零，不再读旧 user_traffic 缓存口径。
+		if up, down, trafficErr := h.repo.GetUserBillableTrafficByDirection(ctx, t.Username); trafficErr == nil {
+			du.CycleUplink, du.CycleDownlink = up, down
 		}
 		users = append(users, du)
 	}

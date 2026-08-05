@@ -5096,12 +5096,39 @@ type User struct {
 	UpdatedAt                time.Time
 }
 
-// GetUserPackagePeriod 返回用户当前套餐的生效起止时间。
+// GetUserPackagePeriod 返回用户当前的流量计费周期。
+// 月度重置套餐必须返回「上个重置日 → 下个重置日」，不能把可能长达一年的套餐有效期
+// 当成流量周期。恰逢重置日时，当天属于新周期；29/30/31 日会自动夹到当月月末。
 func (r *TrafficRepository) GetUserPackagePeriod(ctx context.Context, username string) (start, end *time.Time, err error) {
 	var startAt, endAt sql.NullTime
-	err = r.db.QueryRowContext(ctx, `SELECT package_start_date, package_end_date FROM users WHERE username = ? LIMIT 1`, strings.TrimSpace(username)).Scan(&startAt, &endAt)
+	var isReset, resetDay int
+	err = r.db.QueryRowContext(ctx, `SELECT package_start_date, package_end_date, COALESCE(is_reset, 0), COALESCE(reset_day, 1) FROM users WHERE username = ? LIMIT 1`, strings.TrimSpace(username)).Scan(&startAt, &endAt, &isReset, &resetDay)
 	if err != nil {
 		return nil, nil, err
+	}
+	if isReset != 0 && resetDay >= 1 && resetDay <= 31 {
+		now := time.Now()
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		resetDate := func(year int, month time.Month) time.Time {
+			lastDay := time.Date(year, month+1, 0, 0, 0, 0, 0, now.Location()).Day()
+			day := resetDay
+			if day > lastDay {
+				day = lastDay
+			}
+			return time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+		}
+		thisMonth := resetDate(today.Year(), today.Month())
+		var previous, next time.Time
+		if today.Before(thisMonth) {
+			previousAnchor := time.Date(today.Year(), today.Month()-1, 1, 0, 0, 0, 0, now.Location())
+			previous = resetDate(previousAnchor.Year(), previousAnchor.Month())
+			next = thisMonth
+		} else {
+			previous = thisMonth
+			nextAnchor := time.Date(today.Year(), today.Month()+1, 1, 0, 0, 0, 0, now.Location())
+			next = resetDate(nextAnchor.Year(), nextAnchor.Month())
+		}
+		return &previous, &next, nil
 	}
 	if startAt.Valid {
 		v := startAt.Time
@@ -12792,6 +12819,14 @@ func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username 
 		}
 		if affected, _ := result.RowsAffected(); affected == 0 {
 			return ErrUserNotFound
+		}
+	} else {
+		// 手动重置也必须清掉 80% 告警边沿。is_over_limit 暂时保留，由 enforcer
+		// 在成功恢复普通入站与 routed 子账户后原子清除，不能提前制造“数据库已恢复、Xray 仍断流”。
+		const markerStmt = `UPDATE users SET traffic_warned_80 = 0, updated_at = CURRENT_TIMESTAMP WHERE username = ?`
+		_, err := tx.ExecContext(ctx, markerStmt, username)
+		if err != nil {
+			return fmt.Errorf("clear user traffic limit state: %w", err)
 		}
 	}
 
