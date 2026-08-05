@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // NodeTrafficItem 是 UpsertNodeTrafficBatch 的单条输入:某个 (tag,type) 当前的 cumulative 计数。
@@ -83,6 +84,7 @@ func (r *TrafficRepository) UpsertNodeTrafficBatch(ctx context.Context, serverID
 
 	const insertStmt = `INSERT INTO node_traffic (server_id, tag, type, uplink, downlink, total_uplink, total_downlink, last_uplink, last_downlink, updated_at) VALUES (?, ?, ?, 0, 0, 0, 0, ?, ?, CURRENT_TIMESTAMP)`
 	const updateStmt = `UPDATE node_traffic SET uplink = uplink + ?, downlink = downlink + ?, total_uplink = ?, total_downlink = ?, last_uplink = ?, last_downlink = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	ledgerDate := trafficLedgerDate(time.Now())
 
 	for _, it := range items {
 		if it.Tag == "" || (it.Type != "inbound" && it.Type != "outbound") {
@@ -113,6 +115,9 @@ func (r *TrafficRepository) UpsertNodeTrafficBatch(ctx context.Context, serverID
 		}
 		if _, err := conn.ExecContext(ctx, updateStmt, deltaUp, deltaDown, newTotalUp, newTotalDown, it.Uplink, it.Downlink, e.id); err != nil {
 			return fmt.Errorf("update node traffic %s/%s: %w", it.Tag, it.Type, err)
+		}
+		if err := addDailyNodeTraffic(ctx, conn, ledgerDate, serverID, it.Tag, it.Type, deltaUp, deltaDown); err != nil {
+			return fmt.Errorf("update daily node traffic %s/%s: %w", it.Tag, it.Type, err)
 		}
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {

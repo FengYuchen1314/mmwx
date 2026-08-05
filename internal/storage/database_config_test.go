@@ -263,7 +263,7 @@ func TestSQLiteToPostgresMigrationIntegration(t *testing.T) {
 	if _, err := source.db.ExecContext(ctx, `INSERT INTO invite_code_uses (code, username, tg_id) VALUES ('migration-code', 'migrated', 6394028004)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := source.db.ExecContext(ctx, `INSERT INTO remote_servers (id, name, token, status, last_heartbeat) VALUES (104, 'migration-server', 'migration-server-token', 'offline', '2026-08-02 05:51:58.370742665 -0400 -0400')`); err != nil {
+	if _, err := source.db.ExecContext(ctx, `INSERT INTO remote_servers (id,name,token,status,last_heartbeat,traffic_source,traffic_stats_mode,system_rx_cycle,system_tx_cycle,system_last_seen_rx,system_last_seen_tx,system_boot_time_unix,traffic_used_offset,last_traffic_reset_at) VALUES (104,'migration-server','migration-server-token','offline','2026-08-02 05:51:58.370742665 -0400 -0400','system','max',123456,654321,923456,954321,17000000,-7777,'2026-08-01T00:00:00+08:00')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := source.db.ExecContext(ctx, `INSERT INTO server_xray_config_snapshots (id, server_id, config_json, config_hash, source, status) VALUES (105, 104, '{}', 'valid-hash', 'master_write', 'current'), (106, 999999, '{}', 'orphan-hash', 'master_write', 'old')`); err != nil {
@@ -335,6 +335,18 @@ func TestSQLiteToPostgresMigrationIntegration(t *testing.T) {
 	}
 	if snapshots != 1 {
 		t.Fatalf("snapshots=%d, want only the valid snapshot", snapshots)
+	}
+	var rx, tx, lastRx, lastTx, boot, offset int64
+	var sourceMode, statsMode string
+	if err := postgres.db.QueryRowContext(ctx, `SELECT system_rx_cycle,system_tx_cycle,system_last_seen_rx,system_last_seen_tx,system_boot_time_unix,traffic_used_offset,traffic_source,traffic_stats_mode FROM remote_servers WHERE id=?`, 104).Scan(&rx, &tx, &lastRx, &lastTx, &boot, &offset, &sourceMode, &statsMode); err != nil {
+		t.Fatal(err)
+	}
+	if rx != 123456 || tx != 654321 || lastRx != 923456 || lastTx != 954321 || boot != 17000000 || offset != -7777 || sourceMode != "system" || statsMode != "max" {
+		t.Fatalf("migrated traffic state changed: rx=%d tx=%d last=%d/%d boot=%d offset=%d source=%s mode=%s", rx, tx, lastRx, lastTx, boot, offset, sourceMode, statsMode)
+	}
+	marker, err := postgres.GetSystemSetting(ctx, SystemTrafficSnapshotBackfillMarker)
+	if err != nil || marker == "" {
+		t.Fatalf("migration marker=%q err=%v", marker, err)
 	}
 }
 

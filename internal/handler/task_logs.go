@@ -39,6 +39,8 @@ var taskTypes = []taskType{
 	{"traffic_enforcer", "流量限制执行"},
 	{"server_traffic_reset_guard", "服务器流量重置兜底"},
 	{"daily_snapshot", "每日快照"},
+	{"traffic_snapshot_backfill", "历史流量快照迁移"},
+	{"traffic_ledger_audit", "流量账本校准"},
 	{"orphan_xray_cleaner", "孤儿客户端清理"},
 	{"notify_daily_traffic", "每日流量推送"},
 	{"ddns_reconciler", "DDNS 重试"},

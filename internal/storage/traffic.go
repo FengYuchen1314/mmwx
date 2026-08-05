@@ -2704,6 +2704,9 @@ CREATE INDEX IF NOT EXISTS idx_user_email_traffic_email ON user_email_traffic(em
 	if _, err := r.db.Exec(userEmailTrafficSchema); err != nil {
 		return fmt.Errorf("migrate user_email_traffic: %w", err)
 	}
+	if err := r.migrateDailyTrafficLedger(); err != nil {
+		return fmt.Errorf("migrate daily traffic ledger: %w", err)
+	}
 	// 周期基线:月度重置时把 uplink/downlink 的当前值抬进 cycle_base_*,判定/展示只看 (uplink - base)。
 	// 相比直接把 uplink 清零,这样保住了 total_* 的历史累计,也不需要动 collector 的 delta 逻辑。
 	// 存量行 base=0 → 增量 == 当前累计值,与升级前行为完全一致。
@@ -2755,11 +2758,12 @@ CREATE TABLE IF NOT EXISTS node_traffic_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     server_id INTEGER NOT NULL,
     tag TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'inbound',
     date TEXT NOT NULL,
     uplink INTEGER NOT NULL DEFAULT 0,
     downlink INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(server_id, tag, date)
+    UNIQUE(server_id, tag, type, date)
 );
 CREATE INDEX IF NOT EXISTS idx_node_traffic_snapshots_date ON node_traffic_snapshots(date);
 `
@@ -2773,6 +2777,11 @@ CREATE INDEX IF NOT EXISTS idx_node_traffic_snapshots_date ON node_traffic_snaps
 	// 已删除节点对应的历史 snapshot 行保持默认值 — server 视图也展示不到这些 tag,影响可忽略。
 	if err := r.ensureTableColumn("node_traffic_snapshots", "type", "TEXT NOT NULL DEFAULT 'inbound'"); err != nil {
 		return fmt.Errorf("ensure node_traffic_snapshots.type column: %w", err)
+	}
+	if r.config.Driver == "postgres" {
+		if err := r.migratePostgresNodeTrafficSnapshotUnique(); err != nil {
+			return fmt.Errorf("migrate postgres node_traffic_snapshots unique constraint: %w", err)
+		}
 	}
 
 	// backfill 与 rebuild 必须配套:
@@ -3657,6 +3666,64 @@ func (r *TrafficRepository) nodeTrafficSnapshotsNeedsRebuild() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// migratePostgresNodeTrafficSnapshotUnique upgrades legacy PostgreSQL tables
+// from UNIQUE(server_id,tag,date) to UNIQUE(server_id,tag,type,date). The write
+// path has used the four-column ON CONFLICT target since type was introduced;
+// leaving the old constraint in place makes every daily node snapshot fail
+// with SQLSTATE 42P10. Keep this migration idempotent for both upgraded and
+// freshly-created databases.
+func (r *TrafficRepository) migratePostgresNodeTrafficSnapshotUnique() error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Old PostgreSQL databases received type with DEFAULT 'inbound'. Only when
+	// a (server,tag) maps to exactly one current node_traffic type can history be
+	// corrected without guessing. Ambiguous tags deliberately remain inbound.
+	if _, err := tx.Exec(`
+UPDATE node_traffic_snapshots s
+SET type = x.type
+FROM (
+    SELECT server_id, tag, MIN(type) AS type
+    FROM node_traffic
+    GROUP BY server_id, tag
+    HAVING COUNT(DISTINCT type) = 1
+) x
+WHERE s.server_id = x.server_id AND s.tag = x.tag`); err != nil {
+		return fmt.Errorf("backfill unambiguous snapshot types: %w", err)
+	}
+
+	// Constraint names are database-generated and may differ across installs,
+	// so discover every legacy three-column UNIQUE constraint by its columns.
+	if _, err := tx.Exec(`
+DO $$
+DECLARE c RECORD;
+BEGIN
+  FOR c IN
+    SELECT con.conname
+    FROM pg_constraint con
+    WHERE con.conrelid = 'node_traffic_snapshots'::regclass
+      AND con.contype = 'u'
+      AND (
+        SELECT array_agg(att.attname ORDER BY att.attname)
+        FROM unnest(con.conkey) AS ck(attnum)
+        JOIN pg_attribute att
+          ON att.attrelid = con.conrelid AND att.attnum = ck.attnum
+      ) = ARRAY['date','server_id','tag']::name[]
+  LOOP
+    EXECUTE format('ALTER TABLE node_traffic_snapshots DROP CONSTRAINT %I', c.conname);
+  END LOOP;
+END $$`); err != nil {
+		return fmt.Errorf("drop legacy unique constraint: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_node_traffic_snapshots_server_tag_type_date_unique ON node_traffic_snapshots(server_id,tag,type,date)`); err != nil {
+		return fmt.Errorf("create four-column unique index: %w", err)
+	}
+	return tx.Commit()
 }
 
 // rebuildNodeTrafficSnapshots 重建表把 UNIQUE 改为 (server_id, tag, type, date)。
@@ -7573,31 +7640,74 @@ func (r *TrafficRepository) UpsertRemoteServerSystemTraffic(ctx context.Context,
 		return errors.New("traffic repository not initialized")
 	}
 
-	// 用一条原子 UPDATE 在数据库内计算 delta。旧实现先 SELECT 再 UPDATE:
-	// 每轮多一次往返,且两个并发上报可能读到同一 last_seen 后重复累计。
-	result, err := r.db.ExecContext(ctx, `
-		UPDATE remote_servers SET
-			system_rx_cycle = COALESCE(system_rx_cycle, 0) + CASE
-				WHEN COALESCE(system_boot_time_unix,0) != 0 AND system_boot_time_unix = ? AND ? >= COALESCE(system_last_seen_rx,0)
-				THEN ? - COALESCE(system_last_seen_rx,0) ELSE 0 END,
-			system_tx_cycle = COALESCE(system_tx_cycle, 0) + CASE
-				WHEN COALESCE(system_boot_time_unix,0) != 0 AND system_boot_time_unix = ? AND ? >= COALESCE(system_last_seen_tx,0)
-				THEN ? - COALESCE(system_last_seen_tx,0) ELSE 0 END,
-			system_last_seen_rx = ?,
-			system_last_seen_tx = ?,
-			system_boot_time_unix = ?,
-			system_traffic_updated_at = CURRENT_TIMESTAMP,
-			updated_at = CURRENT_TIMESTAMP
-		WHERE id = ?`,
-		bootTimeUnix, rxTotal, rxTotal, bootTimeUnix, txTotal, txTotal,
-		rxTotal, txTotal, bootTimeUnix, serverID)
+	// Cycle state and daily ledger must commit together. SQLite takes an
+	// IMMEDIATE writer lock before reading the baseline; PostgreSQL locks the
+	// server row with FOR UPDATE. This prevents concurrent reports from booking
+	// the same delta twice.
+	if r.config.Driver == "postgres" {
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := upsertSystemTrafficOn(ctx, tx, serverID, rxTotal, txTotal, bootTimeUnix, true); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	conn, err := r.db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("update server system traffic: %w", err)
+		return err
 	}
-	if affected, _ := result.RowsAffected(); affected == 0 {
-		return ErrRemoteServerNotFound
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	if err := upsertSystemTrafficOn(ctx, conn, serverID, rxTotal, txTotal, bootTimeUnix, false); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
 	return nil
+}
+
+func upsertSystemTrafficOn(ctx context.Context, ex sqlExecutor, serverID, rxTotal, txTotal, bootTimeUnix int64, lockRow bool) error {
+	query := `SELECT COALESCE(system_last_seen_rx,0),COALESCE(system_last_seen_tx,0),COALESCE(system_boot_time_unix,0) FROM remote_servers WHERE id=?`
+	if lockRow {
+		query += ` FOR UPDATE`
+	}
+	var lastRx, lastTx, oldBoot int64
+	if err := ex.QueryRowContext(ctx, query, serverID).Scan(&lastRx, &lastTx, &oldBoot); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrRemoteServerNotFound
+		}
+		return fmt.Errorf("read server system traffic baseline: %w", err)
+	}
+	var rxDelta, txDelta int64
+	if oldBoot != 0 && oldBoot == bootTimeUnix {
+		if rxTotal >= lastRx {
+			rxDelta = rxTotal - lastRx
+		}
+		if txTotal >= lastTx {
+			txDelta = txTotal - lastTx
+		}
+	}
+	if _, err := ex.ExecContext(ctx, `UPDATE remote_servers SET
+		system_rx_cycle=COALESCE(system_rx_cycle,0)+?,system_tx_cycle=COALESCE(system_tx_cycle,0)+?,
+		system_last_seen_rx=?,system_last_seen_tx=?,system_boot_time_unix=?,
+		system_traffic_updated_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?`,
+		rxDelta, txDelta, rxTotal, txTotal, bootTimeUnix, serverID); err != nil {
+		return err
+	}
+	return addDailySystemTraffic(ctx, ex, trafficLedgerDate(time.Now()), serverID, txDelta, rxDelta)
 }
 
 // ResetRemoteServerSystemCycle 清零 cycle 累计,保留 last_seen / boot_time_unix(物理网卡累计不变)。
@@ -12393,6 +12503,9 @@ func upsertUserTrafficOn(ctx context.Context, ex sqlExecutor, serverID int64, us
 	if err != nil {
 		return fmt.Errorf("update user traffic: %w", err)
 	}
+	if err := addDailyUserTraffic(ctx, ex, trafficLedgerDate(time.Now()), serverID, username, deltaUplink, deltaDownlink); err != nil {
+		return fmt.Errorf("update daily user traffic: %w", err)
+	}
 
 	return nil
 }
@@ -12425,11 +12538,11 @@ func (r *TrafficRepository) UpsertUserEmailTraffic(ctx context.Context, serverID
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
-	return upsertUserEmailTrafficOn(ctx, r.db, serverID, email, uplink, downlink, isXrayRestarted, weight, attributedUsername)
+	return upsertUserEmailTrafficOn(ctx, r.db, serverID, email, uplink, downlink, isXrayRestarted, weight, attributedUsername, nil)
 }
 
 // upsertUserEmailTrafficOn 同 upsertUserTrafficOn:实现体与执行目标解耦,供批量事务复用。
-func upsertUserEmailTrafficOn(ctx context.Context, ex sqlExecutor, serverID int64, email string, uplink, downlink int64, isXrayRestarted bool, weight float64, attributedUsername string) error {
+func upsertUserEmailTrafficOn(ctx context.Context, ex sqlExecutor, serverID int64, email string, uplink, downlink int64, isXrayRestarted bool, weight float64, attributedUsername string, nodeShares []WeightedNodeShare) error {
 	if serverID <= 0 {
 		return errors.New("server id is required")
 	}
@@ -12492,6 +12605,12 @@ func upsertUserEmailTrafficOn(ctx context.Context, ex sqlExecutor, serverID int6
 		float64(deltaUplink)*weight, float64(deltaDownlink)*weight,
 		newTotalUplink, newTotalDownlink, uplink, downlink, attributedUsername, existing.ID); err != nil {
 		return fmt.Errorf("update user email traffic: %w", err)
+	}
+	if err := addDailyEmailTraffic(ctx, ex, trafficLedgerDate(time.Now()), serverID, email, attributedUsername, deltaUplink, deltaDownlink, weight); err != nil {
+		return fmt.Errorf("update daily user email traffic: %w", err)
+	}
+	if err := addDailyUserNodeTraffic(ctx, ex, trafficLedgerDate(time.Now()), serverID, attributedUsername, nodeShares, deltaUplink, deltaDownlink, weight); err != nil {
+		return fmt.Errorf("update daily user node traffic: %w", err)
 	}
 	return nil
 }
@@ -12806,6 +12925,53 @@ func (r *TrafficRepository) ResetRemoteServerTrafficCycleAt(ctx context.Context,
 }
 
 // ==================== 流量快照 CRUD ====================
+
+// CreateServerDailySnapshots writes every daily baseline for one server in a
+// single transaction. A day can no longer end up with system/user snapshots
+// present but node snapshots missing: either all five dimensions commit, or
+// none do and the scheduler retries the whole server.
+func (r *TrafficRepository) CreateServerDailySnapshots(ctx context.Context, serverID int64, date string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	if serverID <= 0 {
+		return errors.New("server id is required")
+	}
+	if date == "" {
+		date = time.Now().Format("2006-01-02")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var inUp, inDown, outUp, outDown, userUp, userDown int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN type='inbound' THEN uplink ELSE 0 END),0),COALESCE(SUM(CASE WHEN type='inbound' THEN downlink ELSE 0 END),0),COALESCE(SUM(CASE WHEN type='outbound' THEN uplink ELSE 0 END),0),COALESCE(SUM(CASE WHEN type='outbound' THEN downlink ELSE 0 END),0) FROM node_traffic WHERE server_id=?`, serverID).Scan(&inUp, &inDown, &outUp, &outDown); err != nil {
+		return fmt.Errorf("read node totals: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(uplink),0),COALESCE(SUM(downlink),0) FROM user_traffic WHERE server_id=?`, serverID).Scan(&userUp, &userDown); err != nil {
+		return fmt.Errorf("read user totals: %w", err)
+	}
+	statements := []struct {
+		name, query string
+		args        []any
+	}{
+		{"traffic", `INSERT INTO traffic_snapshots(server_id,date,inbound_uplink,inbound_downlink,outbound_uplink,outbound_downlink,user_uplink,user_downlink,created_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(server_id,date) DO UPDATE SET inbound_uplink=excluded.inbound_uplink,inbound_downlink=excluded.inbound_downlink,outbound_uplink=excluded.outbound_uplink,outbound_downlink=excluded.outbound_downlink,user_uplink=excluded.user_uplink,user_downlink=excluded.user_downlink`, []any{serverID, date, inUp, inDown, outUp, outDown, userUp, userDown}},
+		{"node", `INSERT INTO node_traffic_snapshots(server_id,tag,type,date,uplink,downlink) SELECT server_id,tag,type,?,uplink,downlink FROM node_traffic WHERE server_id=? ON CONFLICT(server_id,tag,type,date) DO UPDATE SET uplink=excluded.uplink,downlink=excluded.downlink`, []any{date, serverID}},
+		{"user", `INSERT INTO user_traffic_snapshots(server_id,username,date,uplink,downlink) SELECT server_id,username,?,uplink,downlink FROM user_traffic WHERE server_id=? ON CONFLICT(server_id,username,date) DO UPDATE SET uplink=excluded.uplink,downlink=excluded.downlink`, []any{date, serverID}},
+		{"user-email", `INSERT INTO user_email_traffic_snapshots(server_id,email,date,uplink,downlink) SELECT server_id,email,?,uplink,downlink FROM user_email_traffic WHERE server_id=? ON CONFLICT(server_id,email,date) DO UPDATE SET uplink=excluded.uplink,downlink=excluded.downlink`, []any{date, serverID}},
+		{"system", `INSERT INTO server_system_traffic_snapshots(server_id,date,rx_cycle,tx_cycle) SELECT id,?,COALESCE(system_rx_cycle,0),COALESCE(system_tx_cycle,0) FROM remote_servers WHERE id=? ON CONFLICT(server_id,date) DO UPDATE SET rx_cycle=excluded.rx_cycle,tx_cycle=excluded.tx_cycle`, []any{date, serverID}},
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			return fmt.Errorf("write %s snapshot: %w", statement.name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit server daily snapshots: %w", err)
+	}
+	return nil
+}
 
 // 为服务器创建每日快照。
 func (r *TrafficRepository) CreateTrafficSnapshot(ctx context.Context, serverID int64, date string) error {
@@ -14058,6 +14224,32 @@ ON CONFLICT(server_id, date) DO UPDATE SET
 	return nil
 }
 
+// SystemTrafficSnapshotBackfillMarker prevents the old one-time startup repair
+// from running after a verified database-engine migration.
+const SystemTrafficSnapshotBackfillMarker = "system_traffic_offset_resync_v1_done"
+
+// BackfillMissingServerSystemTrafficSnapshots only fills absent historical
+// baselines. It must never rewrite the live system counters or the accounting
+// offset: those fields are the authoritative server-cycle state and changing
+// them after SQLite→PostgreSQL migration makes used traffic appear reset.
+func (r *TrafficRepository) BackfillMissingServerSystemTrafficSnapshots(ctx context.Context, serverID int64) (int64, error) {
+	if r == nil || r.db == nil {
+		return 0, errors.New("traffic repository not initialized")
+	}
+	result, err := r.db.ExecContext(ctx, `
+INSERT INTO server_system_traffic_snapshots (server_id, date, rx_cycle, tx_cycle)
+SELECT server_id, date, COALESCE(SUM(downlink),0), COALESCE(SUM(uplink),0)
+FROM node_traffic_snapshots
+WHERE server_id=?
+GROUP BY server_id,date
+ON CONFLICT(server_id,date) DO NOTHING`, serverID)
+	if err != nil {
+		return 0, fmt.Errorf("backfill missing system snapshots: %w", err)
+	}
+	count, _ := result.RowsAffected()
+	return count, nil
+}
+
 // CountServerSystemTrafficSnapshots 返回某 server 已有的 system snapshot 行数,
 // 启动 backfill 用此判断"上一轮切换时是否漏迁移"(< 7 视为需要补)。
 func (r *TrafficRepository) CountServerSystemTrafficSnapshots(ctx context.Context, serverID int64) (int, error) {
@@ -14260,6 +14452,7 @@ type UserEmailTrafficUpsert struct {
 	Downlink           int64
 	Weight             float64
 	AttributedUsername string
+	NodeShares         []WeightedNodeShare
 }
 
 type UserTrafficUpsert struct {
@@ -14320,7 +14513,7 @@ func (r *TrafficRepository) UpsertTrafficBatch(ctx context.Context, serverID int
 		if e.Email == "" {
 			continue
 		}
-		if err := upsertUserEmailTrafficOn(ctx, conn, serverID, e.Email, e.Uplink, e.Downlink, isXrayRestarted, e.Weight, e.AttributedUsername); err != nil {
+		if err := upsertUserEmailTrafficOn(ctx, conn, serverID, e.Email, e.Uplink, e.Downlink, isXrayRestarted, e.Weight, e.AttributedUsername, e.NodeShares); err != nil {
 			return fmt.Errorf("batch upsert user email traffic (%s): %w", e.Email, err)
 		}
 	}

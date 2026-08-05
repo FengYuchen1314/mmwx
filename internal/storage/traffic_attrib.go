@@ -34,6 +34,15 @@ type NodeShare struct {
 	Scale      int
 }
 
+// WeightedNodeShare freezes the node attribution and the exact billing weight
+// used for one ingestion delta. Weight already includes both the node
+// multiplier, the package traffic mode and the share divisor.
+type WeightedNodeShare struct {
+	NodeID   int64
+	RawShare float64
+	Weight   float64
+}
+
 // EmailAttribution 是一条 email 的归因结果。Username 为空表示丢弃(脏数据)。
 type EmailAttribution struct {
 	Username string
@@ -264,18 +273,29 @@ func (a *EmailAttributor) pickNode(serverName, tag, username string) (Node, bool
 //
 // 归因失败 / 用户无套餐 → 1.0(按裸量计费),保住旧实现"认不出就 ×1"的 fallback 语义。
 func (a *EmailAttributor) EmailWeight(email string, serverID int64) float64 {
+	_, shares, weight := a.BillingAttribution(email, serverID)
+	_ = shares
+	return weight
+}
+
+// BillingAttribution computes classification and billing weights once. The
+// collector persists both results, so later node/package edits cannot rewrite
+// historical drill-down attribution.
+func (a *EmailAttributor) BillingAttribution(email string, serverID int64) (EmailAttribution, []WeightedNodeShare, float64) {
 	at := a.Classify(email, serverID)
 	if at.Username == "" {
-		return 1.0
+		return at, nil, 1.0
 	}
 	pkg := a.pkgByUsername[at.Username]
 	if pkg == nil {
-		return 1.0
+		return at, rawWeightedShares(at.Shares), 1.0
 	}
 	// 节点无从确定(服务器已删 / 绑定的 tag 都没有对应节点)时,节点倍率按 1 处理,
 	// 但**套餐 oneway/twoway 倍率照常应用** —— 它只依赖 username,与节点、服务器都无关。
 	// 以前这里返回裸 1.0,把套餐倍率一起吞掉了。
-	w := 1.0
+	trafficMultiplier := float64(pkg.TrafficMultiplier())
+	w := trafficMultiplier
+	weightedShares := make([]WeightedNodeShare, 0, len(at.Shares))
 	if len(at.Shares) > 0 {
 		w = 0
 		for _, ns := range at.Shares {
@@ -283,13 +303,27 @@ func (a *EmailAttributor) EmailWeight(email string, serverID int64) float64 {
 			if scale < 1 {
 				scale = 1
 			}
-			w += pkg.MultiplierForNode(ns.NodeID) / float64(scale)
+			shareWeight := pkg.MultiplierForNode(ns.NodeID) * trafficMultiplier / float64(scale)
+			w += shareWeight
+			weightedShares = append(weightedShares, WeightedNodeShare{NodeID: ns.NodeID, RawShare: 1 / float64(scale), Weight: shareWeight})
 		}
 		if w == 0 {
-			w = 1.0
+			w = trafficMultiplier
 		}
 	}
-	return w * float64(pkg.TrafficMultiplier())
+	return at, weightedShares, w
+}
+
+func rawWeightedShares(shares []NodeShare) []WeightedNodeShare {
+	out := make([]WeightedNodeShare, 0, len(shares))
+	for _, ns := range shares {
+		scale := ns.Scale
+		if scale < 1 {
+			scale = 1
+		}
+		out = append(out, WeightedNodeShare{NodeID: ns.NodeID, RawShare: 1 / float64(scale), Weight: 1 / float64(scale)})
+	}
+	return out
 }
 
 // resolveUser 复刻 ResolveUsernameByEmail 的 #3/#4/#5(#1/#2 已在 Classify 前置处理)。

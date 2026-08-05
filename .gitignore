@@ -57,5 +57,9 @@ MCP_PLAN.md
 *_test.go
 !internal/storage/database_config_test.go
 !internal/storage/package_assignment_test.go
+!internal/storage/traffic_daily_ledger_test.go
+!internal/storage/traffic_ledger_stress_test.go
+!internal/storage/traffic_daily_backfill_test.go
+!internal/handler/traffic_period_baseline_test.go
 !internal/license/ip_region_test.go
 AGENTS.md

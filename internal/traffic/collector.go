@@ -3,6 +3,7 @@ package traffic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -447,9 +448,10 @@ func aggregateAndUpsertUserTraffic(ctx context.Context, repo userTrafficRepo, se
 
 	for emailKey, data := range userStats {
 		weight, attributed := 1.0, ""
+		var nodeShares []storage.WeightedNodeShare
 		if attr != nil {
-			weight = attr.EmailWeight(emailKey, serverID)
-			attributed = attr.Classify(emailKey, serverID).Username
+			at, shares, billingWeight := attr.BillingAttribution(emailKey, serverID)
+			weight, attributed, nodeShares = billingWeight, at.Username, shares
 		}
 		// 双写新表 — email 维度原样保留,即使解析不到 username 也写
 		// (野 client 也算"该 server 的 email 流量",前端可显示成"未识别节点";
@@ -460,6 +462,7 @@ func aggregateAndUpsertUserTraffic(ctx context.Context, repo userTrafficRepo, se
 			Downlink:           data.Downlink,
 			Weight:             weight,
 			AttributedUsername: attributed,
+			NodeShares:         nodeShares,
 		})
 
 		// user_traffic 仍按 ResolveUsernameByEmail 聚合(它是 per-server 视图/快照/limiter 的数据源,
@@ -514,29 +517,19 @@ func (c *Collector) CreateDailySnapshots(ctx context.Context) error {
 	}
 
 	date := time.Now().Format("2006-01-02")
+	var snapshotErrs []error
+	successfulServers := 0
 	for _, rs := range remoteServers {
-		if err := c.repo.CreateTrafficSnapshot(ctx, rs.ID, date); err != nil {
-			log.Printf("[Traffic Collector] Failed to create snapshot for server %s: %v", rs.Name, err)
+		if err := c.repo.CreateServerDailySnapshots(ctx, rs.ID, date); err != nil {
+			log.Printf("[Traffic Collector] Failed to atomically create daily snapshots for server %s: %v", rs.Name, err)
+			snapshotErrs = append(snapshotErrs, fmt.Errorf("server %s: %w", rs.Name, err))
+			continue
 		}
-		if err := c.repo.CreateNodeTrafficSnapshots(ctx, rs.ID, date); err != nil {
-			log.Printf("[Traffic Collector] Failed to create node snapshot for server %s: %v", rs.Name, err)
-		}
-		if err := c.repo.CreateUserTrafficSnapshots(ctx, rs.ID, date); err != nil {
-			log.Printf("[Traffic Collector] Failed to create user snapshot for server %s: %v", rs.Name, err)
-		}
-		// email 级快照 — 节点详情/用户详情按时间范围算"用户在某节点的增量"时减它的 baseline。
-		if err := c.repo.CreateUserEmailTrafficSnapshots(ctx, rs.ID, date); err != nil {
-			log.Printf("[Traffic Collector] Failed to create user-email snapshot for server %s: %v", rs.Name, err)
-		}
-		// Server system traffic baseline — server 视图 traffic_source='system' 模式下今日/本周/本月按钮算增量用。
-		// 即便该 server 当前 source='xray' 也照拍 — 用户后续切到 system 时,已有 baseline 可用。
-		if err := c.repo.CreateServerSystemTrafficSnapshot(ctx, rs.ID, date); err != nil {
-			log.Printf("[Traffic Collector] Failed to create server system snapshot for server %s: %v", rs.Name, err)
-		}
+		successfulServers++
 	}
 
-	log.Printf("[Traffic Collector] Created daily snapshots for %d servers", len(remoteServers))
-	return nil
+	log.Printf("[Traffic Collector] Daily snapshots completed: successful=%d failed=%d total=%d", successfulServers, len(remoteServers)-successfulServers, len(remoteServers))
+	return errors.Join(snapshotErrs...)
 }
 
 // 删除旧快照

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -1424,6 +1423,8 @@ func main() {
 	go trafficCollector.StartSpeedCollection(collectorCtx)
 	// 启动每日快照和清理任务
 	go startDailySnapshotTask(collectorCtx, trafficHandler, trafficCollector)
+	go startTrafficSnapshotBackfillTask(collectorCtx, repo)
+	go startTrafficLedgerAuditTask(collectorCtx, repo)
 	// WAL 巡检:每 5 分钟 wal_checkpoint(TRUNCATE),把 -wal 抽干并截断,防止长跑容器里 mmwx.db-wal 无界膨胀。
 	go startWALCheckpointTask(collectorCtx, repo)
 	// 每分钟检查数据库健康；一旦损坏或底层 I/O 失败，停止所有后台采集/写入任务并只告警一次。
@@ -1640,19 +1641,11 @@ func waitForShutdown(srv *http.Server, cancels ...context.CancelFunc) {
 	}
 }
 
-// backfillSystemSnapshotsForSwitchedServers 一次性修复上一轮 source 切换产生的两个 bug:
-//  1. daily snapshot baseline 缺失 → today/week/month 三个时间按钮显示同一固定值
-//  2. **更严重**:offset 锁在"oldDisplay - 小 system_raw"≈ xray total → 之后 cycle 被 SET 成 xray total
-//     又没动 offset → traffic_used = cycle + offset = 2 × xray total **翻倍**
-//
-// MigrateXraySnapshotsToSystem 现在同时 reset offset = 0,所以本函数对全部 system source server 跑一次
-// 即可修复以上两 bug。**用 system_settings 表里的 marker 控制只跑一次** — 跑完写 marker,后续启动检测到
-// marker 直接跳过。这样用户手动校准的 traffic_used(走 dialog "已用流量"字段触发 handler 的 offset 调整)
-// 不会被后续启动的 backfill 反复冲掉。
+// backfillSystemSnapshotsForSwitchedServers 为早期已切换到 system source、但缺少历史
+// system snapshot 的服务器补基线。这里只允许插入缺失快照，禁止修改 system cycle 和
+// traffic_used_offset；后两者是实时记账状态，数据库迁移后覆写会造成服务器流量归零。
 //
 // 启动后 30s 延迟跑,避开启动峰值;失败只 log,不阻塞主控。
-const backfillSystemTrafficOffsetResyncMarker = "system_traffic_offset_resync_v1_done"
-
 func backfillSystemSnapshotsForSwitchedServers(ctx context.Context, repo *storage.TrafficRepository) {
 	select {
 	case <-ctx.Done():
@@ -1664,7 +1657,7 @@ func backfillSystemSnapshotsForSwitchedServers(ctx context.Context, repo *storag
 	defer cancel()
 
 	// marker 检查 — 已跑过就跳过,保护用户手动校准不被覆盖
-	if val, err := repo.GetSystemSetting(scanCtx, backfillSystemTrafficOffsetResyncMarker); err == nil && val != "" {
+	if val, err := repo.GetSystemSetting(scanCtx, storage.SystemTrafficSnapshotBackfillMarker); err == nil && val != "" {
 		log.Printf("[Backfill SystemSnap] one-time resync already done at %s, skip", val)
 		return
 	}
@@ -1675,25 +1668,27 @@ func backfillSystemSnapshotsForSwitchedServers(ctx context.Context, repo *storag
 		return
 	}
 
-	migrated := 0
+	backfilled := int64(0)
 	for _, s := range servers {
 		if s.TrafficSource != "system" {
 			continue
 		}
-		if err := repo.MigrateXraySnapshotsToSystem(scanCtx, s.ID); err != nil {
-			log.Printf("[Backfill SystemSnap] migrate server %d (%s) failed: %v", s.ID, s.Name, err)
+		inserted, err := repo.BackfillMissingServerSystemTrafficSnapshots(scanCtx, s.ID)
+		if err != nil {
+			log.Printf("[Backfill SystemSnap] backfill server %d (%s) failed: %v", s.ID, s.Name, err)
 			continue
 		}
-		migrated++
-		log.Printf("[Backfill SystemSnap] server %d (%s) migrated xray history → system, offset reset to 0",
-			s.ID, s.Name)
+		backfilled += inserted
+		if inserted > 0 {
+			log.Printf("[Backfill SystemSnap] server %d (%s) added %d missing snapshot(s); live cycle and offset preserved", s.ID, s.Name, inserted)
+		}
 	}
-	if migrated > 0 {
-		log.Printf("[Backfill SystemSnap] one-time resync done: migrated %d server(s)", migrated)
+	if backfilled > 0 {
+		log.Printf("[Backfill SystemSnap] safe one-time backfill done: added %d snapshot(s)", backfilled)
 	}
 
 	// 写 marker — 即便没 migrate 任何 server(全是 xray source)也写,避免每次启动重复扫
-	if err := repo.SetSystemSetting(scanCtx, backfillSystemTrafficOffsetResyncMarker, time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if err := repo.SetSystemSetting(scanCtx, storage.SystemTrafficSnapshotBackfillMarker, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		log.Printf("[Backfill SystemSnap] write marker failed: %v", err)
 	}
 }
@@ -1781,45 +1776,49 @@ func startDailySnapshotTask(ctx context.Context, trafficHandler *handler.Traffic
 	runWithRetry := func() error {
 		logger.Info("[流量收集器] 开始每日流量收集", "start_time", time.Now().Format("2006-01-02 15:04:05"))
 
-		maxRetries := 3
 		retryDelay := 30 * time.Second
+		snapshotDone := false
 
-		for attempt := 1; attempt <= maxRetries; attempt++ {
+		for attempt := 1; ; attempt++ {
 			runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			err := trafficHandler.RecordDailyUsage(runCtx)
 			cancel()
 
-			if err == nil {
+			// Snapshot collection is independent from the aggregate summary. A
+			// temporary summary failure must never suppress the period baselines.
+			var snapshotErr error
+			if trafficCollector != nil && !snapshotDone {
+				snapCtx, snapCancel := context.WithTimeout(ctx, 60*time.Second)
+				snapshotErr = trafficCollector.CreateDailySnapshots(snapCtx)
+				snapCancel()
+				snapshotDone = snapshotErr == nil
+			}
+			if err == nil && snapshotErr == nil {
 				logger.Info("[流量收集器] 每日流量收集成功")
-				// RecordDailyUsage 只写了 daily_usage 聚合表。前端「今天/本周」筛选需要的
-				// node_traffic_snapshots + user_traffic_snapshots 必须靠 collector 单独跑 —
-				// 老 bug:从来没人调过这俩函数,导致快照表永远空,「今天/本周」实际显示全月数据。
-				if trafficCollector != nil {
-					snapCtx, snapCancel := context.WithTimeout(ctx, 60*time.Second)
-					if serr := trafficCollector.CreateDailySnapshots(snapCtx); serr != nil {
-						logger.Error("[流量收集器] 节点/用户快照保存失败", "error", serr)
-					}
-					snapCancel()
-				}
 				return nil
 			}
+			if snapshotErr != nil {
+				logger.Error("[流量收集器] 节点/用户快照保存失败", "error", snapshotErr)
+				err = errors.Join(err, snapshotErr)
+			}
 
-			logger.Warn("[流量收集器] 每日流量收集失败", "attempt", attempt, "max_retries", maxRetries, "error", err)
-
-			if attempt < maxRetries {
-				logger.Info("[流量收集器] 准备重试", "delay", retryDelay)
-				select {
-				case <-ctx.Done():
-					logger.Info("[流量收集器] 重试已取消（服务器关闭）")
-					return ctx.Err()
-				case <-time.After(retryDelay):
-					// 继续重试
+			logger.Warn("[流量收集器] 每日快照尚未完整落库，将持续重试", "attempt", attempt, "error", err)
+			logger.Info("[流量收集器] 准备重试", "delay", retryDelay)
+			select {
+			case <-ctx.Done():
+				logger.Info("[流量收集器] 重试已取消（服务器关闭）")
+				return ctx.Err()
+			case <-time.After(retryDelay):
+			}
+			// Permanent outages should not create a tight loop. Retry quickly at
+			// first, then cap at five minutes until the database recovers.
+			if retryDelay < 5*time.Minute {
+				retryDelay *= 2
+				if retryDelay > 5*time.Minute {
+					retryDelay = 5 * time.Minute
 				}
 			}
 		}
-
-		logger.Error("[流量收集器] 达到最大重试次数后仍失败", "max_retries", maxRetries)
-		return fmt.Errorf("每日流量收集重试 %d 次后仍失败", maxRetries)
 	}
 
 	// 启动后不立即跑,改为等到下一个 00:00:00 触发第一次,之后每 24h 一次。
@@ -1857,6 +1856,79 @@ func startDailySnapshotTask(ctx context.Context, trafficHandler *handler.Traffic
 			return
 		case <-ticker.C:
 			recorded()
+		}
+	}
+}
+
+func startTrafficLedgerAuditTask(ctx context.Context, repo *storage.TrafficRepository) {
+	if repo == nil {
+		return
+	}
+	run := func() {
+		taskrun.Record(ctx, "traffic_ledger_audit", func() (string, error) {
+			checkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer cancel()
+			return repo.AuditDailyTrafficLedger(checkCtx, time.Now())
+		})
+	}
+	// Give collectors one minute to establish their first baselines.
+	timer := time.NewTimer(time.Minute)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		run()
+	}
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
+func startTrafficSnapshotBackfillTask(ctx context.Context, repo *storage.TrafficRepository) {
+	if repo == nil {
+		return
+	}
+	// Let the HTTP service and collectors finish starting first. The migration
+	// reads only immutable dates before the live ledger boundary and retries
+	// until its transaction and completion marker commit together.
+	timer := time.NewTimer(15 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	for {
+		var result storage.TrafficDailyBackfillResult
+		var migrationErr error
+		taskrun.Record(ctx, "traffic_snapshot_backfill", func() (string, error) {
+			migrationCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+			defer cancel()
+			result, migrationErr = repo.BackfillDailyTrafficLedgerFromSnapshots(migrationCtx)
+			return result.String(), migrationErr
+		})
+		if migrationErr == nil && result.AlreadyDone {
+			return
+		}
+		if migrationErr == nil {
+			logger.Info("[流量账本迁移] 历史快照迁移完成", "result", result.String())
+			return
+		}
+		logger.Error("[流量账本迁移] 历史快照迁移失败，将自动重试", "error", migrationErr)
+		retry := time.NewTimer(5 * time.Minute)
+		select {
+		case <-ctx.Done():
+			retry.Stop()
+			return
+		case <-retry.C:
 		}
 	}
 }
@@ -1957,17 +2029,19 @@ func startLogCleanup() {
 	}
 }
 
-// startTaskRunCleanup 只保留最近两天的定时任务运行记录。
+const taskRunRetention = 7 * 24 * time.Hour
+
+// startTaskRunCleanup 只保留最近七天的定时任务运行记录。
 // 启动时立即清理，之后每小时巡检，避免长期运行时 task_runs 持续增长。
 func startTaskRunCleanup(ctx context.Context, repo *storage.TrafficRepository) {
 	cleanup := func() {
-		deleted, err := repo.DeleteOldTaskRuns(ctx, time.Now().Add(-48*time.Hour))
+		deleted, err := repo.DeleteOldTaskRuns(ctx, time.Now().Add(-taskRunRetention))
 		if err != nil {
 			logger.Error("[定时任务日志] 清理过期记录失败", "error", err)
 			return
 		}
 		if deleted > 0 {
-			logger.Info("[定时任务日志] 已清理两天前的记录", "count", deleted)
+			logger.Info("[定时任务日志] 已清理七天前的记录", "count", deleted)
 		}
 	}
 	cleanup()
