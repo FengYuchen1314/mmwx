@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,15 +37,21 @@ func (h *RuleTemplatesHandler) canModifyRuleTemplate(r *http.Request, filename s
 }
 
 func (h *RuleTemplatesHandler) canViewRuleTemplate(r *http.Request, filename string) bool {
-	username := auth.UsernameFromContext(r.Context())
-	if h.repo == nil || userIsAdmin(r.Context(), h.repo, username) {
+	return canUserViewRuleTemplate(r.Context(), h.repo, auth.UsernameFromContext(r.Context()), filename)
+}
+
+// canUserViewRuleTemplate 是 rule_templates 文件的统一后端可见性判定。
+// 普通用户只能看到管理员允许公开的模板以及自己上传的模板；所有读取、预览、
+// 订阅绑定入口都必须调用它，不能只在列表接口过滤。
+func canUserViewRuleTemplate(ctx context.Context, repo *storage.TrafficRepository, username, filename string) bool {
+	if repo == nil || userIsAdmin(ctx, repo, username) {
 		return true
 	}
-	owner, err := h.repo.GetRuleTemplateOwner(r.Context(), filename)
+	owner, err := repo.GetRuleTemplateOwner(ctx, filename)
 	if err != nil || owner == "" {
-		return !h.loadHiddenRuleTemplates(r)[filename]
+		return !loadRuleTemplateFilenameSet(ctx, repo, settingUserHiddenRuleTemplates)[filename]
 	}
-	return owner == username || h.loadVisibleOwnedRuleTemplates(r)[filename]
+	return owner == username || loadRuleTemplateFilenameSet(ctx, repo, settingUserVisibleOwnedRuleTemplates)[filename]
 }
 
 const (
@@ -70,11 +77,15 @@ func (h *RuleTemplatesHandler) loadVisibleOwnedRuleTemplates(r *http.Request) ma
 }
 
 func (h *RuleTemplatesHandler) loadRuleTemplateFilenameSet(r *http.Request, key string) map[string]bool {
+	return loadRuleTemplateFilenameSet(r.Context(), h.repo, key)
+}
+
+func loadRuleTemplateFilenameSet(ctx context.Context, repo *storage.TrafficRepository, key string) map[string]bool {
 	set := map[string]bool{}
-	if h.repo == nil {
+	if repo == nil {
 		return set
 	}
-	raw, _ := h.repo.GetSystemSetting(r.Context(), key)
+	raw, _ := repo.GetSystemSetting(ctx, key)
 	if strings.TrimSpace(raw) == "" {
 		return set
 	}

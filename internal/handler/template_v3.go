@@ -109,6 +109,11 @@ func (h *TemplateV3Handler) handleProcessTemplate(w http.ResponseWriter, r *http
 		writeJSONError(w, http.StatusBadRequest, "无效的模板名称")
 		return
 	}
+	username := auth.UsernameFromContext(r.Context())
+	if !canUserViewRuleTemplate(r.Context(), h.repo, username, templateName) {
+		writeJSONError(w, http.StatusForbidden, "无权使用该模板")
+		return
+	}
 
 	// Read template file
 	templatesDir := "rule_templates"
@@ -185,6 +190,11 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 		writeJSONError(w, http.StatusBadRequest, "无效的模板文件名")
 		return
 	}
+	username := auth.UsernameFromContext(r.Context())
+	if !canUserViewRuleTemplate(r.Context(), h.repo, username, req.TemplateFilename) {
+		writeJSONError(w, http.StatusForbidden, "无权使用该模板")
+		return
+	}
 
 	// Read template file
 	templatesDir := "rule_templates"
@@ -201,7 +211,6 @@ func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http
 	}
 
 	// Get nodes from database
-	username := auth.UsernameFromContext(r.Context())
 	nodes, err := h.repo.ListNodes(r.Context(), username)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "获取节点列表失败")
@@ -845,6 +854,7 @@ func (h *TemplateV3Handler) handleListTemplates(w http.ResponseWriter, r *http.R
 	}
 
 	var templates []templateInfo
+	username := auth.UsernameFromContext(r.Context())
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -853,6 +863,9 @@ func (h *TemplateV3Handler) handleListTemplates(w http.ResponseWriter, r *http.R
 		isClash := strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml")
 		isSurge := strings.HasSuffix(name, ".conf")
 		if !isClash && !isSurge {
+			continue
+		}
+		if !canUserViewRuleTemplate(r.Context(), h.repo, username, name) {
 			continue
 		}
 

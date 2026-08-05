@@ -193,6 +193,10 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 	}
 
 	username := auth.UsernameFromContext(r.Context())
+	if req.TemplateFilename != "" && !canUserViewRuleTemplate(r.Context(), h.repo, username, req.TemplateFilename) {
+		writeError(w, http.StatusForbidden, errors.New("无权使用该模板"))
+		return
+	}
 
 	// 安全:校验文件名(防路径穿越)+ 统一扩展名。
 	sanitizedName, serr := sanitizeSubscribeFilename(req.Filename)
@@ -558,6 +562,10 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	// 非 nil + 值变化 = 用户主动改 → 需要管理员权限。
 	if !isAdmin && req.CustomShortCode != nil && *req.CustomShortCode != existing.CustomShortCode {
 		writeError(w, http.StatusForbidden, errors.New("只有管理员可以编辑短码"))
+		return
+	}
+	if req.TemplateFilename != "" && !canUserViewRuleTemplate(r.Context(), h.repo, uname, req.TemplateFilename) {
+		writeError(w, http.StatusForbidden, errors.New("无权使用该模板"))
 		return
 	}
 
