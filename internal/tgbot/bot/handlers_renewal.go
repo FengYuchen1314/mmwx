@@ -72,7 +72,7 @@ func (s *Service) handleRenewalCallback(ctx context.Context, b *bot.Bot, update 
 	if cq == nil || cq.From.ID == 0 {
 		return
 	}
-	if !s.cfg.IsAdmin(cq.From.ID) {
+	if !s.isAdminTG(ctx, cq.From.ID) {
 		_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cq.ID, Text: "仅管理员可操作", ShowAlert: true})
 		return
 	}

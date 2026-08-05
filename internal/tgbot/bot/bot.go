@@ -58,6 +58,18 @@ func New(cfg config.Config, client *mmwxclient.Client) *Service {
 	return s
 }
 
+// isAdminTG is the single authorization source for TG administrative actions.
+// The configured allowlist alone is not sufficient: IDs can be stale or can
+// later register/bind to a normal account. Require the signed TG identity to be
+// bound to an active master account whose current role is still admin.
+func (s *Service) isAdminTG(ctx context.Context, tgID int64) bool {
+	if tgID == 0 || !s.cfg.IsAdmin(tgID) {
+		return false
+	}
+	info, err := s.client.UserByTG(ctx, tgID)
+	return err == nil && info != nil && info.Bound && info.IsActive && info.Role == "admin"
+}
+
 func (s *Service) Start(parent context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

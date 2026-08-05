@@ -17,7 +17,7 @@ func (s *Service) handleAdminInvite(ctx context.Context, b *bot.Bot, update *mod
 	chatID := update.Message.Chat.ID
 	tgID := update.Message.From.ID
 
-	if !s.cfg.IsAdmin(tgID) {
+	if !s.isAdminTG(ctx, tgID) {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "本命令仅管理员可用。"})
 		return
 	}
@@ -83,7 +83,7 @@ func (s *Service) handleAdminUser(ctx context.Context, b *bot.Bot, update *model
 	chatID := update.Message.Chat.ID
 	tgID := update.Message.From.ID
 
-	if !s.cfg.IsAdmin(tgID) {
+	if !s.isAdminTG(ctx, tgID) {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "本命令仅管理员可用。"})
 		return
 	}
@@ -111,7 +111,7 @@ func (s *Service) handleAnnounce(ctx context.Context, b *bot.Bot, update *models
 	}
 	chatID := update.Message.Chat.ID
 	tgID := update.Message.From.ID
-	if !s.cfg.IsAdmin(tgID) {
+	if !s.isAdminTG(ctx, tgID) {
 		_, _ = b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "本命令仅管理员可用。"})
 		return
 	}

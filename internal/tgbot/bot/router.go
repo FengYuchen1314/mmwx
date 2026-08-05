@@ -51,6 +51,9 @@ func (s *Service) setMyCommands(ctx context.Context, b *bot.Bot) {
 		models.BotCommand{Command: "announce", Description: "发布公告(广播给所有用户)"},
 	)
 	for _, id := range s.cfg.AdminTGIDs {
+		if !s.isAdminTG(ctx, id) {
+			continue
+		}
 		_, _ = b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
 			Commands: adminCmds,
 			Scope:    &models.BotCommandScopeChat{ChatID: id},

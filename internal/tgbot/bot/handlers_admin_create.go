@@ -64,7 +64,7 @@ func (s *Service) handleInviteCallback(ctx context.Context, b *bot.Bot, update *
 	// 先应答,消掉按钮 loading 转圈
 	defer b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cq.ID})
 
-	if !s.cfg.IsAdmin(cq.From.ID) {
+	if !s.isAdminTG(ctx, cq.From.ID) {
 		_, _ = b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
 			CallbackQueryID: cq.ID, Text: "仅管理员可用", ShowAlert: true,
 		})

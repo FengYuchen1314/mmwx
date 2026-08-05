@@ -157,7 +157,8 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	}
 	username := info.Username
 
-	resp := map[string]any{"bound": true, "is_admin": s.cfg.IsAdmin(tgID)}
+	isAdmin := s.cfg.IsAdmin(tgID) && info.Bound && info.IsActive && info.Role == "admin"
+	resp := map[string]any{"bound": true, "is_admin": isAdmin}
 	if renewals, err := s.client.RenewalRequestHistory(ctx, tgID); err == nil {
 		resp["renewal_requests"] = renewals
 		if len(renewals) > 0 {
@@ -260,7 +261,7 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	resp["subscriptions"] = subs
 
 	// 管理员主页始终使用全局视图：订阅管理第一条、所有非零流量节点、全部服务器状态。
-	if s.cfg.IsAdmin(tgID) {
+	if isAdmin {
 		resp["subscriptions"] = []map[string]any{}
 		if sv, err := s.client.GetAdminSubview(ctx, username); err == nil && sv != nil {
 			if sv.Subscription != nil {
@@ -458,7 +459,7 @@ func (s *Service) adminTGID(w http.ResponseWriter, r *http.Request) (int64, bool
 		writeJSONResp(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return 0, false
 	}
-	if !s.cfg.IsAdmin(tgID) {
+	if !s.isAdminTG(r.Context(), tgID) {
 		writeJSONResp(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
 		return 0, false
 	}
