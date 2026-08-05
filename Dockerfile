@@ -60,6 +60,9 @@ RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build \
     -o /app/server \
     ./cmd/server
 
+# 与默认 Compose 的 PostgreSQL 17 保持一致，避免旧版 pg_dump 无法备份新版服务端。
+FROM postgres:17-bookworm AS postgres-client
+
 # Final stage - 用 nginx 官方 Docker base(mainline-bookworm),跟 install-nginx.sh 同款"最新 nginx mainline"语义。
 # 该镜像默认编译 --with-http_v3_module 且静态链 QuicTLS,完整支持 listen ... quic;
 # 之前 debian:bookworm-slim apt 装的 nginx 1.22.1 不带 HTTP/3 模块,EnableHTTPS 写入含 quic 指令的
@@ -78,6 +81,7 @@ WORKDIR /app
 # 由 ensureNginxRunning 处理。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+	libpq5 \
     tzdata \
     gosu \
     wget \
@@ -89,6 +93,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sfn /etc/nginx/servers        /usr/local/nginx/servers \
     && ln -sfn /etc/nginx/stream_servers /usr/local/nginx/stream_servers \
     && ln -sfn /etc/nginx/html           /usr/local/nginx/html
+
+COPY --from=postgres-client /usr/lib/postgresql/17/bin/pg_dump /usr/local/bin/pg_dump
+COPY --from=postgres-client /usr/lib/postgresql/17/bin/pg_restore /usr/local/bin/pg_restore
 
 # Create non-root user
 RUN groupadd -g 1000 appuser && \

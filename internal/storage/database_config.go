@@ -12,6 +12,7 @@ import (
 )
 
 const DatabaseConfigFilename = "database.json"
+const DatabaseRestoreRollbackFilename = "database.restore-rollback.json"
 
 var databaseEnvironmentKeys = []string{
 	"MMWX_DATABASE_DRIVER", "MMWX_DATABASE_PATH", "MMWX_DATABASE_HOST",
@@ -205,17 +206,47 @@ func (c *DatabaseConfig) Validate() error {
 }
 
 func SaveDatabaseConfig(dataDir string, cfg DatabaseConfig) error {
+	return saveDatabaseConfigFile(filepath.Join(dataDir, DatabaseConfigFilename), cfg)
+}
+
+func SaveDatabaseRestoreRollback(dataDir string, cfg DatabaseConfig) error {
+	return saveDatabaseConfigFile(filepath.Join(dataDir, DatabaseRestoreRollbackFilename), cfg)
+}
+
+func LoadDatabaseRestoreRollback(dataDir string) (DatabaseConfig, error) {
+	raw, err := os.ReadFile(filepath.Join(dataDir, DatabaseRestoreRollbackFilename))
+	if err != nil {
+		return DatabaseConfig{}, err
+	}
+	var cfg DatabaseConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return DatabaseConfig{}, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return DatabaseConfig{}, err
+	}
+	return cfg, nil
+}
+
+func ClearDatabaseRestoreRollback(dataDir string) error {
+	err := os.Remove(filepath.Join(dataDir, DatabaseRestoreRollbackFilename))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func saveDatabaseConfigFile(target string, cfg DatabaseConfig) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	target := filepath.Join(dataDir, DatabaseConfigFilename)
 	tmp := target + ".tmp"
 	if err := os.WriteFile(tmp, append(raw, '\n'), 0600); err != nil {
 		return err

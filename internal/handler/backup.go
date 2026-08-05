@@ -3,13 +3,18 @@ package handler
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,7 +23,7 @@ import (
 
 // NewBackupDownloadHandler 返回一个创建并下载 ZIP 备份的处理程序。
 // 该处理程序需要管理员身份验证。
-func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
+func NewBackupDownloadHandler(repo *storage.TrafficRepository, dataDir string) http.Handler {
 	if repo == nil {
 		panic("backup download handler requires repository")
 	}
@@ -28,15 +33,23 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 			writeBackupError(w, http.StatusMethodNotAllowed, errors.New("only GET or POST is supported"))
 			return
 		}
-		if repo.DatabaseDriver() == "postgres" {
-			writeBackupError(w, http.StatusNotImplemented, errors.New("PostgreSQL 数据库请使用 pg_dump 备份；当前 ZIP 备份不包含 PostgreSQL 数据，已拒绝生成不完整备份"))
-			return
-		}
+		isPostgres := repo.DatabaseDriver() == "postgres"
+		// PostgreSQL 数据库体积可能很大，因此仅在管理员明确勾选时导出。
+		// SQLite 数据库位于 data/ 中，保持原有的完整备份行为。
+		includeDatabase := !isPostgres || r.URL.Query().Get("include_database") == "true"
 
-		// 检查点 WAL 确保所有数据都写入主数据库文件
-		if err := repo.Checkpoint(); err != nil {
-			writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("failed to checkpoint database: %w", err))
-			return
+		// SQLite 先 checkpoint；PostgreSQL 由 pg_dump 自己建立一致性快照。
+		if !isPostgres {
+			if err := repo.Checkpoint(); err != nil {
+				writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("failed to checkpoint database: %w", err))
+				return
+			}
+		}
+		if includeDatabase {
+			if err := repo.QuickCheck(r.Context()); err != nil {
+				writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("数据库健康检查失败: %w", err))
+				return
+			}
 		}
 
 		// data/ 同时包含 SQLite、ACME/上传证书及已持久化的自签证书(data/certs)。
@@ -44,11 +57,32 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 		// 先把 zip 打进内存再输出，打包错误仍能正常回 4xx/5xx。
 		var zipBuf bytes.Buffer
 		zipWriter := zip.NewWriter(&zipBuf)
-		if err := addDirToZip(zipWriter, "data", "data"); err != nil {
+		if isPostgres && includeDatabase {
+			dump, err := createPostgresDump(r.Context(), repo.DatabaseConfig())
+			if err != nil {
+				_ = zipWriter.Close()
+				writeBackupError(w, http.StatusInternalServerError, err)
+				return
+			}
+			if err := addBytesToZip(zipWriter, "database/postgres.dump", dump); err != nil {
+				writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("打包 PostgreSQL 数据失败: %w", err))
+				return
+			}
+			manifest, _ := json.MarshalIndent(map[string]any{
+				"format": "mmwx-database-backup-v1", "driver": "postgres",
+				"created_at": time.Now().Format(time.RFC3339), "dump_format": "custom",
+			}, "", "  ")
+			if err := addBytesToZip(zipWriter, "database/manifest.json", append(manifest, '\n')); err != nil {
+				writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("打包数据库元数据失败: %w", err))
+				return
+			}
+		}
+		if err := addDirToZip(zipWriter, dataDir, "data"); err != nil {
 			writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("打包 data 失败: %w", err))
 			return
 		}
-		if err := addDirToZip(zipWriter, "subscribes", "subscribes"); err != nil {
+		subscribeDir := filepath.Join(filepath.Dir(dataDir), "subscribes")
+		if err := addDirToZip(zipWriter, subscribeDir, "subscribes"); err != nil {
 			writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("打包 subscribes 失败: %w", err))
 			return
 		}
@@ -64,10 +98,50 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository) http.Handler {
 	})
 }
 
+func createPostgresDump(ctx context.Context, cfg storage.DatabaseConfig) ([]byte, error) {
+	bin, err := exec.LookPath("pg_dump")
+	if err != nil {
+		return nil, errors.New("未找到 pg_dump，无法创建 PostgreSQL 备份；Docker 请升级并重建最新镜像，裸机请安装与数据库服务端同版本或更高版本的 PostgreSQL client")
+	}
+	dumpCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(dumpCtx, bin,
+		"--format=custom", "--compress=6", "--no-owner", "--no-privileges",
+		"--host", cfg.Host, "--port", strconv.Itoa(cfg.Port),
+		"--username", cfg.Username, "--dbname", cfg.Database,
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+cfg.Password, "PGSSLMODE="+cfg.SSLMode)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	dump, err := cmd.Output()
+	if err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		return nil, fmt.Errorf("PostgreSQL 备份失败: %s", message)
+	}
+	if len(dump) < 5 || string(dump[:5]) != "PGDMP" {
+		return nil, errors.New("PostgreSQL 备份失败：pg_dump 未返回有效的 custom dump")
+	}
+	return dump, nil
+}
+
+func addBytesToZip(writer *zip.Writer, name string, data []byte) error {
+	header := &zip.FileHeader{Name: name, Method: zip.Store}
+	header.SetModTime(time.Now())
+	dst, err := writer.CreateHeader(header)
+	if err != nil {
+		return err
+	}
+	_, err = dst.Write(data)
+	return err
+}
+
 // NewBackupRestoreHandler 返回一个从备份恢复的处理程序。
 // 备份以普通 ZIP 格式上传，不需要密码。
 // 该处理程序需要管理员身份验证。
-func NewBackupRestoreHandler(repo *storage.TrafficRepository) http.Handler {
+func NewBackupRestoreHandler(repo *storage.TrafficRepository, dataDir string) http.Handler {
 	if repo == nil {
 		panic("backup restore handler requires repository")
 	}
@@ -77,26 +151,29 @@ func NewBackupRestoreHandler(repo *storage.TrafficRepository) http.Handler {
 			writeBackupError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
 			return
 		}
-		if repo.DatabaseDriver() == "postgres" {
-			writeBackupError(w, http.StatusNotImplemented, errors.New("当前使用 PostgreSQL，不能用 SQLite ZIP 覆盖恢复；请使用 pg_restore 恢复数据库，并单独还原 data/subscribes 目录"))
-			return
-		}
-
-		if err := restoreFromRequest(w, r); err != nil {
+		result, err := restoreFromRequest(w, r, repo, dataDir)
+		if err != nil {
 			return // restoreFromRequest 内部已写错误响应
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"message": "备份恢复成功，请重启服务或刷新页面",
+			"message":    "备份恢复成功，主控正在重启",
+			"restarting": strconv.FormatBool(result.databaseSwitched),
 		})
+		if result.databaseSwitched {
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				_ = SignalGracefulRestart()
+			}()
+		}
 	})
 }
 
 // NewSetupRestoreBackupHandler 返回用于在初始设置期间恢复备份的处理程序。
 // 该处理程序不需要身份验证，但仅在系统未初始化(无用户)时可用。
-func NewSetupRestoreBackupHandler(repo *storage.TrafficRepository) http.Handler {
+func NewSetupRestoreBackupHandler(repo *storage.TrafficRepository, dataDir string) http.Handler {
 	if repo == nil {
 		panic("setup restore backup handler requires repository")
 	}
@@ -118,35 +195,47 @@ func NewSetupRestoreBackupHandler(repo *storage.TrafficRepository) http.Handler 
 			return
 		}
 
-		if err := restoreFromRequest(w, r); err != nil {
+		result, err := restoreFromRequest(w, r, repo, dataDir)
+		if err != nil {
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"message": "备份恢复成功，请刷新页面后登录",
+			"message":    "备份恢复成功，请刷新页面后登录",
+			"restarting": strconv.FormatBool(result.databaseSwitched),
 		})
+		if result.databaseSwitched {
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				_ = SignalGracefulRestart()
+			}()
+		}
 	})
+}
+
+type backupRestoreResult struct {
+	databaseSwitched bool
 }
 
 // restoreFromRequest 读取上传的备份(加密或旧明文),解密(如需要)后提取到 data/ 与 subscribes/。
 // 出错时已写好响应并返回非 nil,调用方据此直接 return。
-func restoreFromRequest(w http.ResponseWriter, r *http.Request) error {
-	// 将上传大小限制为 100MB
-	r.Body = http.MaxBytesReader(w, r.Body, 100<<20)
+func restoreFromRequest(w http.ResponseWriter, r *http.Request, repo *storage.TrafficRepository, dataDir string) (backupRestoreResult, error) {
+	// PostgreSQL custom dump 通常远大于旧 SQLite 备份。
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<30)
 
 	file, _, err := r.FormFile("backup")
 	if err != nil {
 		writeBackupError(w, http.StatusBadRequest, fmt.Errorf("failed to read backup file: %w", err))
-		return err
+		return backupRestoreResult{}, err
 	}
 	defer file.Close()
 
 	data, err := io.ReadAll(file)
 	if err != nil {
 		writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("failed to read backup file: %w", err))
-		return err
+		return backupRestoreResult{}, err
 	}
 
 	if isLegacyEncryptedBackup(data) {
@@ -154,21 +243,63 @@ func restoreFromRequest(w http.ResponseWriter, r *http.Request) error {
 		if passphrase == "" {
 			err := errors.New("这是旧版加密备份，请填写原备份密码")
 			writeBackupError(w, http.StatusBadRequest, err)
-			return err
+			return backupRestoreResult{}, err
 		}
 		plain, decryptErr := decryptLegacyBackup(data, passphrase)
 		if decryptErr != nil {
 			writeBackupError(w, http.StatusBadRequest, decryptErr)
-			return decryptErr
+			return backupRestoreResult{}, decryptErr
 		}
 		data = plain
 	}
 
-	if err := extractBackupFromBytes(data); err != nil {
-		writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("failed to extract backup: %w", err))
-		return err
+	dump, hasPostgresDump, err := postgresDumpFromBackup(data)
+	if err != nil {
+		writeBackupError(w, http.StatusBadRequest, err)
+		return backupRestoreResult{}, err
 	}
-	return nil
+	if hasPostgresDump {
+		if repo.DatabaseDriver() != "postgres" {
+			err := errors.New("PostgreSQL 数据库备份只能恢复到已配置 PostgreSQL 的主控")
+			writeBackupError(w, http.StatusConflict, err)
+			return backupRestoreResult{}, err
+		}
+		if storage.DatabaseConfigUsesEnvironment() {
+			err := errors.New("数据库连接由 MMWX_DATABASE_* 环境变量管理，无法安全切换到恢复数据库；请改用 database.json 配置后重试")
+			writeBackupError(w, http.StatusConflict, err)
+			return backupRestoreResult{}, err
+		}
+		newConfig, restoreErr := restorePostgresToStaging(r.Context(), dump, repo.DatabaseConfig())
+		if restoreErr != nil {
+			writeBackupError(w, http.StatusInternalServerError, restoreErr)
+			return backupRestoreResult{}, restoreErr
+		}
+		// PostgreSQL 模式绝不能从备份覆盖 database.json，否则会重新指向
+		// 制作备份时的数据库，绕过已验证的新库。
+		if err := extractBackupFromBytesForRuntime(data, true, dataDir); err != nil {
+			dropPostgresDatabase(repo.DatabaseConfig(), newConfig.Database)
+			writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("failed to extract backup: %w", err))
+			return backupRestoreResult{}, err
+		}
+		if err := storage.SaveDatabaseRestoreRollback(dataDir, repo.DatabaseConfig()); err != nil {
+			dropPostgresDatabase(repo.DatabaseConfig(), newConfig.Database)
+			writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("保存数据库恢复回滚配置失败: %w", err))
+			return backupRestoreResult{}, err
+		}
+		if err := storage.SaveDatabaseConfig(dataDir, newConfig); err != nil {
+			_ = storage.ClearDatabaseRestoreRollback(dataDir)
+			dropPostgresDatabase(repo.DatabaseConfig(), newConfig.Database)
+			writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("切换恢复数据库失败: %w", err))
+			return backupRestoreResult{}, err
+		}
+		return backupRestoreResult{databaseSwitched: true}, nil
+	}
+
+	if err := extractBackupFromBytesForRuntime(data, repo.DatabaseDriver() == "postgres", dataDir); err != nil {
+		writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("failed to extract backup: %w", err))
+		return backupRestoreResult{}, err
+	}
+	return backupRestoreResult{}, nil
 }
 
 // 递归地将目录添加到 zip writer
@@ -220,17 +351,193 @@ func addDirToZip(zipWriter *zip.Writer, srcDir, baseInZip string) error {
 	})
 }
 
+func postgresDumpFromBackup(data []byte) ([]byte, bool, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to open zip: %w", err)
+	}
+	var dumpFile *zip.File
+	var manifestFound bool
+	for _, file := range zr.File {
+		name := strings.ReplaceAll(file.Name, "\\", "/")
+		switch name {
+		case "database/manifest.json":
+			manifestFound = true
+		case "database/postgres.dump":
+			dumpFile = file
+		}
+	}
+	if dumpFile == nil {
+		return nil, false, nil
+	}
+	if !manifestFound {
+		return nil, false, errors.New("PostgreSQL 备份缺少 database/manifest.json")
+	}
+	if dumpFile.UncompressedSize64 > 1<<30 {
+		return nil, false, errors.New("PostgreSQL dump 解压后超过 1 GiB 限制")
+	}
+	rc, err := dumpFile.Open()
+	if err != nil {
+		return nil, false, fmt.Errorf("打开 PostgreSQL dump 失败: %w", err)
+	}
+	defer rc.Close()
+	dump, err := io.ReadAll(io.LimitReader(rc, (1<<30)+1))
+	if err != nil {
+		return nil, false, fmt.Errorf("读取 PostgreSQL dump 失败: %w", err)
+	}
+	if len(dump) < 5 || string(dump[:5]) != "PGDMP" {
+		return nil, false, errors.New("PostgreSQL dump 文件头无效")
+	}
+	return dump, true, nil
+}
+
+func restorePostgresToStaging(ctx context.Context, dump []byte, cfg storage.DatabaseConfig) (storage.DatabaseConfig, error) {
+	bin, err := exec.LookPath("pg_restore")
+	if err != nil {
+		return storage.DatabaseConfig{}, errors.New("未找到 pg_restore；请安装与数据库服务端同版本或更高版本的 PostgreSQL client")
+	}
+	tmp, err := os.CreateTemp("", "mmwx-postgres-restore-*.dump")
+	if err != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("创建恢复临时文件失败: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return storage.DatabaseConfig{}, err
+	}
+	if _, err := tmp.Write(dump); err != nil {
+		tmp.Close()
+		return storage.DatabaseConfig{}, fmt.Errorf("写入恢复临时文件失败: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return storage.DatabaseConfig{}, err
+	}
+
+	checkCtx, cancelCheck := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancelCheck()
+	check := exec.CommandContext(checkCtx, bin, "--list", tmpPath)
+	if output, err := check.CombinedOutput(); err != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("pg_restore 校验备份失败: %s", strings.TrimSpace(string(output)))
+	}
+
+	adminDB, err := sql.Open("pgx", postgresConfigDSN(cfg))
+	if err != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("连接 PostgreSQL 失败: %w", err)
+	}
+	defer adminDB.Close()
+	if err := adminDB.PingContext(ctx); err != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("连接 PostgreSQL 失败: %w", err)
+	}
+	stageName := postgresRestoreDatabaseName(cfg.Database)
+	if _, err := adminDB.ExecContext(ctx, `CREATE DATABASE `+quotePostgresIdentifier(stageName)+` TEMPLATE template0`); err != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("创建恢复数据库失败（数据库用户需要 CREATEDB 权限）: %w", err)
+	}
+	dropStage := true
+	defer func() {
+		if dropStage {
+			_, _ = adminDB.ExecContext(context.Background(), `DROP DATABASE IF EXISTS `+quotePostgresIdentifier(stageName)+` WITH (FORCE)`)
+		}
+	}()
+
+	restoreCtx, cancelRestore := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancelRestore()
+	cmd := exec.CommandContext(restoreCtx, bin,
+		"--exit-on-error", "--no-owner", "--no-privileges", "--single-transaction",
+		"--host", cfg.Host, "--port", strconv.Itoa(cfg.Port),
+		"--username", cfg.Username, "--dbname", stageName, tmpPath,
+	)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+cfg.Password, "PGSSLMODE="+cfg.SSLMode)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("PostgreSQL 恢复失败: %s", strings.TrimSpace(string(output)))
+	}
+
+	newConfig := cfg
+	newConfig.Database = stageName
+	verifyRepo, err := storage.NewTrafficRepositoryFromConfig(newConfig)
+	if err != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("验证恢复数据库失败: %w", err)
+	}
+	verifyCtx, cancelVerify := context.WithTimeout(ctx, 30*time.Second)
+	_, usersErr := verifyRepo.ListUsers(verifyCtx, 1)
+	cancelVerify()
+	closeErr := verifyRepo.Close()
+	if usersErr != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("验证恢复数据库用户表失败: %w", usersErr)
+	}
+	if closeErr != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("关闭恢复数据库验证连接失败: %w", closeErr)
+	}
+	dropStage = false
+	return newConfig, nil
+}
+
+func postgresConfigDSN(cfg storage.DatabaseConfig) string {
+	u := &url.URL{Scheme: "postgres", Host: fmt.Sprintf("%s:%d", cfg.Host, cfg.Port), Path: cfg.Database}
+	u.User = url.UserPassword(cfg.Username, cfg.Password)
+	query := u.Query()
+	query.Set("sslmode", cfg.SSLMode)
+	u.RawQuery = query.Encode()
+	return u.String()
+}
+
+func postgresRestoreDatabaseName(current string) string {
+	base := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' {
+			return r
+		}
+		return '_'
+	}, current)
+	now := time.Now()
+	suffix := now.Format("_restore_20060102_150405_") + fmt.Sprintf("%06d", now.Nanosecond()/1000)
+	maxBase := 63 - len(suffix)
+	if len(base) > maxBase {
+		base = base[:maxBase]
+	}
+	if base == "" {
+		base = "mmwx"
+	}
+	return base + suffix
+}
+
+func dropPostgresDatabase(cfg storage.DatabaseConfig, database string) {
+	db, err := sql.Open("pgx", postgresConfigDSN(cfg))
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, _ = db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+quotePostgresIdentifier(database)+` WITH (FORCE)`)
+}
+
+func quotePostgresIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
 // extractBackupFromBytes 从内存中的 zip 字节提取备份。
 func extractBackupFromBytes(data []byte) error {
+	return extractBackupFromBytesWithOptions(data, false)
+}
+
+func extractBackupFromBytesWithOptions(data []byte, skipDatabaseConfig bool) error {
+	return extractBackupFromBytesForRuntime(data, skipDatabaseConfig, "data")
+}
+
+func extractBackupFromBytesForRuntime(data []byte, skipDatabaseConfig bool, dataDir string) error {
 	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return fmt.Errorf("failed to open zip: %w", err)
 	}
-	return extractZipReader(zr)
+	return extractZipReaderWithOptions(zr, skipDatabaseConfig, dataDir)
 }
 
 // extractZipReader 把 zip 内容提取到 data/ 与 subscribes/(其余路径忽略,并防路径穿越)。
 func extractZipReader(reader *zip.Reader) error {
+	return extractZipReaderWithOptions(reader, false, "data")
+}
+
+func extractZipReaderWithOptions(reader *zip.Reader, skipDatabaseConfig bool, dataDir string) error {
 	// 首先验证 zip 内容
 	hasData := false
 	hasSubscribes := false
@@ -238,6 +545,9 @@ func extractZipReader(reader *zip.Reader) error {
 		// 显式把反斜杠换成正斜杠:兼容旧版在 Windows 上生成的备份(zip 内路径为 data\...)。
 		// 注意不能用 filepath.ToSlash —— 它只在 Windows 生效,Linux 主控恢复 Windows 备份时不处理反斜杠。
 		name := strings.ReplaceAll(f.Name, "\\", "/")
+		if skipDatabaseConfig && name == "data/"+storage.DatabaseConfigFilename {
+			continue
+		}
 		if strings.HasPrefix(name, "data/") {
 			hasData = true
 		}
@@ -253,6 +563,9 @@ func extractZipReader(reader *zip.Reader) error {
 	for _, f := range reader.File {
 		// 显式换掉反斜杠(兼容旧 Windows 备份);filepath.ToSlash 在 Linux 不处理反斜杠,故不能用。
 		name := strings.ReplaceAll(f.Name, "\\", "/")
+		if skipDatabaseConfig && name == "data/"+storage.DatabaseConfigFilename {
+			continue
+		}
 
 		// 安全检查：防止路径穿越
 		if strings.Contains(name, "..") {
@@ -264,7 +577,13 @@ func extractZipReader(reader *zip.Reader) error {
 			continue
 		}
 
-		destPath := filepath.FromSlash(name)
+		var destPath string
+		if strings.HasPrefix(name, "data/") {
+			destPath = filepath.Join(dataDir, filepath.FromSlash(strings.TrimPrefix(name, "data/")))
+		} else {
+			subscribeDir := filepath.Join(filepath.Dir(dataDir), "subscribes")
+			destPath = filepath.Join(subscribeDir, filepath.FromSlash(strings.TrimPrefix(name, "subscribes/")))
+		}
 
 		if f.FileInfo().IsDir() {
 			if err := os.MkdirAll(destPath, 0755); err != nil {
@@ -291,21 +610,31 @@ func extractZipReader(reader *zip.Reader) error {
 		if strings.HasSuffix(lowerBase, ".key") || lowerBase == "privkey.pem" {
 			mode = 0600
 		}
-		destFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+		tmpFile, err := os.CreateTemp(filepath.Dir(destPath), ".mmwx-restore-*")
 		if err != nil {
 			srcFile.Close()
-			return fmt.Errorf("failed to create file %s: %w", destPath, err)
+			return fmt.Errorf("failed to create temporary file for %s: %w", destPath, err)
 		}
-
-		_, err = io.Copy(destFile, srcFile)
+		tmpPath := tmpFile.Name()
+		_, err = io.Copy(tmpFile, srcFile)
 		srcFile.Close()
-		destFile.Close()
-
+		if syncErr := tmpFile.Sync(); err == nil {
+			err = syncErr
+		}
+		if closeErr := tmpFile.Close(); err == nil {
+			err = closeErr
+		}
 		if err != nil {
+			_ = os.Remove(tmpPath)
 			return fmt.Errorf("failed to extract file %s: %w", f.Name, err)
 		}
-		if err := os.Chmod(destPath, mode); err != nil {
+		if err := os.Chmod(tmpPath, mode); err != nil {
+			_ = os.Remove(tmpPath)
 			return fmt.Errorf("failed to restore permissions for %s: %w", f.Name, err)
+		}
+		if err := os.Rename(tmpPath, destPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("failed to replace file %s: %w", f.Name, err)
 		}
 	}
 

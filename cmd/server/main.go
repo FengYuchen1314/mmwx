@@ -158,8 +158,23 @@ func main() {
 		repo, err = storage.NewTrafficRepositoryFromConfig(databaseConfig)
 	}
 	if err != nil {
-		logger.Error("数据库初始化失败", "driver", databaseConfig.Driver, "error", err)
-		os.Exit(1)
+		// PostgreSQL 恢复采用新库切换。若新库在重启后无法打开，使用切换前
+		// 留下的配置自动回退，避免主控因一次失败恢复永久无法启动。
+		rollbackConfig, rollbackErr := storage.LoadDatabaseRestoreRollback(dataDir)
+		if databaseConfig.Driver == "postgres" && rollbackErr == nil {
+			logger.Warn("恢复后的 PostgreSQL 无法启动，正在自动切回原数据库", "database", databaseConfig.Database, "error", err)
+			if saveErr := storage.SaveDatabaseConfig(dataDir, rollbackConfig); saveErr == nil {
+				repo, err = storage.NewTrafficRepositoryFromConfig(rollbackConfig)
+				databaseConfig = rollbackConfig
+			}
+		}
+		if err != nil {
+			logger.Error("数据库初始化失败", "driver", databaseConfig.Driver, "error", err)
+			os.Exit(1)
+		}
+	}
+	if clearErr := storage.ClearDatabaseRestoreRollback(dataDir); clearErr != nil {
+		logger.Warn("清理数据库恢复回滚标记失败", "error", clearErr)
 	}
 	databaseTarget := databaseConfig.Database
 	if databaseConfig.Driver == "sqlite" {
@@ -327,7 +342,7 @@ func main() {
 	mux.Handle("/api/setup/status", handler.NewSetupStatusHandler(repo))
 	mux.Handle("/api/setup/init", handler.NewInitialSetupHandler(repo, dataDir))
 	mux.Handle("/api/setup/verify-domain", handler.NewVerifyDomainHandler())
-	mux.Handle("/api/setup/restore-backup", handler.NewSetupRestoreBackupHandler(repo))
+	mux.Handle("/api/setup/restore-backup", handler.NewSetupRestoreBackupHandler(repo, dataDir))
 
 	// 从 system_settings 读 3 个安全限流器的自定义阈值(KV 缺失 → fallback hardcoded 默认值)。
 	// 同一份配置后面给 brute_force + subscription_rate 构造时复用。
@@ -404,8 +419,8 @@ func main() {
 	mux.Handle("/api/admin/templates/", auth.RequireToken(tokenStore, userRepo, handler.NewTemplateHandler(repo)))
 	mux.Handle("/api/admin/templates/convert", auth.RequireToken(tokenStore, userRepo, handler.NewTemplateConvertHandler()))
 	mux.Handle("/api/admin/templates/fetch-source", auth.RequireToken(tokenStore, userRepo, handler.NewTemplateFetchSourceHandler()))
-	mux.Handle("/api/admin/backup/download", auth.RequireAdmin(tokenStore, userRepo, handler.NewBackupDownloadHandler(repo)))
-	mux.Handle("/api/admin/backup/restore", auth.RequireAdmin(tokenStore, userRepo, handler.NewBackupRestoreHandler(repo)))
+	mux.Handle("/api/admin/backup/download", auth.RequireAdmin(tokenStore, userRepo, handler.NewBackupDownloadHandler(repo, dataDir)))
+	mux.Handle("/api/admin/backup/restore", auth.RequireAdmin(tokenStore, userRepo, handler.NewBackupRestoreHandler(repo, dataDir)))
 	mux.Handle("/api/admin/update/check", auth.RequireAdmin(tokenStore, userRepo, handler.NewUpdateCheckHandler()))
 	mux.Handle("/api/admin/update/apply", auth.RequireAdmin(tokenStore, userRepo, handler.NewUpdateApplyHandler()))
 	mux.Handle("/api/admin/update/apply-sse", auth.RequireAdmin(tokenStore, userRepo, handler.NewUpdateApplySSEHandler()))
