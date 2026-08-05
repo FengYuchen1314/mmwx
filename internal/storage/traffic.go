@@ -5128,6 +5128,12 @@ func (r *TrafficRepository) GetUserPackagePeriod(ctx context.Context, username s
 			nextAnchor := time.Date(today.Year(), today.Month()+1, 1, 0, 0, 0, 0, now.Location())
 			next = resetDate(nextAnchor.Year(), nextAnchor.Month())
 		}
+		// 新套餐可能在月度重置日之后才生效。此时本次套餐周期不能回溯到
+		// 月初的重置日，否则会把绑定套餐前的历史流量算入新套餐。
+		// package_start_date 是套餐计费边界；月度重置日只是后续周期边界。
+		if startAt.Valid && startAt.Time.After(previous) {
+			previous = startAt.Time
+		}
 		return &previous, &next, nil
 	}
 	if startAt.Valid {
@@ -8615,6 +8621,24 @@ func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username st
 		isResetInt = 1
 	}
 
+	// 套餐绑定与计费边界检查点必须原子完成。累计计数器没有逐条时间戳，因此新套餐
+	// 绑定时要记住边界处的累计值，查询时只计算边界后的增量。此操作不删除历史流量；
+	// 日账本仍完整保留旧周期数据。否则当天中途绑定时，仅按日汇总也会混入当天早些
+	// 时候产生的流量。
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin assign package: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var oldPackageID sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT package_id FROM users WHERE username = ?`, username).Scan(&oldPackageID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("read current package before assign: %w", err)
+	}
+	packageChanged := !oldPackageID.Valid || oldPackageID.Int64 != packageID
+
 	// traffic_limit_override 的生命周期:换套餐清除,纯续期保留。
 	// CASE 里的 package_id 是 UPDATE 前的旧值(标准 SQL:SET 表达式一律按旧行求值),
 	// 拿它跟新 packageID 比即可区分两种调用:
@@ -8635,7 +8659,7 @@ func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username st
 		WHERE username = ?
 	`
 
-	result, err := r.db.ExecContext(ctx, query, packageID, packageID, startDate, endDate, packageID, endDate, isResetInt, resetDay, username)
+	result, err := tx.ExecContext(ctx, query, packageID, packageID, startDate, endDate, packageID, endDate, isResetInt, resetDay, username)
 	if err != nil {
 		return fmt.Errorf("assign package to user: %w", err)
 	}
@@ -8647,6 +8671,17 @@ func (r *TrafficRepository) AssignPackageToUser(ctx context.Context, username st
 
 	if affected == 0 {
 		return ErrUserNotFound
+	}
+	if packageChanged {
+		if err := checkpointUserTrafficRowsTx(ctx, tx, username); err != nil {
+			return fmt.Errorf("start new package traffic cycle: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET traffic_warned_80 = 0, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, username); err != nil {
+			return fmt.Errorf("clear traffic warning for new package: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit assign package to user: %w", err)
 	}
 
 	return nil
@@ -12794,22 +12829,8 @@ func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username 
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	const userStmt = `UPDATE user_traffic SET uplink = 0, downlink = 0, cycle_start = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE username = ?`
-	if _, err := tx.ExecContext(ctx, userStmt, username); err != nil {
-		return fmt.Errorf("reset user traffic cycle: %w", err)
-	}
-
-	// 按 attributed_username 过滤 —— 与 GetUserBillableTraffic 同源,"计费看得见的行"必然被抬基线。
-	// 旧实现在这里用 4 段 LIKE(email= / esc__% / esc-% / IN subaccounts),要求与读侧逐字一致,
-	// 是个只靠注释维持的口头约定;而且它漏掉 client.email == users.email 形态 → 那些行的基线永不抬升。
-	// 归因失败的行(attributed_username='')不被任何用户计费,自然也不需要重置。
-	const emailStmt = `UPDATE user_email_traffic
-		SET cycle_base_uplink = uplink, cycle_base_downlink = downlink,
-		    cycle_base_weighted_uplink = weighted_uplink, cycle_base_weighted_downlink = weighted_downlink,
-		    cycle_start = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-		WHERE attributed_username = ?`
-	if _, err := tx.ExecContext(ctx, emailStmt, username); err != nil {
-		return fmt.Errorf("reset user email traffic cycle: %w", err)
+	if err := checkpointUserTrafficRowsTx(ctx, tx, username); err != nil {
+		return err
 	}
 	if resetAt != nil {
 		const markerStmt = `UPDATE users SET last_reset_at = ?, traffic_warned_80 = 0, updated_at = CURRENT_TIMESTAMP WHERE username = ?`
@@ -12832,6 +12853,26 @@ func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username 
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit reset user traffic cycle: %w", err)
+	}
+	return nil
+}
+
+// checkpointUserTrafficRowsTx 记录当前累计值作为新周期的时间边界。它不会删除历史累计
+// 或日账本；读取本周期流量时只取该检查点之后的增量。
+// 套餐切换和手动/月度重置必须共用这一实现，避免三条路径口径漂移。
+func checkpointUserTrafficRowsTx(ctx context.Context, tx *dialectTx, username string) error {
+	const userStmt = `UPDATE user_traffic SET uplink = 0, downlink = 0, cycle_start = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE username = ?`
+	if _, err := tx.ExecContext(ctx, userStmt, username); err != nil {
+		return fmt.Errorf("reset user traffic cycle: %w", err)
+	}
+	// 按 attributed_username 过滤，与 GetUserBillableTraffic 完全同源。
+	const emailStmt = `UPDATE user_email_traffic
+		SET cycle_base_uplink = uplink, cycle_base_downlink = downlink,
+		    cycle_base_weighted_uplink = weighted_uplink, cycle_base_weighted_downlink = weighted_downlink,
+		    cycle_start = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		WHERE attributed_username = ?`
+	if _, err := tx.ExecContext(ctx, emailStmt, username); err != nil {
+		return fmt.Errorf("reset user email traffic cycle: %w", err)
 	}
 	return nil
 }
