@@ -106,16 +106,10 @@ func (m *Manager) Restart(parent context.Context) error {
 	if !s.Enabled {
 		return nil
 	}
-	adminUsername := ""
-	users, err := m.repo.ListUsers(parent, 1000)
-	if err != nil {
-		return err
-	}
-	for _, user := range users {
-		if user.Role == storage.RoleAdmin {
-			adminUsername = user.Username
-			break
-		}
+	adminUsername := m.repo.GetPrimaryAdminUsername(parent)
+	adminUser, err := m.repo.GetUser(parent, adminUsername)
+	if err != nil || adminUser.Role != storage.RoleAdmin || !adminUser.IsActive {
+		return errors.New("首次初始化创建的管理员账号不存在、已停用或角色异常")
 	}
 	if adminUsername == "" {
 		return errors.New("未找到管理员账号")

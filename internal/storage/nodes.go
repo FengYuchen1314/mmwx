@@ -1319,22 +1319,45 @@ func (r *TrafficRepository) ListRoutedNodesByParent(ctx context.Context, parentN
 	return out, rows.Err()
 }
 
+const primaryAdminUsernameSetting = "primary_admin_username"
+
+// GetPrimaryAdminUsername returns the immutable logical owner of this master.
+// Fresh installations persist it during setup. Upgraded databases backfill it
+// once from the earliest-created user, so adding another role='admin' row later
+// cannot grant ownership or TG administrator privileges.
+func (r *TrafficRepository) GetPrimaryAdminUsername(ctx context.Context) string {
+	if r == nil || r.db == nil {
+		return "admin"
+	}
+	if username, err := r.GetSystemSetting(ctx, primaryAdminUsernameSetting); err == nil && strings.TrimSpace(username) != "" {
+		return strings.TrimSpace(username)
+	}
+	var username string
+	err := r.db.QueryRowContext(ctx, `SELECT username FROM users ORDER BY created_at ASC, username ASC LIMIT 1`).Scan(&username)
+	if err != nil || strings.TrimSpace(username) == "" {
+		return "admin"
+	}
+	username = strings.TrimSpace(username)
+	// Best effort: concurrent callers choose the same deterministic first row.
+	_ = r.SetSystemSetting(ctx, primaryAdminUsernameSetting, username)
+	return username
+}
+
+func (r *TrafficRepository) SetPrimaryAdminUsername(ctx context.Context, username string) error {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return errors.New("primary admin username is required")
+	}
+	return r.SetSystemSetting(ctx, primaryAdminUsernameSetting, username)
+}
+
 // GetSystemNodeOwner 返回"系统节点"应该归属的 username。
 // 用途:NodeSyncListener 自动同步、remote_manage 批量同步等"系统侧"创建节点时,需要一个
 // username 字段来归属节点。不能硬编码 "admin" 字面字符串(系统里 admin 用户名可能是注册时
 // 任意输入的)。本函数按 created_at 升序取第一个 role='admin' 的用户名;若系统中无 admin
 // (极端情况),回退到字面字符串 "admin" 以保持与旧行为兼容。
 func (r *TrafficRepository) GetSystemNodeOwner(ctx context.Context) string {
-	if r == nil || r.db == nil {
-		return "admin"
-	}
-	var u string
-	err := r.db.QueryRowContext(ctx,
-		`SELECT username FROM users WHERE role = ? ORDER BY created_at ASC LIMIT 1`, RoleAdmin).Scan(&u)
-	if err != nil || strings.TrimSpace(u) == "" {
-		return "admin"
-	}
-	return u
+	return r.GetPrimaryAdminUsername(ctx)
 }
 
 // ListNonAdminUsernames 返回所有 role != 'admin' 的用户名集合(即"普通用户")。

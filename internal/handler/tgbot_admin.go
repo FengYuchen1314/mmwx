@@ -721,12 +721,13 @@ func (h *TGBotAPIHandler) userByTG(w http.ResponseWriter, r *http.Request) {
 	}
 	notifyEnabled, _ := h.repo.GetTGNotify(r.Context(), tgID)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"success":        true,
-		"bound":          true,
-		"username":       username,
-		"role":           user.Role,
-		"is_active":      user.IsActive,
-		"notify_enabled": notifyEnabled,
+		"success":          true,
+		"bound":            true,
+		"username":         username,
+		"role":             user.Role,
+		"is_active":        user.IsActive,
+		"is_primary_admin": username == h.repo.GetPrimaryAdminUsername(r.Context()),
+		"notify_enabled":   notifyEnabled,
 	})
 }
 

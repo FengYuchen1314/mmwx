@@ -219,6 +219,10 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 		// 确保用户设置为管理员且处于活动状态
 		_ = setupRepo.UpdateUserRole(r.Context(), username, storage.RoleAdmin)
 		_ = setupRepo.UpdateUserStatus(r.Context(), username, true)
+		if err := setupRepo.SetPrimaryAdminUsername(r.Context(), username); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("保存主控所有者失败: %w", err))
+			return
+		}
 
 		if avatarURL != "" || email != "" || nickname != "" {
 			_ = setupRepo.UpdateUserProfile(r.Context(), username, storage.UserProfileUpdate{

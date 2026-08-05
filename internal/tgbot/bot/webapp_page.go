@@ -12,6 +12,8 @@ import (
 // __DEVPREVIEW__ 注入:仅 webapp_dev_preview=true 时允许从 ?initData= 读取(本地预览),生产为 false。
 // __THEME__ 注入:跟随主控「默认主题」,anime 时给 <html> 加 theme-anime 类(首屏即生效,无闪烁)。
 func (s *Service) webAppPage(w http.ResponseWriter, r *http.Request) {
+	// Do not let a CDN retain an old Mini App shell after authorization fixes.
+	setWebAppPrivateHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	flag := "false"
 	if s.cfg.WebAppDevPreview {
@@ -645,7 +647,9 @@ function __assignPkg(username,i,btn){
 }
 window.__assignPkg=__assignPkg;
 function load(){
- fetch("/api/tg-webapp/me",{headers:{"X-Telegram-Init-Data":window.__init}})
+ // The nonce and cache:no-store prevent a CDN rule that ignores the custom
+ // Telegram header from reusing another visitor's identity response.
+ fetch("/api/tg-webapp/me?_="+Date.now(),{cache:"no-store",headers:{"Cache-Control":"no-cache","X-Telegram-Init-Data":window.__init}})
   .then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
   .then(render)
   .catch(function(){document.getElementById("app").classList.remove("hide");document.getElementById("view-home").innerHTML='<div class="card">加载失败,请稍后重试。</div>';});

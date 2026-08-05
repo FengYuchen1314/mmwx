@@ -157,7 +157,7 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 	}
 	username := info.Username
 
-	isAdmin := s.cfg.IsAdmin(tgID) && info.Bound && info.IsActive && info.Role == "admin"
+	isAdmin := s.cfg.IsAdmin(tgID) && info.Bound && info.IsActive && info.IsPrimaryAdmin && info.Role == "admin"
 	resp := map[string]any{"bound": true, "is_admin": isAdmin}
 	if renewals, err := s.client.RenewalRequestHistory(ctx, tgID); err == nil {
 		resp["renewal_requests"] = renewals
@@ -733,6 +733,7 @@ func clientIP(r *http.Request) string {
 
 func webRL(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		setWebAppPrivateHeaders(w)
 		if !webAllow(clientIP(r)) {
 			writeJSONResp(w, http.StatusTooManyRequests, map[string]any{"error": "请求过于频繁,请稍后再试"})
 			return
@@ -741,7 +742,20 @@ func webRL(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// Mini App API responses depend on the Telegram-signed request header. They
+// must never be shared by a browser cache, reverse proxy, or CDN. Vary is kept
+// as an additional guard for intermediaries that disregard no-store.
+func setWebAppPrivateHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Vary", "X-Telegram-Init-Data")
+}
+
 func writeJSONResp(w http.ResponseWriter, code int, v any) {
+	setWebAppPrivateHeaders(w)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)

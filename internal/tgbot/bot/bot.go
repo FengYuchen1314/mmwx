@@ -67,7 +67,7 @@ func (s *Service) isAdminTG(ctx context.Context, tgID int64) bool {
 		return false
 	}
 	info, err := s.client.UserByTG(ctx, tgID)
-	return err == nil && info != nil && info.Bound && info.IsActive && info.Role == "admin"
+	return err == nil && info != nil && info.Bound && info.IsActive && info.IsPrimaryAdmin && info.Role == "admin"
 }
 
 func (s *Service) Start(parent context.Context) error {

@@ -144,12 +144,13 @@ func (c *Client) Unbind(ctx context.Context, tgID int64) (string, error) {
 }
 
 type UserByTG struct {
-	Success       bool   `json:"success"`
-	Bound         bool   `json:"bound"`
-	Username      string `json:"username,omitempty"`
-	Role          string `json:"role,omitempty"`
-	IsActive      bool   `json:"is_active,omitempty"`
-	NotifyEnabled bool   `json:"notify_enabled,omitempty"`
+	Success        bool   `json:"success"`
+	Bound          bool   `json:"bound"`
+	Username       string `json:"username,omitempty"`
+	Role           string `json:"role,omitempty"`
+	IsActive       bool   `json:"is_active,omitempty"`
+	IsPrimaryAdmin bool   `json:"is_primary_admin,omitempty"`
+	NotifyEnabled  bool   `json:"notify_enabled,omitempty"`
 }
 
 func (c *Client) UserByTG(ctx context.Context, tgID int64) (*UserByTG, error) {

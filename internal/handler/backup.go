@@ -279,11 +279,31 @@ func compatiblePostgresTool(tool, major string) (string, bool) {
 	}
 	for _, path := range paths {
 		output, err := exec.Command(path, "--version").CombinedOutput()
-		if err == nil && strings.Contains(string(output), " "+major+".") {
+		// Development and release-candidate clients report versions such as
+		// "PostgreSQL 19beta2" and "PostgreSQL 19rc1", without a dot after
+		// the major. Parse the leading digits instead of matching " 19." so
+		// PG19 works before and after its stable release.
+		if err == nil && postgresToolMajor(string(output)) == major {
 			return path, true
 		}
 	}
 	return "", false
+}
+
+func postgresToolMajor(versionOutput string) string {
+	marker := "PostgreSQL)"
+	if i := strings.Index(versionOutput, marker); i >= 0 {
+		versionOutput = versionOutput[i+len(marker):]
+	}
+	versionOutput = strings.TrimSpace(versionOutput)
+	end := 0
+	for end < len(versionOutput) && versionOutput[end] >= '0' && versionOutput[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return ""
+	}
+	return versionOutput[:end]
 }
 
 func postgresServerMajor(ctx context.Context, cfg storage.DatabaseConfig) (string, error) {
@@ -694,12 +714,9 @@ func tryGrantLocalPostgresCreatedb(ctx context.Context, cfg storage.DatabaseConf
 	if err != nil {
 		return err
 	}
-	psql := filepath.Join("/usr/lib/postgresql", major, "bin", "psql")
-	if _, err := os.Stat(psql); err != nil {
-		psql, err = exec.LookPath("psql")
-		if err != nil {
-			return errors.New("系统缺少 psql")
-		}
+	psql, err := ensurePostgresClientTool(ctx, "psql", major)
+	if err != nil {
+		return fmt.Errorf("准备 PG%s psql 失败: %w", major, err)
 	}
 	grantCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
