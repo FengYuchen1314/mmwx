@@ -1088,13 +1088,13 @@ func (h *RemoteManageHandler) HandleAgentUpgradeStream(w http.ResponseWriter, r 
 }
 
 // forwardUpgradeStream 是升级专用版本的 SSE 转发,在 forwardStreamToRemote 基础上加了:
-//  1. 主控侧 5min 硬超时 — 老 agent 的 sseStreamCmd 会卡死,通用 forward 无 timeout 浏览器会一直转
+//  1. 主控侧 60s 硬超时 — 老 agent 的 sseStreamCmd 会卡死,通用 forward 无 timeout 浏览器会一直转
 //  2. 升级成功检测 — 用 system-info.agent_version 前后对比;无 agent_version 字段的老 agent 退化为
 //     "ping 是否变化"(老 binary 没重启 → 旧 PID 还在响应原 conn;若新 binary 起来 → 短暂 502 然后恢复)
 //  3. 失败时往 SSE 末尾追一条 {type:"result", success:false, hint:"..."} — 前端可据此提示
 //     用户哪几台需要手工 ssh 上去跑 upgrade-agent.sh
 func (h *RemoteManageHandler) forwardUpgradeStream(w http.ResponseWriter, r *http.Request, serverID int64) {
-	const upgradeTimeout = 5 * time.Minute
+	const upgradeTimeout = 60 * time.Second
 
 	server, err := h.repo.GetRemoteServer(r.Context(), serverID)
 	if err != nil {
@@ -1320,7 +1320,7 @@ func upgradeResult(preVersion, postVersion string, sawBinaryReplaced, timeoutHit
 		r["message"] = fmt.Sprintf("升级成功:agent v%s(旧版本无法识别,以脚本完成 + 当前可查为准)", postVersion)
 	case timeoutHit:
 		r["success"] = false
-		r["message"] = "升级超时(5min):agent 脚本可能卡死。请在服务器上手工跑 scripts/upgrade-agent.sh 救场"
+		r["message"] = "升级超时(60s):agent 脚本可能卡死。请在服务器上手工跑 scripts/upgrade-agent.sh 救场"
 		r["hint"] = "old_agent_stuck"
 	case !sawBinaryReplaced:
 		r["success"] = false

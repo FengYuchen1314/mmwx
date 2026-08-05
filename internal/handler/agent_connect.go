@@ -775,7 +775,7 @@ esac
 # 镜像链 — 顺序尝试,任一成功即停。GitHub 优先,失败再自动降级到 CDN 代理。
 # 注:GitHub Release binary 重定向到 objects.githubusercontent.com(只有 A 记录,无 AAAA),
 # 纯 v6 机器直连 github 会 "network is unreachable" → 会快速失败(近乎即时,非超时)后降级到
-# ghproxy / gh-proxy(v4+v6 双栈反代)。
+# gh-proxy 反代兜底。
 # 更新 CDN(Cloudflare R2)优先 — CDN_BASE 由后端按 CDN 加速开关注入(默认开启、域名写死),非空才加入;
 # 失败自动降级到 GitHub / gh-proxy。
 CDN_BASE="__MMWX_UPDATE_CDN__"
@@ -785,7 +785,6 @@ if [ -n "$CDN_BASE" ]; then
 fi
 MIRRORS+=("https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
 MIRRORS+=("https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
-MIRRORS+=("https://mirror.ghproxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
 
 # Download binary — 优先用 curl(更普遍),没有就用 wget;两者都没就按发行版包管理器装一个,
 # 杜绝 "wget: command not found" 噪声 / "ERROR: 都没装" 卡死。
@@ -829,7 +828,7 @@ for url in "${MIRRORS[@]}"; do
     echo "  → 该镜像失败,尝试下一个..."
 done
 if [ "$download_ok" != "1" ]; then
-    echo "ERROR: 所有镜像均下载失败(GitHub + ghproxy + gh-proxy 全部不可达)" >&2
+    echo "ERROR: 所有镜像均下载失败(GitHub + gh-proxy 全部不可达)" >&2
     exit 1
 fi
 
