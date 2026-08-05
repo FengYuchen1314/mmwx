@@ -2,10 +2,73 @@ package storage
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
+
+func TestAssignPackagePostgresCompatibility(t *testing.T) {
+	if os.Getenv("MMWX_TEST_POSTGRES") == "" {
+		t.Skip("set MMWX_TEST_POSTGRES=1 to run")
+	}
+	host := os.Getenv("MMWX_TEST_POSTGRES_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := 55432
+	if value, err := strconv.Atoi(os.Getenv("MMWX_TEST_POSTGRES_PORT")); err == nil && value > 0 {
+		port = value
+	}
+	database := os.Getenv("MMWX_TEST_POSTGRES_DATABASE")
+	if database == "" {
+		database = "mmwx"
+	}
+	password := os.Getenv("MMWX_TEST_POSTGRES_PASSWORD")
+	if password == "" {
+		password = "mmwx-test"
+	}
+	repo, err := NewTrafficRepositoryFromConfig(DatabaseConfig{
+		Driver: "postgres", Host: host, Port: port, Database: database,
+		Username: "mmwx", Password: password, SSLMode: "disable",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	username := "renew-pg-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := repo.CreateUser(ctx, username, "", "", "hash", RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	pkgID, err := repo.CreatePackage(ctx, Package{Name: username, CycleDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = repo.db.ExecContext(context.Background(), `DELETE FROM users WHERE username = ?`, username)
+		_, _ = repo.db.ExecContext(context.Background(), `DELETE FROM packages WHERE id = ?`, pkgID)
+	})
+	now := time.Now()
+	if err := repo.AssignPackageToUser(ctx, username, pkgID, now, now.AddDate(0, 1, 0), true, 1); err != nil {
+		t.Fatalf("initial package assignment on PostgreSQL: %v", err)
+	}
+	limit := int64(1234)
+	if err := repo.UpdateUserTrafficLimitOverride(ctx, username, &limit); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AssignPackageToUser(ctx, username, pkgID, now, now.AddDate(0, 2, 0), true, 1); err != nil {
+		t.Fatalf("same-package renewal on PostgreSQL: %v", err)
+	}
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.PackageID != pkgID || user.PackageEndDate == nil || user.TrafficLimitOverride == nil || *user.TrafficLimitOverride != limit {
+		t.Fatalf("renewal state mismatch: %+v", user)
+	}
+}
 
 func TestAssignPackagePreservesOverrideOnlyForSamePackage(t *testing.T) {
 	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "package-assignment.db"))
