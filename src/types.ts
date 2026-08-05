@@ -23,6 +23,9 @@ export interface ProbePingSeries {
 export interface ProbeServer {
   name?: string
   region?: string
+  region_country?: string
+  region_name?: string
+  region_city?: string
   online: boolean
   upload_speed?: number
   download_speed?: number

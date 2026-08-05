@@ -1424,6 +1424,33 @@ footer a:hover {
     padding-inline: 22px;
   }
 }
+@media (max-width: 640px) {
+  .route-badge-animation {
+    padding: 2px;
+  }
+  .route-badge-icon {
+    width: 16px;
+    height: 16px;
+  }
+  .route-badge-text {
+    padding: 4px 3px;
+  }
+  .route-badge small {
+    flex: none;
+    writing-mode: vertical-rl;
+    font-size: 7px;
+    line-height: 1;
+    letter-spacing: -0.02em;
+  }
+  .route-badge strong {
+    flex: none;
+    margin-left: 2px;
+    overflow: visible;
+    text-overflow: clip;
+    font-size: 8px;
+    letter-spacing: -0.02em;
+  }
+}
 @media (max-width: 480px) {
   .ping-grid {
     column-gap: 12px;
