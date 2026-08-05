@@ -799,8 +799,12 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 		uninstallCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		var uninstallErr error
+		streamUnsupported := false
 		streamOutput := &countingDiscardWriter{}
 		if h.wsHandler != nil {
+			if conn, connected := h.wsHandler.GetConnectionByServerID(req.ID); connected && !conn.Capabilities.Stream {
+				streamUnsupported = true
+			}
 			uninstallErr = h.wsHandler.CallAgentStream(uninstallCtx, req.ID, stdhttp.MethodPost, "/api/child/agent/uninstall-stream", "", nil, streamOutput, nil, 25*time.Second)
 		} else {
 			uninstallErr = fmt.Errorf("%w: ws handler unavailable", ErrWSRPCUnavailable)
@@ -821,10 +825,14 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		}
 		if uninstallErr != nil {
 			log.Printf("[Remote Server] uninstall agent before deleting %s failed: %v", serverName, uninstallErr)
+			message := "卸载 Agent 失败，服务器未删除：" + uninstallErr.Error()
+			if streamUnsupported {
+				message = "当前 Agent 版本不支持通过 WebSocket 自动卸载，请先升级 Agent；如 Agent 已离线或无需卸载，请取消勾选“先卸载 Agent”后删除"
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(RemoteServerResponse{
 				Success: false,
-				Message: "卸载 Agent 失败，服务器未删除：" + uninstallErr.Error(),
+				Message: message,
 			})
 			return
 		}
@@ -832,6 +840,7 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	}
 
 	if err := h.repo.DeleteRemoteServer(ctx, req.ID); err != nil {
+		log.Printf("[Remote Server] delete server id=%d name=%s status=%s failed: %v", req.ID, serverName, server.Status, err)
 		msg := "删除服务器失败"
 		if err == storage.ErrRemoteServerNotFound {
 			msg = "服务器不存在"
