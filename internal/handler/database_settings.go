@@ -140,13 +140,21 @@ func (h *DatabaseSettingsHandler) fillCurrentPassword(cfg *storage.DatabaseConfi
 
 func decodeDatabaseConfig(w http.ResponseWriter, r *http.Request) (storage.DatabaseConfig, bool) {
 	defer r.Body.Close()
-	var cfg storage.DatabaseConfig
+	// password_configured is a read-only flag returned by DatabaseStatus.SafeView.
+	// Older frontends spread that status object back into the test/migrate request.
+	// Accept this one known presentation field while keeping DisallowUnknownFields
+	// enabled so genuine request typos are still rejected.
+	var request struct {
+		storage.DatabaseConfig
+		PasswordConfigured bool `json:"password_configured,omitempty"`
+	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&cfg); err != nil {
+	if err := decoder.Decode(&request); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "数据库配置格式错误: " + err.Error()})
 		return storage.DatabaseConfig{}, false
 	}
+	cfg := request.DatabaseConfig
 	if strings.TrimSpace(cfg.Driver) == "" {
 		cfg.Driver = "postgres"
 	}
