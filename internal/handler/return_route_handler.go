@@ -64,7 +64,12 @@ type returnRouteResult struct {
 	Hops     []returnRouteHop `json:"hops,omitempty"`
 	Reason   string           `json:"reason,omitempty"`
 	Error    string           `json:"error,omitempty"`
+	Source   string           `json:"source,omitempty"`
 }
+
+var ansiEscapePattern = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))`)
+var traceIPPattern = regexp.MustCompile(`(?:^|[ (])((?:\d{1,3}\.){3}\d{1,3})(?:[ )]|$)`)
+var traceASNPattern = regexp.MustCompile(`(?i)\bAS(\d{2,10})\b`)
 
 // HandleReturnRouteTest is deliberately a normal child HTTP handler: the
 // agent's RPC mux invokes it over the existing outbound WebSocket connection.
@@ -186,21 +191,23 @@ func fileSHA256(path string) string {
 }
 
 func traceReturnRoute(parent context.Context, bin string, target returnRouteTarget, ipVersion int, timeout time.Duration) returnRouteResult {
-	result := returnRouteResult{Carrier: target.Carrier, Region: target.Region, Target: target.Host}
+	result := returnRouteResult{Carrier: target.Carrier, Region: target.Region, Target: target.Host, Source: "nexttrace"}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	args := []string{"-4", "-T", "-p", strconv.Itoa(target.Port), "-q", "2", "--max-attempts", "2", "--timeout", "1500", "--no-rdns", "-j", target.Host}
 	if ipVersion == 6 {
 		args[0] = "-6"
 	}
-	out, err := exec.CommandContext(ctx, bin, args...).Output()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), "NO_COLOR=1", "TERM=dumb")
+	out, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() != nil {
 			result.Error = "route trace timed out"
 		} else {
 			result.Error = err.Error()
 		}
-		return result
+		return traceReturnRouteFallback(parent, target, ipVersion, timeout, result.Error)
 	}
 	var raw struct {
 		Hops [][]struct {
@@ -220,9 +227,8 @@ func traceReturnRoute(parent context.Context, bin string, target returnRouteTarg
 			} `json:"Geo"`
 		} `json:"Hops"`
 	}
-	if err := json.Unmarshal(out, &raw); err != nil {
-		result.Error = "invalid nexttrace response: " + err.Error()
-		return result
+	if err := unmarshalNextTraceJSON(out, &raw); err != nil {
+		return traceReturnRouteFallback(parent, target, ipVersion, timeout, "invalid nexttrace response: "+err.Error())
 	}
 	seenASN := map[string]bool{}
 	for _, probes := range raw.Hops {
@@ -246,7 +252,7 @@ func traceReturnRoute(parent context.Context, bin string, target returnRouteTarg
 				seenASN[hop.ASN] = true
 				result.PathASNs = append(result.PathASNs, hop.ASN)
 			}
-			if result.EntryHop == nil && isMainlandChina(hop.Country) {
+			if result.EntryHop == nil && isMainlandEntryHop(hop) {
 				copyHop := hop
 				result.EntryHop = &copyHop
 			}
@@ -262,6 +268,91 @@ func traceReturnRoute(parent context.Context, bin string, target returnRouteTarg
 	if !result.Success && result.Error == "" {
 		result.Error = "no mainland China hop found"
 	}
+	if !result.Success {
+		return traceReturnRouteFallback(parent, target, ipVersion, timeout, result.Error)
+	}
+	return result
+}
+
+func unmarshalNextTraceJSON(out []byte, dst any) error {
+	clean := ansiEscapePattern.ReplaceAll(out, nil)
+	start, end := strings.IndexByte(string(clean), '{'), strings.LastIndexByte(string(clean), '}')
+	if start < 0 || end < start {
+		return errors.New("JSON object not found")
+	}
+	return json.Unmarshal(clean[start:end+1], dst)
+}
+
+// traceReturnRouteFallback only runs after nexttrace failed. Prefer TCP MTR with
+// ASN lookup; traceroute is the last resort on small Alpine/NAT installations.
+func traceReturnRouteFallback(parent context.Context, target returnRouteTarget, ipVersion int, timeout time.Duration, primaryErr string) returnRouteResult {
+	commands := []struct {
+		name string
+		args []string
+	}{
+		{"mtr", []string{"-4", "-T", "-P", strconv.Itoa(target.Port), "-r", "-c", "5", "-n", "-z", target.Host}},
+		{"traceroute", []string{"-4", "-T", "-p", strconv.Itoa(target.Port), "-n", "-q", "2", "-w", "2", target.Host}},
+	}
+	if ipVersion == 6 {
+		commands[0].args[0], commands[1].args[0] = "-6", "-6"
+	}
+	errorsSeen := []string{primaryErr}
+	for _, candidate := range commands {
+		path, err := exec.LookPath(candidate.name)
+		if err != nil {
+			errorsSeen = append(errorsSeen, candidate.name+" not installed")
+			continue
+		}
+		ctx, cancel := context.WithTimeout(parent, timeout)
+		cmd := exec.CommandContext(ctx, path, candidate.args...)
+		cmd.Env = append(os.Environ(), "NO_COLOR=1", "TERM=dumb")
+		out, runErr := cmd.CombinedOutput()
+		cancel()
+		if runErr != nil && len(out) == 0 {
+			errorsSeen = append(errorsSeen, candidate.name+": "+runErr.Error())
+			continue
+		}
+		result := parseRouteToolOutput(target, candidate.name, out)
+		if result.Success {
+			result.Reason = strings.TrimSpace(result.Reason + "；nexttrace 失败后使用 " + candidate.name + " 兜底")
+			return result
+		}
+		errorsSeen = append(errorsSeen, candidate.name+": no mainland China hop found")
+	}
+	return returnRouteResult{Carrier: target.Carrier, Region: target.Region, Target: target.Host, Source: "nexttrace", Error: strings.Join(errorsSeen, "; ")}
+}
+
+func parseRouteToolOutput(target returnRouteTarget, source string, out []byte) returnRouteResult {
+	result := returnRouteResult{Carrier: target.Carrier, Region: target.Region, Target: target.Host, Source: source}
+	seenASN := map[string]bool{}
+	for index, line := range strings.Split(string(ansiEscapePattern.ReplaceAll(out, nil)), "\n") {
+		ipMatch := traceIPPattern.FindStringSubmatch(line)
+		if len(ipMatch) < 2 {
+			continue
+		}
+		hop := returnRouteHop{Hop: index + 1, IP: ipMatch[1]}
+		if asn := traceASNPattern.FindStringSubmatch(line); len(asn) == 2 {
+			hop.ASN = normalizeASN(asn[1])
+		}
+		if strings.HasPrefix(hop.IP, "59.43.") {
+			hop.ASN = "4809"
+		}
+		result.Hops = append(result.Hops, hop)
+		if hop.ASN != "" && !seenASN[hop.ASN] {
+			seenASN[hop.ASN] = true
+			result.PathASNs = append(result.PathASNs, hop.ASN)
+		}
+		if result.EntryHop == nil && isMainlandEntryHop(hop) {
+			copyHop := hop
+			result.EntryHop = &copyHop
+		}
+	}
+	result.Route, result.Reason = classifyReturnRoute(result.EntryHop, result.PathASNs)
+	if result.Route == "Unknown" && target.Carrier == "telecom" && result.EntryHop != nil {
+		result.Route = "163"
+		result.Reason += "；电信目标未识别到 CN2/CTG 骨干，按普通 163 线路兜底"
+	}
+	result.Success = result.EntryHop != nil
 	return result
 }
 
@@ -272,6 +363,18 @@ func normalizeASN(v string) string {
 func isMainlandChina(country string) bool {
 	v := strings.ToLower(strings.TrimSpace(country))
 	return (strings.Contains(v, "中国") || v == "china") && !strings.Contains(v, "香港") && !strings.Contains(v, "澳门") && !strings.Contains(v, "台湾")
+}
+
+func isMainlandEntryHop(hop returnRouteHop) bool {
+	if isMainlandChina(hop.Country) || strings.HasPrefix(hop.IP, "59.43.") {
+		return true
+	}
+	switch normalizeASN(hop.ASN) {
+	case "23764", "4809", "4134", "4837", "9929", "10099", "58453", "9808", "58807", "4538", "7497":
+		return true
+	default:
+		return false
+	}
 }
 
 func classifyReturnRoute(entry *returnRouteHop, path []string) (string, string) {
