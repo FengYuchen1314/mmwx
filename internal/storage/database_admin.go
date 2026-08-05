@@ -189,6 +189,17 @@ func (r *TrafficRepository) MigrateSQLiteToPostgresWithProgress(ctx context.Cont
 			}
 		}
 	}
+	// A migration is not successful merely because every INSERT returned nil.
+	// Verify the fields that determine the displayed server traffic before the
+	// target transaction can commit or database.json can switch drivers.
+	if err := verifyMigratedServerTrafficState(ctx, sourceTx, targetTx); err != nil {
+		return report, fmt.Errorf("verify server traffic state: %w", err)
+	}
+	// The target already contains verified cycle/offset values. Suppress the
+	// legacy startup repair that used to replace them with Xray aggregates.
+	if _, err := targetTx.ExecContext(ctx, `INSERT INTO system_settings(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`, SystemTrafficSnapshotBackfillMarker, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		return report, fmt.Errorf("mark verified server traffic migration: %w", err)
+	}
 	if err := targetTx.Commit(); err != nil {
 		return report, err
 	}
@@ -202,6 +213,126 @@ func (r *TrafficRepository) MigrateSQLiteToPostgresWithProgress(ctx context.Cont
 		notify(DatabaseMigrationProgress{Phase: "completed", TotalTables: len(tables), CompletedTables: len(tables), Rows: report.Rows, Skipped: report.Skipped})
 	}
 	return report, nil
+}
+
+type migratedServerTrafficState struct {
+	SystemRx, SystemTx, LastSeenRx, LastSeenTx, Boot, Offset int64
+	Source, Mode                                             string
+	NodeUp, NodeDown                                         int64
+}
+
+func verifyMigratedServerTrafficState(ctx context.Context, source *sql.Tx, target *dialectTx) error {
+	readSource := func() (map[int64]migratedServerTrafficState, error) {
+		rows, err := source.QueryContext(ctx, `SELECT r.id,COALESCE(r.system_rx_cycle,0),COALESCE(r.system_tx_cycle,0),COALESCE(r.system_last_seen_rx,0),COALESCE(r.system_last_seen_tx,0),COALESCE(r.system_boot_time_unix,0),COALESCE(r.traffic_used_offset,0),COALESCE(r.traffic_source,'xray'),COALESCE(r.traffic_stats_mode,'both'),COALESCE((SELECT SUM(n.uplink) FROM node_traffic n WHERE n.server_id=r.id),0),COALESCE((SELECT SUM(n.downlink) FROM node_traffic n WHERE n.server_id=r.id),0) FROM remote_servers r ORDER BY r.id`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		result := map[int64]migratedServerTrafficState{}
+		for rows.Next() {
+			var id int64
+			var value migratedServerTrafficState
+			if err := rows.Scan(&id, &value.SystemRx, &value.SystemTx, &value.LastSeenRx, &value.LastSeenTx, &value.Boot, &value.Offset, &value.Source, &value.Mode, &value.NodeUp, &value.NodeDown); err != nil {
+				return nil, err
+			}
+			result[id] = value
+		}
+		return result, rows.Err()
+	}
+	readTarget := func() (map[int64]migratedServerTrafficState, error) {
+		rows, err := target.QueryContext(ctx, `SELECT r.id,COALESCE(r.system_rx_cycle,0),COALESCE(r.system_tx_cycle,0),COALESCE(r.system_last_seen_rx,0),COALESCE(r.system_last_seen_tx,0),COALESCE(r.system_boot_time_unix,0),COALESCE(r.traffic_used_offset,0),COALESCE(r.traffic_source,'xray'),COALESCE(r.traffic_stats_mode,'both'),COALESCE((SELECT SUM(n.uplink) FROM node_traffic n WHERE n.server_id=r.id),0),COALESCE((SELECT SUM(n.downlink) FROM node_traffic n WHERE n.server_id=r.id),0) FROM remote_servers r ORDER BY r.id`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		result := map[int64]migratedServerTrafficState{}
+		for rows.Next() {
+			var id int64
+			var value migratedServerTrafficState
+			if err := rows.Scan(&id, &value.SystemRx, &value.SystemTx, &value.LastSeenRx, &value.LastSeenTx, &value.Boot, &value.Offset, &value.Source, &value.Mode, &value.NodeUp, &value.NodeDown); err != nil {
+				return nil, err
+			}
+			result[id] = value
+		}
+		return result, rows.Err()
+	}
+	sourceState, err := readSource()
+	if err != nil {
+		return fmt.Errorf("read SQLite traffic state: %w", err)
+	}
+	targetState, err := readTarget()
+	if err != nil {
+		return fmt.Errorf("read PostgreSQL traffic state: %w", err)
+	}
+	if len(sourceState) != len(targetState) {
+		return fmt.Errorf("server count differs: sqlite=%d postgres=%d", len(sourceState), len(targetState))
+	}
+	for id, expected := range sourceState {
+		actual, ok := targetState[id]
+		if !ok {
+			return fmt.Errorf("server %d is missing in PostgreSQL", id)
+		}
+		if actual != expected {
+			return fmt.Errorf("server %d differs: sqlite=%+v postgres=%+v", id, expected, actual)
+		}
+	}
+	sourceReset := map[int64]*time.Time{}
+	rows, err := source.QueryContext(ctx, `SELECT id,last_traffic_reset_at FROM remote_servers ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id int64
+		var raw any
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		if raw == nil {
+			sourceReset[id] = nil
+			continue
+		}
+		normalized, err := normalizePostgresValue(raw, "timestamp without time zone")
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("normalize server %d last reset: %w", id, err)
+		}
+		value, ok := normalized.(time.Time)
+		if !ok {
+			rows.Close()
+			return fmt.Errorf("server %d last reset has type %T", id, normalized)
+		}
+		value = value.UTC()
+		sourceReset[id] = &value
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	targetRows, err := target.QueryContext(ctx, `SELECT id,last_traffic_reset_at FROM remote_servers ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	for targetRows.Next() {
+		var id int64
+		var actual sql.NullTime
+		if err := targetRows.Scan(&id, &actual); err != nil {
+			targetRows.Close()
+			return err
+		}
+		expected := sourceReset[id]
+		if expected == nil && actual.Valid {
+			targetRows.Close()
+			return fmt.Errorf("server %d last reset unexpectedly set", id)
+		}
+		if expected != nil && (!actual.Valid || !actual.Time.UTC().Equal(*expected)) {
+			targetRows.Close()
+			return fmt.Errorf("server %d last reset differs: sqlite=%v postgres=%v", id, expected, actual)
+		}
+	}
+	if err := targetRows.Close(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ReleaseDatabaseMigrationGate is only used when publishing the new config or

@@ -56,15 +56,88 @@ func (h *TrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleServerPeriodTotals(w, r)
 	case path == "user-nodes":
 		h.handleUserNodes(w, r)
+	case path == "user-period-totals":
+		h.handleUserPeriodTotals(w, r)
 	case path == "node-users":
 		h.handleNodeUsers(w, r)
 	case path == "node-totals":
 		h.handleNodeTotals(w, r)
 	case path == "user-connections":
 		h.handleUserConnections(w, r)
+	case path == "period":
+		h.handleLedgerPeriod(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// handleUserPeriodTotals is the legacy-snapshot companion of handleUserNodes.
+// Both endpoints derive their values from user_email_traffic with the same
+// attribution and current-package estimate, so a parent user row always equals
+// the sum of its drill-down rows for pre-ledger/incomplete ranges.
+func (h *TrafficHandler) handleUserPeriodTotals(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	date := strings.TrimSpace(r.URL.Query().Get("date"))
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		h.writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": "date must be YYYY-MM-DD"})
+		return
+	}
+	ctx := r.Context()
+	baseUp, baseDown := h.emailBaseline(ctx, date)
+	attr, err := h.repo.BuildEmailAttributor(ctx)
+	if err != nil {
+		h.writeJSON(w, 500, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	rows, err := h.repo.ListUserEmailTraffic(ctx)
+	if err != nil {
+		h.writeJSON(w, 500, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	type dirs struct{ up, down float64 }
+	totals := map[string]dirs{}
+	packages := map[string]*storage.Package{}
+	for _, row := range rows {
+		at := attr.Classify(row.Email, row.ServerID)
+		if at.Username == "" {
+			continue
+		}
+		e := subEmailBaseline(row, baseUp, baseDown)
+		pkg, ok := packages[at.Username]
+		if !ok {
+			if u, e := h.repo.GetUser(ctx, at.Username); e == nil && u.PackageID > 0 {
+				pkg, _ = h.repo.GetPackage(ctx, u.PackageID)
+			}
+			packages[at.Username] = pkg
+		}
+		weight := 1.0
+		if pkg != nil {
+			weight = float64(pkg.TrafficMultiplier())
+			if len(at.Shares) > 0 {
+				weight = 0
+				for _, share := range at.Shares {
+					scale := share.Scale
+					if scale < 1 {
+						scale = 1
+					}
+					weight += pkg.MultiplierForNode(share.NodeID) * float64(pkg.TrafficMultiplier()) / float64(scale)
+				}
+			}
+		}
+		d := totals[at.Username]
+		d.up += float64(e.Uplink) * weight
+		d.down += float64(e.Downlink) * weight
+		totals[at.Username] = d
+	}
+	items := make([]periodTrafficItem, 0, len(totals))
+	for username, d := range totals {
+		items = append(items, periodTrafficItem{Username: username, Uplink: d.up, Downlink: d.down, Used: d.up + d.down})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Used > items[j].Used })
+	h.writeJSON(w, http.StatusOK, map[string]any{"success": true, "date": date, "items": items})
 }
 
 // handleServerPeriodTotals 返回从 date 当日 00:00 到当前的服务器流量。
@@ -242,6 +315,10 @@ func (h *TrafficHandler) handleUserNodes(w http.ResponseWriter, r *http.Request)
 		if date == "" {
 			uet.Uplink = int64(uet.WeightedUplink)
 			uet.Downlink = int64(uet.WeightedDownlink)
+		}
+		if len(at.Shares) == 0 {
+			addToNode(storage.NodeShare{NodeID: 0, NodeName: "未归属", Scale: 1}, uet)
+			continue
 		}
 		for _, ns := range at.Shares {
 			addToNode(ns, storage.ScaledEmailTraffic(uet, ns.Scale))
@@ -684,19 +761,22 @@ func subEmailBaseline(uet storage.UserEmailTraffic, up, down map[string]int64) s
 		return uet
 	}
 	k := strconv.FormatInt(uet.ServerID, 10) + "|" + uet.Email
-	if b, ok := up[k]; ok {
-		if uet.Uplink > b {
-			uet.Uplink -= b
-		} else {
-			uet.Uplink = 0
-		}
+	baseUp, hasUp := up[k]
+	baseDown, hasDown := down[k]
+	// The selected baseline may belong to the previous package/reset cycle.
+	// user_email_traffic is reset by raising cycle_base_*, so its current
+	// cycle-delta can legitimately be smaller than the historical snapshot.
+	// In that case both directions must fall back to the full current cycle,
+	// exactly like the dashboard user total. Clamping each direction to zero
+	// made the user row non-zero while every node in its drilldown showed 0 B.
+	if (hasUp && uet.Uplink < baseUp) || (hasDown && uet.Downlink < baseDown) {
+		return uet
 	}
-	if b, ok := down[k]; ok {
-		if uet.Downlink > b {
-			uet.Downlink -= b
-		} else {
-			uet.Downlink = 0
-		}
+	if hasUp {
+		uet.Uplink -= baseUp
+	}
+	if hasDown {
+		uet.Downlink -= baseDown
 	}
 	return uet
 }
