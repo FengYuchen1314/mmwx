@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 )
@@ -62,5 +63,52 @@ func TestSharedInboundTracking(t *testing.T) {
 	tags2, _ = repo.ListSharedInboundTags(ctx, 2)
 	if len(tags2) != 1 {
 		t.Fatalf("清 share1 不应影响 share2,实际 %v", tags2)
+	}
+}
+
+// 修改物理入站时，批量刷新只能更新父节点；routed 子节点必须随后用自己的
+// 凭据重建，不能先被父节点配置覆盖。
+func TestInboundUpdateKeepsRoutedChildForDedicatedRefresh(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "routed-refresh.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	ctx := context.Background()
+	parent, err := repo.CreateNode(ctx, Node{Username: "admin", NodeName: "parent", Protocol: "vless", ClashConfig: `{"name":"parent","server":"old","port":443}`, ParsedConfig: `{"old":true}`, Enabled: true, OriginalServer: "S", InboundTag: "in-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := parent.ID
+	child, err := repo.CreateRoutedNode(ctx, RoutedNodeDetail{
+		Node:              Node{Username: "admin", NodeName: "child", Protocol: "vless", ClashConfig: `{"name":"child","server":"old","port":443,"uuid":"child-id"}`, ParsedConfig: `{"old":true}`, Enabled: true, OriginalServer: "S", InboundTag: "in-1", NodeType: "routed", ParentNodeID: &parentID},
+		RoutedOutboundTag: "routed:test", RoutedRuleMarktag: "route-test", RoutedAdminCredential: `{"id":"child-id"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentConfig := `{"name":"parent","server":"new","port":8443,"uuid":"parent-id"}`
+	if err := repo.UpdateNodeByInboundTag(ctx, "S", "in-1", parentConfig, "v4"); err != nil {
+		t.Fatal(err)
+	}
+	beforeRefresh, err := repo.GetNodeByID(ctx, child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before map[string]any
+	_ = json.Unmarshal([]byte(beforeRefresh.ClashConfig), &before)
+	if before["server"] != "old" || before["uuid"] != "child-id" {
+		t.Fatalf("routed child was overwritten by physical update: %#v", before)
+	}
+	childConfig := `{"name":"child","server":"new","port":8443,"uuid":"child-id"}`
+	if err := repo.UpdateRoutedNodeProxyConfigs(ctx, child.ID, `{"transport":"new"}`, childConfig, "vless"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := repo.GetNodeByID(ctx, child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ClashConfig != childConfig || after.ParsedConfig != `{"transport":"new"}` || after.NodeName != "child" {
+		t.Fatalf("routed child refresh incomplete: %#v", after)
 	}
 }

@@ -260,6 +260,28 @@ func (r *TrafficRepository) UpdateNodeClashCredential(ctx context.Context, id in
 	return nil
 }
 
+// UpdateRoutedNodeProxyConfigs refreshes a routed child's inherited transport
+// settings after its physical inbound is replaced, while preserving the child
+// identity and outbound/rule metadata.
+func (r *TrafficRepository) UpdateRoutedNodeProxyConfigs(ctx context.Context, id int64, parsedConfig, clashConfig, protocol string) error {
+	if r == nil || r.db == nil {
+		return errors.New("traffic repository not initialized")
+	}
+	res, err := r.db.ExecContext(ctx, `UPDATE nodes SET protocol=?, parsed_config=?, clash_config=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND COALESCE(node_type,'physical')='routed'`,
+		protocol, parsedConfig, clashConfig, id)
+	if err != nil {
+		return fmt.Errorf("update routed node proxy configs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update routed node proxy configs rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrNodeNotFound
+	}
+	return nil
+}
+
 // UpdateRoutedAdminCredential keeps the routed node's stored admin credential
 // and its subscription-facing Clash config in sync.
 func (r *TrafficRepository) UpdateRoutedAdminCredential(ctx context.Context, id int64, credentialJSON, clashConfig string) error {
@@ -1103,7 +1125,8 @@ func (r *TrafficRepository) UpdateNodeByInboundTag(ctx context.Context, serverNa
 	query := `
 		UPDATE nodes
 		SET clash_config = ?, parsed_config = ?, updated_at = CURRENT_TIMESTAMP
-		WHERE original_server = ? AND inbound_tag = ?`
+		WHERE original_server = ? AND inbound_tag = ?
+		  AND COALESCE(node_type, 'physical') != 'routed'`
 	switch family {
 	case "v4":
 		query += ` AND IFNULL(ip_family, '') != 'v6'`

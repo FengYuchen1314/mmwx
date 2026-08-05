@@ -509,33 +509,30 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 	// 下面基于 chooseClashServerHost 的 v4/v6 更新只对「非中转」节点生效。
 	if l.applyRelayNodesOnUpdate(ctx, server.Name, event, clashConfig) {
 		log.Printf("[NodeSync] Updated relay node(s) for inbound: %s/%s", server.Name, event.Tag)
-		return
-	}
+	} else {
+		// v4/域名节点:用 base 配置(server = chooseClashServerHost)更新。
+		if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, clashConfig, "v4"); err != nil {
+			log.Printf("[NodeSync] Failed to update v4 node: %v", err)
+		}
 
-	// v4/域名节点:用 base 配置(server = chooseClashServerHost)更新。
-	// 订阅生成时 proxy 名取 node_name 列(subscription.go:988),clash_config 内的 name 仅内部用,无需特意保留。
-	if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, clashConfig, "v4"); err != nil {
-		log.Printf("[NodeSync] Failed to update v4 node: %v", err)
-	}
-
-	// IPv6 节点:同一 inbound_tag 下若存在 v6 节点,用相同入站配置但 server 改回 v6 host(域名优先)更新,
-	// 避免被 base(v4)配置覆盖回 v4。server 无 v6(域名/字面地址都无)时无 v6 节点,跳过。
-	if v6Host := chooseClashServerHostV6(server); v6Host != "" {
-		var m map[string]any
-		if json.Unmarshal([]byte(clashConfig), &m) == nil {
-			name, _ := m["name"].(string)
-			if v6cfg, cerr := cloneClashWithServer(m, name, v6Host); cerr == nil {
-				if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, v6cfg, "v6"); err != nil {
-					log.Printf("[NodeSync] Failed to update v6 node: %v", err)
+		// IPv6 节点使用自己的地址更新，且存储层只更新物理节点，不再先污染 routed 子节点。
+		if v6Host := chooseClashServerHostV6(server); v6Host != "" {
+			var m map[string]any
+			if json.Unmarshal([]byte(clashConfig), &m) == nil {
+				name, _ := m["name"].(string)
+				if v6cfg, cerr := cloneClashWithServer(m, name, v6Host); cerr == nil {
+					if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, v6cfg, "v6"); err != nil {
+						log.Printf("[NodeSync] Failed to update v6 node: %v", err)
+					}
 				}
 			}
 		}
 	}
-	l.refreshRoutedChildrenAfterInboundUpdate(ctx, server.Name, event.Tag, clashConfig)
+	l.refreshRoutedChildrenAfterInboundUpdate(ctx, server.Name, event.Tag)
 	log.Printf("[NodeSync] Updated node(s) for inbound: %s/%s", server.Name, event.Tag)
 }
 
-func (l *NodeSyncListener) refreshRoutedChildrenAfterInboundUpdate(ctx context.Context, serverName, inboundTag, parentClash string) {
+func (l *NodeSyncListener) refreshRoutedChildrenAfterInboundUpdate(ctx context.Context, serverName, inboundTag string) {
 	nodes, err := l.repo.ListAllNodes(ctx)
 	if err != nil {
 		return
@@ -553,8 +550,10 @@ func (l *NodeSyncListener) refreshRoutedChildrenAfterInboundUpdate(ctx context.C
 			if json.Unmarshal([]byte(child.RoutedAdminCredential), &credential) != nil {
 				continue
 			}
-			clash := cloneClashWithCredentialForUpdate(parentClash, child.Protocol, credential, child.NodeName)
-			if err := l.repo.UpdateNodeClashCredential(ctx, child.ID, clash); err != nil {
+			// 每个物理父节点可能分别是 v4、v6 或中转节点。必须基于该父节点刚刚
+			// 更新后的实际配置重建，不能统一套用事件里的 v4 基础配置。
+			clash := cloneClashWithCredentialForUpdate(parent.ClashConfig, parent.Protocol, credential, child.NodeName)
+			if err := l.repo.UpdateRoutedNodeProxyConfigs(ctx, child.ID, parent.ParsedConfig, clash, parent.Protocol); err != nil {
 				log.Printf("[NodeSync] update routed child %d after inbound edit failed: %v", child.ID, err)
 			}
 		}
@@ -622,6 +621,9 @@ func (l *NodeSyncListener) applyRelayNodesOnUpdate(ctx context.Context, serverNa
 	for _, n := range nodes {
 		if n.OriginalServer != serverName || n.InboundTag != event.Tag {
 			continue
+		}
+		if n.NodeType == "routed" {
+			continue // 子节点在父节点完成后按各自凭据统一重建
 		}
 		if newRelay == "" && strings.TrimSpace(n.RelayOrigServer) == "" {
 			continue // 该节点不是中转,交给普通 v4/v6 更新
