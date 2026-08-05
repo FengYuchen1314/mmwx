@@ -11,7 +11,13 @@ import (
 	"time"
 )
 
-//go:embed dist/*
+// Embed the directory as a single tree. Using dist/* makes each immediate
+// child an individual match, so an empty directory copied by Vite (for
+// example dist/twemoji) causes "contains no embeddable files" at build time.
+// Empty directories are irrelevant to the runtime file server and are safely
+// ignored when the whole tree is embedded.
+//
+//go:embed dist
 var embeddedFiles embed.FS
 
 // themePlaceholder 是 index.html 内联脚本里的默认主题占位符,serveIndex 时替换成管理员设置的值。

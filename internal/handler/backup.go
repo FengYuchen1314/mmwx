@@ -16,10 +16,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"miaomiaowux/internal/storage"
 )
+
+var postgresClientInstallMu sync.Mutex
+
+const postgresClientMajor = "17"
 
 // NewBackupDownloadHandler 返回一个创建并下载 ZIP 备份的处理程序。
 // 该处理程序需要管理员身份验证。
@@ -82,7 +87,7 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository, dataDir string) h
 			return
 		}
 		subscribeDir := filepath.Join(filepath.Dir(dataDir), "subscribes")
-		if err := addDirToZip(zipWriter, subscribeDir, "subscribes"); err != nil {
+		if err := addOptionalDirToZip(zipWriter, subscribeDir, "subscribes"); err != nil {
 			writeBackupError(w, http.StatusInternalServerError, fmt.Errorf("打包 subscribes 失败: %w", err))
 			return
 		}
@@ -98,10 +103,19 @@ func NewBackupDownloadHandler(repo *storage.TrafficRepository, dataDir string) h
 	})
 }
 
+func addOptionalDirToZip(zipWriter *zip.Writer, srcDir, baseInZip string) error {
+	if _, err := os.Stat(srcDir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return addDirToZip(zipWriter, srcDir, baseInZip)
+}
+
 func createPostgresDump(ctx context.Context, cfg storage.DatabaseConfig) ([]byte, error) {
-	bin, err := exec.LookPath("pg_dump")
+	bin, err := ensurePostgresClientTool(ctx, "pg_dump")
 	if err != nil {
-		return nil, errors.New("未找到 pg_dump，无法创建 PostgreSQL 备份；Docker 请升级并重建最新镜像，裸机请安装与数据库服务端同版本或更高版本的 PostgreSQL client")
+		return nil, err
 	}
 	dumpCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
@@ -125,6 +139,150 @@ func createPostgresDump(ctx context.Context, cfg storage.DatabaseConfig) ([]byte
 		return nil, errors.New("PostgreSQL 备份失败：pg_dump 未返回有效的 custom dump")
 	}
 	return dump, nil
+}
+
+// ensurePostgresClientTool locates an official PostgreSQL client tool and, on
+// a privileged bare-metal installation, installs the client package on demand.
+func ensurePostgresClientTool(ctx context.Context, tool string) (string, error) {
+	if path, ok := compatiblePostgresTool(tool); ok {
+		return path, nil
+	}
+
+	postgresClientInstallMu.Lock()
+	defer postgresClientInstallMu.Unlock()
+	if path, ok := compatiblePostgresTool(tool); ok {
+		return path, nil
+	}
+
+	type installStep struct {
+		name string
+		args []string
+	}
+	var steps []installStep
+	switch {
+	case commandExists("apt-get"):
+		steps = []installStep{
+			{name: "apt-get", args: []string{"update", "-qq"}},
+			{name: "apt-get", args: []string{"install", "-y", "postgresql-client-17"}},
+		}
+	case commandExists("apk"):
+		steps = []installStep{{name: "apk", args: []string{"add", "--no-cache", "postgresql17-client"}}}
+	case commandExists("dnf"):
+		steps = []installStep{{name: "dnf", args: []string{"install", "-y", "postgresql17"}}}
+	case commandExists("yum"):
+		steps = []installStep{{name: "yum", args: []string{"install", "-y", "postgresql17"}}}
+	case commandExists("pacman"):
+		steps = []installStep{{name: "pacman", args: []string{"-Sy", "--noconfirm", "postgresql"}}}
+	default:
+		return "", fmt.Errorf("未找到 %s，且无法识别系统包管理器；请安装与数据库服务端同版本或更高版本的 PostgreSQL client", tool)
+	}
+
+	installCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	for _, step := range steps {
+		cmd := exec.CommandContext(installCtx, step.name, step.args...)
+		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			// An unrelated third-party apt source may be expired while Debian's
+			// cached indexes remain usable. Continue to the actual install step.
+			if step.name == "apt-get" && len(step.args) > 0 && step.args[0] == "update" {
+				continue
+			}
+			// Debian/Ubuntu LTS repositories can be older than PG17. Add the
+			// official PostgreSQL repository and install the exact client major.
+			if step.name == "apt-get" && installPostgres17FromPGDG(installCtx) == nil {
+				continue
+			}
+			detail := strings.TrimSpace(string(output))
+			if detail == "" {
+				detail = err.Error()
+			}
+			return "", fmt.Errorf("未找到 %s，自动安装 PostgreSQL client 失败（主控进程可能没有 root 权限）: %s", tool, detail)
+		}
+	}
+
+	path, ok := compatiblePostgresTool(tool)
+	if !ok {
+		return "", fmt.Errorf("PostgreSQL client 安装完成，但未找到可用的 PG%s %s；旧系统请启用 PostgreSQL 官方 PGDG 软件源", postgresClientMajor, tool)
+	}
+	return path, nil
+}
+
+func installPostgres17FromPGDG(ctx context.Context) error {
+	prerequisites := exec.CommandContext(ctx, "apt-get", "install", "-y", "ca-certificates", "curl", "gnupg")
+	prerequisites.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+	if output, err := prerequisites.CombinedOutput(); err != nil {
+		return fmt.Errorf("安装 PGDG 软件源依赖失败: %s", strings.TrimSpace(string(output)))
+	}
+	osRelease, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return err
+	}
+	codename := ""
+	for _, line := range strings.Split(string(osRelease), "\n") {
+		if strings.HasPrefix(line, "VERSION_CODENAME=") {
+			codename = strings.Trim(strings.TrimPrefix(line, "VERSION_CODENAME="), `"'`)
+			break
+		}
+	}
+	if codename == "" || strings.ContainsAny(codename, " /\\\t\r\n") {
+		return errors.New("无法识别 Debian/Ubuntu VERSION_CODENAME")
+	}
+	if err := os.MkdirAll("/usr/share/postgresql-common/pgdg", 0755); err != nil {
+		return err
+	}
+	keyFile, err := os.CreateTemp("", "mmwx-pgdg-key-*.asc")
+	if err != nil {
+		return err
+	}
+	keyPath := keyFile.Name()
+	_ = keyFile.Close()
+	defer os.Remove(keyPath)
+	if output, err := exec.CommandContext(ctx, "curl", "-fsSL", "-o", keyPath, "https://www.postgresql.org/media/keys/ACCC4CF8.asc").CombinedOutput(); err != nil {
+		return fmt.Errorf("下载 PGDG 签名密钥失败: %s", strings.TrimSpace(string(output)))
+	}
+	keyring := "/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg"
+	if output, err := exec.CommandContext(ctx, "gpg", "--dearmor", "--yes", "--output", keyring, keyPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("导入 PGDG 签名密钥失败: %s", strings.TrimSpace(string(output)))
+	}
+	sourcePath := "/etc/apt/sources.list.d/pgdg.list"
+	source := fmt.Sprintf("deb [signed-by=%s] https://apt.postgresql.org/pub/repos/apt %s-pgdg main\n", keyring, codename)
+	if err := os.WriteFile(sourcePath, []byte(source), 0644); err != nil {
+		return err
+	}
+	update := exec.CommandContext(ctx, "apt-get", "update",
+		"-o", "Dir::Etc::sourcelist=sources.list.d/pgdg.list",
+		"-o", "Dir::Etc::sourceparts=-",
+		"-o", "APT::Get::List-Cleanup=0")
+	if output, err := update.CombinedOutput(); err != nil {
+		return fmt.Errorf("更新 PGDG 软件源失败: %s", strings.TrimSpace(string(output)))
+	}
+	install := exec.CommandContext(ctx, "apt-get", "install", "-y", "postgresql-client-17")
+	install.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+	if output, err := install.CombinedOutput(); err != nil {
+		return fmt.Errorf("安装 PostgreSQL 17 client 失败: %s", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func compatiblePostgresTool(tool string) (string, bool) {
+	paths := []string{filepath.Join("/usr/lib/postgresql", postgresClientMajor, "bin", tool)}
+	if path, err := exec.LookPath(tool); err == nil {
+		paths = append(paths, path)
+	}
+	for _, path := range paths {
+		output, err := exec.Command(path, "--version").CombinedOutput()
+		if err == nil && strings.Contains(string(output), " "+postgresClientMajor+".") {
+			return path, true
+		}
+	}
+	return "", false
+}
+
+func commandExists(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
 }
 
 func addBytesToZip(writer *zip.Writer, name string, data []byte) error {
@@ -392,9 +550,9 @@ func postgresDumpFromBackup(data []byte) ([]byte, bool, error) {
 }
 
 func restorePostgresToStaging(ctx context.Context, dump []byte, cfg storage.DatabaseConfig) (storage.DatabaseConfig, error) {
-	bin, err := exec.LookPath("pg_restore")
+	bin, err := ensurePostgresClientTool(ctx, "pg_restore")
 	if err != nil {
-		return storage.DatabaseConfig{}, errors.New("未找到 pg_restore；请安装与数据库服务端同版本或更高版本的 PostgreSQL client")
+		return storage.DatabaseConfig{}, err
 	}
 	tmp, err := os.CreateTemp("", "mmwx-postgres-restore-*.dump")
 	if err != nil {
@@ -431,7 +589,16 @@ func restorePostgresToStaging(ctx context.Context, dump []byte, cfg storage.Data
 	}
 	stageName := postgresRestoreDatabaseName(cfg.Database)
 	if _, err := adminDB.ExecContext(ctx, `CREATE DATABASE `+quotePostgresIdentifier(stageName)+` TEMPLATE template0`); err != nil {
-		return storage.DatabaseConfig{}, fmt.Errorf("创建恢复数据库失败（数据库用户需要 CREATEDB 权限）: %w", err)
+		if isCreateDatabasePermissionError(err) {
+			if grantErr := tryGrantLocalPostgresCreatedb(ctx, cfg); grantErr == nil {
+				_, err = adminDB.ExecContext(ctx, `CREATE DATABASE `+quotePostgresIdentifier(stageName)+` TEMPLATE template0`)
+			} else {
+				return storage.DatabaseConfig{}, fmt.Errorf("创建恢复数据库失败，且本机自动授予 CREATEDB 权限失败: %v；原始错误: %w", grantErr, err)
+			}
+		}
+		if err != nil {
+			return storage.DatabaseConfig{}, fmt.Errorf("创建恢复数据库失败（远程数据库请由管理员为 %s 授予 CREATEDB 权限）: %w", cfg.Username, err)
+		}
 	}
 	dropStage := true
 	defer func() {
@@ -470,6 +637,52 @@ func restorePostgresToStaging(ctx context.Context, dump []byte, cfg storage.Data
 	}
 	dropStage = false
 	return newConfig, nil
+}
+
+func isCreateDatabasePermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "sqlstate 42501") || strings.Contains(message, "permission denied to create database")
+}
+
+// tryGrantLocalPostgresCreatedb removes the command-line step for the common
+// bare-metal setup. It deliberately works only for a loopback PostgreSQL and a
+// root master process, using PostgreSQL's local peer-authenticated OS account;
+// no database superuser password is requested, transmitted, or stored.
+func tryGrantLocalPostgresCreatedb(ctx context.Context, cfg storage.DatabaseConfig) error {
+	host := strings.TrimSpace(strings.ToLower(cfg.Host))
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" && !strings.HasPrefix(host, "/") {
+		return errors.New("数据库不是本机地址")
+	}
+	if os.Geteuid() != 0 {
+		return errors.New("主控进程不是 root，无法切换到 postgres 系统账号")
+	}
+	runuser, err := exec.LookPath("runuser")
+	if err != nil {
+		return errors.New("系统缺少 runuser")
+	}
+	psql := filepath.Join("/usr/lib/postgresql", postgresClientMajor, "bin", "psql")
+	if _, err := os.Stat(psql); err != nil {
+		psql, err = exec.LookPath("psql")
+		if err != nil {
+			return errors.New("系统缺少 psql")
+		}
+	}
+	grantCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	statement := `ALTER ROLE ` + quotePostgresIdentifier(cfg.Username) + ` CREATEDB`
+	cmd := exec.CommandContext(grantCtx, runuser, "-u", "postgres", "--", psql,
+		"--no-psqlrc", "--set", "ON_ERROR_STOP=1", "--dbname", "postgres", "--command", statement)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		detail := strings.TrimSpace(string(output))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return errors.New(detail)
+	}
+	return nil
 }
 
 func postgresConfigDSN(cfg storage.DatabaseConfig) string {
