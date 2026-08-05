@@ -21,18 +21,31 @@ const probeExternalTokenHeader = "X-MMwx-Probe-Token"
 // 无法从协议层绝对阻止能够伪造 Origin/Referer 的服务端抓取，因此仍需配合限流。
 func RequireProbeExternalAccess(repo *storage.TrafficRepository, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		only, _ := repo.GetSystemSetting(r.Context(), probeExternalOnlyKey)
-		if only != "1" {
+		internalOn, externalOn := probeChannelEnabled(repo, r)
+		if (externalOn && validProbeExternalToken(repo, r)) ||
+			(internalOn && probeSameOriginRequest(repo, r)) {
 			next.ServeHTTP(w, r)
 			return
 		}
-
-		if validProbeExternalToken(repo, r) || probeSameOriginRequest(repo, r) {
+		// 未开启接口保护时，外置探针可按原有公开接口方式访问；内置开关不会
+		// 顺带公开接口。开启保护后，外置请求必须携带专用密钥。
+		only, _ := repo.GetSystemSetting(r.Context(), probeExternalOnlyKey)
+		if externalOn && only != "1" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		http.NotFound(w, r)
 	})
+}
+
+func probeChannelEnabled(repo *storage.TrafficRepository, r *http.Request) (internal, external bool) {
+	internalRaw, _ := repo.GetSystemSetting(r.Context(), probeInternalEnabledKey)
+	externalRaw, _ := repo.GetSystemSetting(r.Context(), probeExternalEnabledKey)
+	if internalRaw == "" && externalRaw == "" {
+		legacy, _ := repo.GetSystemSetting(r.Context(), probeDisguiseEnabledKey)
+		return legacy == "1", legacy == "1"
+	}
+	return internalRaw == "1", externalRaw == "1"
 }
 
 func validProbeExternalToken(repo *storage.TrafficRepository, r *http.Request) bool {

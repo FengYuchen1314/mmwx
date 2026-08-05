@@ -326,6 +326,8 @@ func (h *SystemSettingsHandler) SetExternalHTTPS(w http.ResponseWriter, r *http.
 // 伪装探针配置的 4 个 KV 键。
 const (
 	probeDisguiseEnabledKey = "probe_disguise_enabled" // "1"/"" 开关
+	probeInternalEnabledKey = "probe_internal_enabled" // 内置探针独立开关
+	probeExternalEnabledKey = "probe_external_enabled" // 外置探针独立开关
 	probeDisguiseTitleKey   = "probe_disguise_title"   // 伪装页标题(管理员自定义)
 	// 伪装页 logo:图片 URL 或 data: URI。空=只显示标题。
 	// data: URI 有大小上限(probeLogoMaxBytes)——公开端点每 5 秒轮询一次,大图会持续吃带宽。
@@ -369,6 +371,12 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	}
 	ctx := r.Context()
 	enabled, _ := h.repo.GetSystemSetting(ctx, probeDisguiseEnabledKey)
+	internalEnabled, _ := h.repo.GetSystemSetting(ctx, probeInternalEnabledKey)
+	externalEnabled, _ := h.repo.GetSystemSetting(ctx, probeExternalEnabledKey)
+	// 新开关首次升级尚未写入时，沿用旧总开关，避免升级后探针意外关闭。
+	if internalEnabled == "" && externalEnabled == "" && enabled == "1" {
+		internalEnabled, externalEnabled = "1", "1"
+	}
 	title, _ := h.repo.GetSystemSetting(ctx, probeDisguiseTitleKey)
 	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
 	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
@@ -416,6 +424,8 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	json.NewEncoder(w).Encode(map[string]any{
 		"success":                   true,
 		"enabled":                   enabled == "1",
+		"internal_enabled":          internalEnabled == "1",
+		"external_enabled":          externalEnabled == "1",
 		"title":                     title,
 		"logo":                      logo,
 		"block_login":               blockLogin == "1",
@@ -447,8 +457,10 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		return
 	}
 	var req struct {
-		Enabled bool   `json:"enabled"`
-		Title   string `json:"title"`
+		Enabled         bool   `json:"enabled"`
+		InternalEnabled *bool  `json:"internal_enabled"`
+		ExternalEnabled *bool  `json:"external_enabled"`
+		Title           string `json:"title"`
 		// 指针语义:nil=不改(旧前端 PUT 不带这个字段时不会被冲成空)。
 		Logo       *string `json:"logo"`
 		BlockLogin *bool   `json:"block_login"`
@@ -495,6 +507,29 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 	}
 	if req.ServerIDs == nil {
 		req.ServerIDs = []int64{}
+	}
+	// enabled 保留给旧前端；新前端分别提交两个开关，总开关保存为二者的并集，供共享
+	// payload/采集任务判断是否仍有任一探针需要数据。
+	if req.InternalEnabled != nil || req.ExternalEnabled != nil {
+		oldInternal, _ := h.repo.GetSystemSetting(ctx, probeInternalEnabledKey)
+		oldExternal, _ := h.repo.GetSystemSetting(ctx, probeExternalEnabledKey)
+		internalOn, externalOn := oldInternal == "1", oldExternal == "1"
+		if oldInternal == "" && oldExternal == "" {
+			oldEnabled, _ := h.repo.GetSystemSetting(ctx, probeDisguiseEnabledKey)
+			internalOn, externalOn = oldEnabled == "1", oldEnabled == "1"
+		}
+		if req.InternalEnabled != nil {
+			internalOn = *req.InternalEnabled
+		}
+		if req.ExternalEnabled != nil {
+			externalOn = *req.ExternalEnabled
+		}
+		req.Enabled = internalOn || externalOn
+		if h.repo.SetSystemSetting(ctx, probeInternalEnabledKey, boolStr(internalOn)) != nil ||
+			h.repo.SetSystemSetting(ctx, probeExternalEnabledKey, boolStr(externalOn)) != nil {
+			fail()
+			return
+		}
 	}
 	idsJSON, _ := json.Marshal(req.ServerIDs)
 	// 密钥明文只用于本次计算 SHA-256，不写数据库、不返回给后续 GET。

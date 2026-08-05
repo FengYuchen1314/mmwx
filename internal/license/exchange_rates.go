@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// exchangeRatesTTL keeps probe prices reasonably close to the values configured
+// on the license server. Probe payloads are requested frequently, so fetching on
+// every request would put unnecessary load on the license service.
+const exchangeRatesTTL = 24 * time.Hour
+
 // ExchangeRates returns the value of one unit of each currency in CNY.
 // Results are cached because the public probe payload is rebuilt frequently.
 func (m *Manager) ExchangeRates(ctx context.Context) (map[string]float64, error) {
@@ -17,7 +22,7 @@ func (m *Manager) ExchangeRates(ctx context.Context) (map[string]float64, error)
 		return nil, errors.New("license unavailable")
 	}
 	m.exchangeMu.RLock()
-	if time.Since(m.exchangeFetchedAt) < 6*time.Hour && len(m.exchangeRates) > 0 {
+	if time.Since(m.exchangeFetchedAt) < exchangeRatesTTL && len(m.exchangeRates) > 0 {
 		out := cloneRates(m.exchangeRates)
 		m.exchangeMu.RUnlock()
 		return out, nil
@@ -31,11 +36,11 @@ func (m *Manager) ExchangeRates(ctx context.Context) (map[string]float64, error)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return nil, err
+		return m.staleExchangeRates(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("exchange rate service unavailable")
+		return m.staleExchangeRates(errors.New("exchange rate service unavailable"))
 	}
 	var result struct {
 		Success bool               `json:"success"`
@@ -43,16 +48,38 @@ func (m *Manager) ExchangeRates(ctx context.Context) (map[string]float64, error)
 		Error   string             `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return m.staleExchangeRates(err)
 	}
 	if !result.Success || len(result.Rates) == 0 {
-		return nil, errors.New(result.Error)
+		return m.staleExchangeRates(errors.New(result.Error))
+	}
+	clean := make(map[string]float64, len(result.Rates)+1)
+	for code, rate := range result.Rates {
+		code = strings.ToUpper(strings.TrimSpace(code))
+		if len(code) == 3 && rate > 0 {
+			clean[code] = rate
+		}
+	}
+	clean["CNY"] = 1
+	if len(clean) == 1 {
+		return m.staleExchangeRates(errors.New("license server returned no valid exchange rates"))
 	}
 	m.exchangeMu.Lock()
-	m.exchangeRates = cloneRates(result.Rates)
+	m.exchangeRates = cloneRates(clean)
 	m.exchangeFetchedAt = time.Now()
 	m.exchangeMu.Unlock()
-	return cloneRates(result.Rates), nil
+	return cloneRates(clean), nil
+}
+
+// staleExchangeRates keeps the probe usable during a temporary license-server
+// outage without silently replacing configured rates with hard-coded defaults.
+func (m *Manager) staleExchangeRates(fetchErr error) (map[string]float64, error) {
+	m.exchangeMu.RLock()
+	defer m.exchangeMu.RUnlock()
+	if len(m.exchangeRates) > 0 {
+		return cloneRates(m.exchangeRates), nil
+	}
+	return nil, fetchErr
 }
 
 func cloneRates(src map[string]float64) map[string]float64 {

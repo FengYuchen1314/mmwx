@@ -1189,6 +1189,7 @@ func (h *RemoteWSHandler) handleAuth(conn *websocket.Conn, preAuthConn *RemoteWS
 				if s.Region == "" && region.Flag() != "" {
 					_ = h.repo.UpdateRemoteServerProbeMeta(lookupCtx, s.ID, region.Flag(), s.RenewalPrice, s.RenewalCycle, s.RenewalCurrency, s.ExpiresAt)
 				}
+				_ = h.repo.UpdateRemoteServerLocation(lookupCtx, s.ID, region.Country, region.Region, region.City)
 				_ = h.repo.UpdateRemoteServerProvider(lookupCtx, s.ID, region.ProviderName, region.ProviderURL, region.TelecomPaidPeer)
 			}(server, ip)
 		}

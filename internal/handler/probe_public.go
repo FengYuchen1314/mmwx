@@ -61,6 +61,9 @@ type probeHourBucket struct {
 type probeServer struct {
 	Name            string `json:"name,omitempty"` // show_name 关闭时省略
 	Region          string `json:"region,omitempty"`
+	RegionCountry   string `json:"region_country,omitempty"`
+	RegionName      string `json:"region_name,omitempty"`
+	RegionCity      string `json:"region_city,omitempty"`
 	ProviderName    string `json:"provider_name,omitempty"`
 	ProviderURL     string `json:"provider_url,omitempty"`
 	TelecomPaidPeer bool   `json:"telecom_paid_peer,omitempty"`
@@ -196,7 +199,11 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		used, _ := h.repo.GetServerTrafficUsed(ctx, s.ID)
 		used += s.TrafficUsedOffset
 		online := (h.wsHandler != nil && h.wsHandler.IsConnected(s.Token)) || s.Status == "connected"
-		ps := probeServer{Online: online, Region: s.Region, TelecomPaidPeer: s.TelecomPaidPeer}
+		ps := probeServer{
+			Online: online, Region: s.Region, RegionCountry: s.RegionCountry,
+			RegionName: s.RegionName, RegionCity: s.RegionCity,
+			TelecomPaidPeer: s.TelecomPaidPeer,
+		}
 		if onSpeed {
 			up, down := s.CurrentUploadSpeed, s.CurrentDownloadSpeed
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
