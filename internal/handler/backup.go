@@ -24,8 +24,6 @@ import (
 
 var postgresClientInstallMu sync.Mutex
 
-const postgresClientMajor = "17"
-
 // NewBackupDownloadHandler 返回一个创建并下载 ZIP 备份的处理程序。
 // 该处理程序需要管理员身份验证。
 func NewBackupDownloadHandler(repo *storage.TrafficRepository, dataDir string) http.Handler {
@@ -113,7 +111,11 @@ func addOptionalDirToZip(zipWriter *zip.Writer, srcDir, baseInZip string) error 
 }
 
 func createPostgresDump(ctx context.Context, cfg storage.DatabaseConfig) ([]byte, error) {
-	bin, err := ensurePostgresClientTool(ctx, "pg_dump")
+	major, err := postgresServerMajor(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("读取 PostgreSQL 服务端版本失败: %w", err)
+	}
+	bin, err := ensurePostgresClientTool(ctx, "pg_dump", major)
 	if err != nil {
 		return nil, err
 	}
@@ -143,14 +145,17 @@ func createPostgresDump(ctx context.Context, cfg storage.DatabaseConfig) ([]byte
 
 // ensurePostgresClientTool locates an official PostgreSQL client tool and, on
 // a privileged bare-metal installation, installs the client package on demand.
-func ensurePostgresClientTool(ctx context.Context, tool string) (string, error) {
-	if path, ok := compatiblePostgresTool(tool); ok {
+func ensurePostgresClientTool(ctx context.Context, tool, major string) (string, error) {
+	if _, err := strconv.Atoi(major); err != nil || len(major) < 2 || len(major) > 3 {
+		return "", fmt.Errorf("无效的 PostgreSQL 主版本: %q", major)
+	}
+	if path, ok := compatiblePostgresTool(tool, major); ok {
 		return path, nil
 	}
 
 	postgresClientInstallMu.Lock()
 	defer postgresClientInstallMu.Unlock()
-	if path, ok := compatiblePostgresTool(tool); ok {
+	if path, ok := compatiblePostgresTool(tool, major); ok {
 		return path, nil
 	}
 
@@ -163,14 +168,14 @@ func ensurePostgresClientTool(ctx context.Context, tool string) (string, error) 
 	case commandExists("apt-get"):
 		steps = []installStep{
 			{name: "apt-get", args: []string{"update", "-qq"}},
-			{name: "apt-get", args: []string{"install", "-y", "postgresql-client-17"}},
+			{name: "apt-get", args: []string{"install", "-y", "postgresql-client-" + major}},
 		}
 	case commandExists("apk"):
-		steps = []installStep{{name: "apk", args: []string{"add", "--no-cache", "postgresql17-client"}}}
+		steps = []installStep{{name: "apk", args: []string{"add", "--no-cache", "postgresql" + major + "-client"}}}
 	case commandExists("dnf"):
-		steps = []installStep{{name: "dnf", args: []string{"install", "-y", "postgresql17"}}}
+		steps = []installStep{{name: "dnf", args: []string{"install", "-y", "postgresql" + major}}}
 	case commandExists("yum"):
-		steps = []installStep{{name: "yum", args: []string{"install", "-y", "postgresql17"}}}
+		steps = []installStep{{name: "yum", args: []string{"install", "-y", "postgresql" + major}}}
 	case commandExists("pacman"):
 		steps = []installStep{{name: "pacman", args: []string{"-Sy", "--noconfirm", "postgresql"}}}
 	default:
@@ -189,9 +194,10 @@ func ensurePostgresClientTool(ctx context.Context, tool string) (string, error) 
 			if step.name == "apt-get" && len(step.args) > 0 && step.args[0] == "update" {
 				continue
 			}
-			// Debian/Ubuntu LTS repositories can be older than PG17. Add the
+			// Debian/Ubuntu LTS repositories can be older than the configured
+			// PostgreSQL server. Add the
 			// official PostgreSQL repository and install the exact client major.
-			if step.name == "apt-get" && installPostgres17FromPGDG(installCtx) == nil {
+			if step.name == "apt-get" && installPostgresClientFromPGDG(installCtx, major) == nil {
 				continue
 			}
 			detail := strings.TrimSpace(string(output))
@@ -202,14 +208,14 @@ func ensurePostgresClientTool(ctx context.Context, tool string) (string, error) 
 		}
 	}
 
-	path, ok := compatiblePostgresTool(tool)
+	path, ok := compatiblePostgresTool(tool, major)
 	if !ok {
-		return "", fmt.Errorf("PostgreSQL client 安装完成，但未找到可用的 PG%s %s；旧系统请启用 PostgreSQL 官方 PGDG 软件源", postgresClientMajor, tool)
+		return "", fmt.Errorf("PostgreSQL client 安装完成，但未找到可用的 PG%s %s", major, tool)
 	}
 	return path, nil
 }
 
-func installPostgres17FromPGDG(ctx context.Context) error {
+func installPostgresClientFromPGDG(ctx context.Context, major string) error {
 	prerequisites := exec.CommandContext(ctx, "apt-get", "install", "-y", "ca-certificates", "curl", "gnupg")
 	prerequisites.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
 	if output, err := prerequisites.CombinedOutput(); err != nil {
@@ -258,26 +264,43 @@ func installPostgres17FromPGDG(ctx context.Context) error {
 	if output, err := update.CombinedOutput(); err != nil {
 		return fmt.Errorf("更新 PGDG 软件源失败: %s", strings.TrimSpace(string(output)))
 	}
-	install := exec.CommandContext(ctx, "apt-get", "install", "-y", "postgresql-client-17")
+	install := exec.CommandContext(ctx, "apt-get", "install", "-y", "postgresql-client-"+major)
 	install.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
 	if output, err := install.CombinedOutput(); err != nil {
-		return fmt.Errorf("安装 PostgreSQL 17 client 失败: %s", strings.TrimSpace(string(output)))
+		return fmt.Errorf("安装 PostgreSQL %s client 失败: %s", major, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
 
-func compatiblePostgresTool(tool string) (string, bool) {
-	paths := []string{filepath.Join("/usr/lib/postgresql", postgresClientMajor, "bin", tool)}
+func compatiblePostgresTool(tool, major string) (string, bool) {
+	paths := []string{filepath.Join("/usr/lib/postgresql", major, "bin", tool)}
 	if path, err := exec.LookPath(tool); err == nil {
 		paths = append(paths, path)
 	}
 	for _, path := range paths {
 		output, err := exec.Command(path, "--version").CombinedOutput()
-		if err == nil && strings.Contains(string(output), " "+postgresClientMajor+".") {
+		if err == nil && strings.Contains(string(output), " "+major+".") {
 			return path, true
 		}
 	}
 	return "", false
+}
+
+func postgresServerMajor(ctx context.Context, cfg storage.DatabaseConfig) (string, error) {
+	db, err := sql.Open("pgx", postgresConfigDSN(cfg))
+	if err != nil {
+		return "", err
+	}
+	defer db.Close()
+	var versionNum int
+	if err := db.QueryRowContext(ctx, `SHOW server_version_num`).Scan(&versionNum); err != nil {
+		return "", err
+	}
+	major := versionNum / 10000
+	if major < 10 || major > 99 {
+		return "", fmt.Errorf("无法识别 server_version_num=%d", versionNum)
+	}
+	return strconv.Itoa(major), nil
 }
 
 func commandExists(name string) bool {
@@ -550,7 +573,11 @@ func postgresDumpFromBackup(data []byte) ([]byte, bool, error) {
 }
 
 func restorePostgresToStaging(ctx context.Context, dump []byte, cfg storage.DatabaseConfig) (storage.DatabaseConfig, error) {
-	bin, err := ensurePostgresClientTool(ctx, "pg_restore")
+	major, err := postgresServerMajor(ctx, cfg)
+	if err != nil {
+		return storage.DatabaseConfig{}, fmt.Errorf("读取 PostgreSQL 服务端版本失败: %w", err)
+	}
+	bin, err := ensurePostgresClientTool(ctx, "pg_restore", major)
 	if err != nil {
 		return storage.DatabaseConfig{}, err
 	}
@@ -663,7 +690,11 @@ func tryGrantLocalPostgresCreatedb(ctx context.Context, cfg storage.DatabaseConf
 	if err != nil {
 		return errors.New("系统缺少 runuser")
 	}
-	psql := filepath.Join("/usr/lib/postgresql", postgresClientMajor, "bin", "psql")
+	major, err := postgresServerMajor(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	psql := filepath.Join("/usr/lib/postgresql", major, "bin", "psql")
 	if _, err := os.Stat(psql); err != nil {
 		psql, err = exec.LookPath("psql")
 		if err != nil {

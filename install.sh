@@ -69,27 +69,14 @@ check_architecture() {
 install_dependencies() {
     echo_info "检查并安装依赖..."
     if command -v apk >/dev/null 2>&1; then
-        apk add --no-cache bash wget curl jq ca-certificates openrc postgresql17-client >/dev/null
+        apk add --no-cache bash wget curl jq ca-certificates openrc >/dev/null
     elif command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq || true
         DEBIAN_FRONTEND=noninteractive apt-get install -y wget curl jq ca-certificates gnupg >/dev/null 2>&1
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-client-17 >/dev/null 2>&1; then
-            . /etc/os-release
-            install -d -m 0755 /usr/share/postgresql-common/pgdg
-            curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-                | gpg --dearmor --yes -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg
-            echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
-                > /etc/apt/sources.list.d/pgdg.list
-            apt-get update \
-                -o Dir::Etc::sourcelist="sources.list.d/pgdg.list" \
-                -o Dir::Etc::sourceparts="-" \
-                -o APT::Get::List-Cleanup="0" >/dev/null
-            DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-client-17 >/dev/null
-        fi
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y wget curl jq ca-certificates postgresql17 >/dev/null
+        dnf install -y wget curl jq ca-certificates >/dev/null
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y wget curl jq ca-certificates postgresql17 >/dev/null
+        yum install -y wget curl jq ca-certificates >/dev/null
     else
         echo_error "不支持的包管理器，请先安装 wget、curl、jq 和 CA 证书"
         exit 1
