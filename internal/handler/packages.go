@@ -85,23 +85,24 @@ func hasNonZeroIntLimit(m map[int64]int) bool {
 }
 
 type createPackageRequest struct {
-	Name                  string                       `json:"name"`
-	Description           string                       `json:"description"`
-	TrafficLimitGB        float64                      `json:"traffic_limit_gb"`
-	CycleDays             int                          `json:"cycle_days"`
-	IsReset               bool                         `json:"is_reset"`
-	ResetDay              int                          `json:"reset_day"`
-	Nodes                 []int64                      `json:"nodes"`
-	NodeMultipliers       map[int64]float64            `json:"node_multipliers"`    // node_id → 倍率
-	NodeNameOverrides     map[int64]string             `json:"node_name_overrides"` // node_id → 套餐内显示名
-	NodeSpeedLimits       map[int64]float64            `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits      map[int64]int                `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
-	SpeedLimitMbps        float64                      `json:"speed_limit_mbps"`
-	DeviceLimit           int                          `json:"device_limit"`
-	AutoSpeedRules        []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
-	TrafficMode           string                       `json:"traffic_mode"`
-	TemplateFilename      string                       `json:"template_filename"`       // Clash 模板;空 = 走系统默认
-	SurgeTemplateFilename string                       `json:"surge_template_filename"` // Surge 模板;空 = 走系统默认
+	Name                    string                       `json:"name"`
+	Description             string                       `json:"description"`
+	TrafficLimitGB          float64                      `json:"traffic_limit_gb"`
+	CycleDays               int                          `json:"cycle_days"`
+	IsReset                 bool                         `json:"is_reset"`
+	ResetDay                int                          `json:"reset_day"`
+	Nodes                   []int64                      `json:"nodes"`
+	NodeMultipliers         map[int64]float64            `json:"node_multipliers"`    // node_id → 倍率
+	NodeNameOverrides       map[int64]string             `json:"node_name_overrides"` // node_id → 套餐内显示名
+	NodeNameOverrideEnabled bool                         `json:"node_name_override_enabled"`
+	NodeSpeedLimits         map[int64]float64            `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeDeviceLimits        map[int64]int                `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	SpeedLimitMbps          float64                      `json:"speed_limit_mbps"`
+	DeviceLimit             int                          `json:"device_limit"`
+	AutoSpeedRules          []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
+	TrafficMode             string                       `json:"traffic_mode"`
+	TemplateFilename        string                       `json:"template_filename"`       // Clash 模板;空 = 走系统默认
+	SurgeTemplateFilename   string                       `json:"surge_template_filename"` // Surge 模板;空 = 走系统默认
 }
 
 func normalizePackageNodeNames(names map[int64]string, nodes []int64) (map[int64]string, error) {
@@ -235,24 +236,25 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	pkg := storage.Package{
-		Name:                  req.Name,
-		Description:           req.Description,
-		TrafficLimitGB:        req.TrafficLimitGB,
-		TrafficLimitBytes:     int64(req.TrafficLimitGB * 1024 * 1024 * 1024),
-		CycleDays:             req.CycleDays,
-		IsReset:               req.IsReset,
-		ResetDay:              req.ResetDay,
-		Nodes:                 nodes,
-		NodeMultipliers:       req.NodeMultipliers,
-		NodeNameOverrides:     nodeNames,
-		NodeSpeedLimits:       req.NodeSpeedLimits,
-		NodeDeviceLimits:      req.NodeDeviceLimits,
-		SpeedLimitMbps:        req.SpeedLimitMbps,
-		DeviceLimit:           req.DeviceLimit,
-		AutoSpeedRules:        req.AutoSpeedRules,
-		TrafficMode:           trafficMode,
-		TemplateFilename:      strings.TrimSpace(req.TemplateFilename),
-		SurgeTemplateFilename: strings.TrimSpace(req.SurgeTemplateFilename),
+		Name:                    req.Name,
+		Description:             req.Description,
+		TrafficLimitGB:          req.TrafficLimitGB,
+		TrafficLimitBytes:       int64(req.TrafficLimitGB * 1024 * 1024 * 1024),
+		CycleDays:               req.CycleDays,
+		IsReset:                 req.IsReset,
+		ResetDay:                req.ResetDay,
+		Nodes:                   nodes,
+		NodeMultipliers:         req.NodeMultipliers,
+		NodeNameOverrides:       nodeNames,
+		NodeNameOverrideEnabled: req.NodeNameOverrideEnabled,
+		NodeSpeedLimits:         req.NodeSpeedLimits,
+		NodeDeviceLimits:        req.NodeDeviceLimits,
+		SpeedLimitMbps:          req.SpeedLimitMbps,
+		DeviceLimit:             req.DeviceLimit,
+		AutoSpeedRules:          req.AutoSpeedRules,
+		TrafficMode:             trafficMode,
+		TemplateFilename:        strings.TrimSpace(req.TemplateFilename),
+		SurgeTemplateFilename:   strings.TrimSpace(req.SurgeTemplateFilename),
 	}
 
 	id, err := h.repo.CreatePackage(r.Context(), pkg)
@@ -291,24 +293,25 @@ func NewPackageUpdateHandler(repo *storage.TrafficRepository, remoteManage *Remo
 }
 
 type updatePackageRequest struct {
-	ID                    int64                        `json:"id"`
-	Name                  string                       `json:"name"`
-	Description           string                       `json:"description"`
-	TrafficLimitGB        float64                      `json:"traffic_limit_gb"`
-	CycleDays             int                          `json:"cycle_days"`
-	IsReset               *bool                        `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
-	ResetDay              *int                         `json:"reset_day"` // 同上
-	Nodes                 []int64                      `json:"nodes"`
-	NodeMultipliers       map[int64]float64            `json:"node_multipliers"`    // node_id → 倍率
-	NodeNameOverrides     map[int64]string             `json:"node_name_overrides"` // node_id → 套餐内显示名
-	NodeSpeedLimits       map[int64]float64            `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits      map[int64]int                `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
-	SpeedLimitMbps        float64                      `json:"speed_limit_mbps"`
-	DeviceLimit           int                          `json:"device_limit"`
-	AutoSpeedRules        []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
-	TrafficMode           string                       `json:"traffic_mode"`
-	TemplateFilename      string                       `json:"template_filename"`       // Clash 模板;空 = 走系统默认
-	SurgeTemplateFilename string                       `json:"surge_template_filename"` // Surge 模板;空 = 走系统默认
+	ID                      int64                        `json:"id"`
+	Name                    string                       `json:"name"`
+	Description             string                       `json:"description"`
+	TrafficLimitGB          float64                      `json:"traffic_limit_gb"`
+	CycleDays               int                          `json:"cycle_days"`
+	IsReset                 *bool                        `json:"is_reset"`  // 指针:请求未携带时保留库中旧值,不按零值覆盖
+	ResetDay                *int                         `json:"reset_day"` // 同上
+	Nodes                   []int64                      `json:"nodes"`
+	NodeMultipliers         map[int64]float64            `json:"node_multipliers"`    // node_id → 倍率
+	NodeNameOverrides       map[int64]string             `json:"node_name_overrides"` // node_id → 套餐内显示名
+	NodeNameOverrideEnabled bool                         `json:"node_name_override_enabled"`
+	NodeSpeedLimits         map[int64]float64            `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeDeviceLimits        map[int64]int                `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	SpeedLimitMbps          float64                      `json:"speed_limit_mbps"`
+	DeviceLimit             int                          `json:"device_limit"`
+	AutoSpeedRules          []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
+	TrafficMode             string                       `json:"traffic_mode"`
+	TemplateFilename        string                       `json:"template_filename"`       // Clash 模板;空 = 走系统默认
+	SurgeTemplateFilename   string                       `json:"surge_template_filename"` // Surge 模板;空 = 走系统默认
 }
 
 func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -401,25 +404,26 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	pkg := storage.Package{
-		ID:                    req.ID,
-		Name:                  req.Name,
-		Description:           req.Description,
-		TrafficLimitGB:        req.TrafficLimitGB,
-		TrafficLimitBytes:     int64(req.TrafficLimitGB * 1024 * 1024 * 1024),
-		CycleDays:             req.CycleDays,
-		IsReset:               isReset,
-		ResetDay:              resetDay,
-		Nodes:                 nodes,
-		NodeMultipliers:       req.NodeMultipliers,
-		NodeNameOverrides:     nodeNames,
-		NodeSpeedLimits:       req.NodeSpeedLimits,
-		NodeDeviceLimits:      req.NodeDeviceLimits,
-		SpeedLimitMbps:        req.SpeedLimitMbps,
-		DeviceLimit:           req.DeviceLimit,
-		AutoSpeedRules:        req.AutoSpeedRules,
-		TrafficMode:           trafficMode,
-		TemplateFilename:      strings.TrimSpace(req.TemplateFilename),
-		SurgeTemplateFilename: strings.TrimSpace(req.SurgeTemplateFilename),
+		ID:                      req.ID,
+		Name:                    req.Name,
+		Description:             req.Description,
+		TrafficLimitGB:          req.TrafficLimitGB,
+		TrafficLimitBytes:       int64(req.TrafficLimitGB * 1024 * 1024 * 1024),
+		CycleDays:               req.CycleDays,
+		IsReset:                 isReset,
+		ResetDay:                resetDay,
+		Nodes:                   nodes,
+		NodeMultipliers:         req.NodeMultipliers,
+		NodeNameOverrides:       nodeNames,
+		NodeNameOverrideEnabled: req.NodeNameOverrideEnabled,
+		NodeSpeedLimits:         req.NodeSpeedLimits,
+		NodeDeviceLimits:        req.NodeDeviceLimits,
+		SpeedLimitMbps:          req.SpeedLimitMbps,
+		DeviceLimit:             req.DeviceLimit,
+		AutoSpeedRules:          req.AutoSpeedRules,
+		TrafficMode:             trafficMode,
+		TemplateFilename:        strings.TrimSpace(req.TemplateFilename),
+		SurgeTemplateFilename:   strings.TrimSpace(req.SurgeTemplateFilename),
 	}
 
 	if err := h.repo.UpdatePackage(r.Context(), pkg); err != nil {

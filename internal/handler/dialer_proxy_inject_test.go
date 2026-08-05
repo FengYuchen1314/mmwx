@@ -202,7 +202,8 @@ func TestPackageNodeNameOverridesPersistByNodeID(t *testing.T) {
 	}
 	pkgID, err := repo.CreatePackage(ctx, storage.Package{
 		Name: "named", TrafficLimitBytes: 1 << 30, Nodes: []int64{n1.ID, n2.ID},
-		NodeNameOverrides: map[int64]string{n1.ID: "Hong Kong", n2.ID: "Japan", 999999: "stale"},
+		NodeNameOverrides:       map[int64]string{n1.ID: "Hong Kong", n2.ID: "Japan", 999999: "stale"},
+		NodeNameOverrideEnabled: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -213,6 +214,9 @@ func TestPackageNodeNameOverridesPersistByNodeID(t *testing.T) {
 	}
 	if pkg.NodeNameOverrides[n1.ID] != "Hong Kong" || pkg.NodeNameOverrides[n2.ID] != "Japan" {
 		t.Fatalf("overrides crossed nodes: %#v", pkg.NodeNameOverrides)
+	}
+	if !pkg.NodeNameOverrideEnabled {
+		t.Fatal("node name override switch must persist")
 	}
 	if _, ok := pkg.NodeNameOverrides[999999]; ok {
 		t.Fatal("stale node override must not be persisted")
@@ -231,7 +235,7 @@ func TestPackageNodeNameOverridesPersistByNodeID(t *testing.T) {
 }
 
 func TestApplyPackageNameOverrideUsesNodeID(t *testing.T) {
-	pkg := &storage.Package{NodeNameOverrides: map[int64]string{11: "Hong Kong", 12: "Japan"}}
+	pkg := &storage.Package{NodeNameOverrideEnabled: true, NodeNameOverrides: map[int64]string{11: "Hong Kong", 12: "Japan"}}
 	p1 := map[string]any{"name": "same"}
 	p2 := map[string]any{"name": "same"}
 	applyPackageNameOverride(p1, storage.Node{ID: 11}, pkg)
@@ -241,8 +245,19 @@ func TestApplyPackageNameOverrideUsesNodeID(t *testing.T) {
 	}
 }
 
+func TestApplyPackageNameOverrideRequiresEnabledSwitch(t *testing.T) {
+	pkg := &storage.Package{NodeNameOverrides: map[int64]string{11: "Hong Kong"}}
+	proxy := map[string]any{"name": "original"}
+	if applyPackageNameOverride(proxy, storage.Node{ID: 11}, pkg) {
+		t.Fatal("disabled package name override must not be applied")
+	}
+	if proxy["name"] != "original" {
+		t.Fatalf("disabled override changed node name: %v", proxy["name"])
+	}
+}
+
 func TestPackageNameOverridePrecedesMultiplierPrefix(t *testing.T) {
-	pkg := &storage.Package{NodeNameOverrides: map[int64]string{11: "Hong Kong"}, NodeMultipliers: map[int64]float64{11: 2}}
+	pkg := &storage.Package{NodeNameOverrideEnabled: true, NodeNameOverrides: map[int64]string{11: "Hong Kong"}, NodeMultipliers: map[int64]float64{11: 2}}
 	proxy := map[string]any{"name": "original"}
 	node := storage.Node{ID: 11, NodeName: "original"}
 	applyPackageNameOverride(proxy, node, pkg)

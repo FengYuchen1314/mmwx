@@ -761,7 +761,7 @@ func applyMultiplierPrefix(proxy map[string]any, node storage.Node, pkg *storage
 
 // applyPackageNameOverride 只根据稳定的节点 ID 应用套餐内名称，不依赖原名或列表顺序。
 func applyPackageNameOverride(proxy map[string]any, node storage.Node, pkg *storage.Package) bool {
-	if proxy == nil || pkg == nil || len(pkg.NodeNameOverrides) == 0 {
+	if proxy == nil || pkg == nil || !pkg.NodeNameOverrideEnabled || len(pkg.NodeNameOverrides) == 0 {
 		return false
 	}
 	name := strings.TrimSpace(pkg.NodeNameOverrides[node.ID])
