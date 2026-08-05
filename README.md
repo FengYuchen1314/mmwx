@@ -49,6 +49,9 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.4.6 (2026-08-05)
+- 🌈 三网回程测试兜底traceroute
+
 ### v0.4.5 (2026-08-04)
 - 🌈 支持探测三网回程
 - 🛠️ fix: nginx website 变量未转换
