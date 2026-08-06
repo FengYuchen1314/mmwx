@@ -88,6 +88,7 @@ type Client struct {
 	// 只在总开关 + 各子开关开时采集对应项;probeMu 保护配置与最新 ping 结果。
 	probeMu               sync.Mutex
 	probeCollectCPU       bool
+	probeCollectInfo      bool
 	probeCollectMem       bool
 	probeCollectDisk      bool
 	probeCollectPing      bool
@@ -2674,17 +2675,21 @@ func (c *Client) handleConfigUpdate(updates map[string]string) {
 // 这些**不落盘**(规避 config.yaml 的 JSON 注入面),重连时主控会重新下发。
 func (c *Client) handleProbeConfigUpdate(updates map[string]string) {
 	_, hasCPU := updates["probe_collect_cpu"]
+	_, hasInfo := updates["probe_collect_info"]
 	_, hasMem := updates["probe_collect_mem"]
 	_, hasDisk := updates["probe_collect_disk"]
 	_, hasPing := updates["probe_collect_ping"]
 	_, hasTargets := updates["probe_ping_targets"]
 	_, hasInterval := updates["probe_ping_interval_ms"]
-	if !hasCPU && !hasMem && !hasDisk && !hasPing && !hasTargets && !hasInterval {
+	if !hasInfo && !hasCPU && !hasMem && !hasDisk && !hasPing && !hasTargets && !hasInterval {
 		return // 本次下发不含探针配置
 	}
 
 	c.probeMu.Lock()
 	defer c.probeMu.Unlock()
+	if hasInfo {
+		c.probeCollectInfo = updates["probe_collect_info"] == "1"
+	}
 	if hasCPU {
 		c.probeCollectCPU = updates["probe_collect_cpu"] == "1"
 	}
@@ -2723,19 +2728,19 @@ func (c *Client) handleProbeConfigUpdate(updates map[string]string) {
 func (c *Client) probeAnyEnabled() bool {
 	c.probeMu.Lock()
 	defer c.probeMu.Unlock()
-	return c.probeCollectCPU || c.probeCollectMem || c.probeCollectDisk || c.probeCollectPing
+	return c.probeCollectInfo || c.probeCollectCPU || c.probeCollectMem || c.probeCollectDisk || c.probeCollectPing
 }
 
 // collectProbeSysMetrics 按开关采一次系统指标(供 sendTrafficData 调)。无开启项返回 nil。
 func (c *Client) collectProbeSysMetrics() *ProbeSysMetrics {
 	c.probeMu.Lock()
-	cpu, mem, disk := c.probeCollectCPU, c.probeCollectMem, c.probeCollectDisk
+	info, cpu, mem, disk := c.probeCollectInfo, c.probeCollectCPU, c.probeCollectMem, c.probeCollectDisk
 	if c.probeSys == nil {
 		c.probeSys = newSysMetricsCollector()
 	}
 	sc := c.probeSys
 	c.probeMu.Unlock()
-	if !cpu && !mem && !disk {
+	if !info && !cpu && !mem && !disk {
 		return nil
 	}
 	m := sc.sample(cpu, mem, disk)

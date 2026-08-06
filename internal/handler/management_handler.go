@@ -2754,6 +2754,14 @@ func (h *ManageHandler) manageInboundClient(w http.ResponseWriter, ctx context.C
 		writeError(w, http.StatusNotFound, fmt.Sprintf("inbound %s not found", req.Tag))
 		return
 	}
+	// Keep an immutable copy of the currently active inbound. A runtime replace
+	// removes the old inbound before adding the new one; if the add fails, leaving
+	// it removed turns one package/user change into an outage for every client on
+	// that Reality/SS2022 inbound.
+	var oldTarget map[string]interface{}
+	if rawOld, marshalErr := json.Marshal(target); marshalErr == nil {
+		_ = json.Unmarshal(rawOld, &oldTarget)
+	}
 
 	protocol, _ := target["protocol"].(string)
 	settings, _ := target["settings"].(map[string]interface{})
@@ -2858,6 +2866,13 @@ func (h *ManageHandler) manageInboundClient(w http.ResponseWriter, ctx context.C
 	// 运行时应用:remove 旧 inbound + add 新 inbound。在 inboundsMu 内顺序执行,
 	// 不会和别的 add/remove 交错。失败也只警告 — 配置文件已经是新版,xray 下次重启就生效。
 	if err := h.replaceRuntimeInbound(ctx, req.Tag, target); err != nil {
+		if oldTarget != nil {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if rollbackErr := h.replaceRuntimeInbound(rollbackCtx, req.Tag, oldTarget); rollbackErr != nil {
+				log.Printf("[Manage] CRITICAL: failed to restore old runtime inbound tag=%s: %v", req.Tag, rollbackErr)
+			}
+			cancel()
+		}
 		log.Printf("[Manage] manageInboundClient: runtime apply failed (tag=%s): %v; config file already updated", req.Tag, err)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success":         true,
@@ -5503,11 +5518,10 @@ esac
 # 镜像链 — 顺序尝试,任一成功即停。GitHub 优先,失败再自动降级到 CDN 代理。
 # 注:GitHub Release binary 实际重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
 # 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直连 github 会 "network is unreachable" → 会快速失败(近乎即时,
-# 非超时)后降级到 ghproxy / gh-proxy(v4+v6 双栈反代)。
+# 非超时)后降级到 gh-proxy 反代。
 MIRRORS=(
     "https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
     "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-    "https://mirror.ghproxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
 )
 # 优先 curl,没有就用 wget;两者都没就按发行版包管理器装一个 — 跟 install.sh 同款逻辑
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then

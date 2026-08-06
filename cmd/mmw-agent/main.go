@@ -660,10 +660,11 @@ func (g *listenGate) stop() {
 // 背景:GitHub Release 重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
 // 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直接 connect: network is unreachable → geoip.dat
 //
-// jsdelivr 全球 CDN 同时提供 v4/v6;ghproxy 同款。GitHub 原始保留兜底(国内有 v4 时可达)。
+// jsdelivr 全球 CDN 同时提供 v4/v6;gh-proxy 作为国内回退。
+// GitHub 原始保留兜底(国内有 v4 时可达)。
 var geoMirrorTemplates = []string{
 	"https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/%s",
-	"https://mirror.ghproxy.com/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/%s",
+	"https://gh-proxy.com/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/%s",
 	"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/%s",
 }
 
