@@ -91,6 +91,7 @@ type probeServer struct {
 	Uptime          *int64              `json:"uptime,omitempty"`
 	CPUModel        string              `json:"cpu_model,omitempty"`
 	CPUCores        int                 `json:"cpu_cores,omitempty"`
+	CPUThreads      int                 `json:"cpu_threads,omitempty"`
 	OS              string              `json:"os,omitempty"`
 	Kernel          string              `json:"kernel,omitempty"`
 	Arch            string              `json:"arch,omitempty"`
@@ -371,7 +372,7 @@ func fillProbeMetrics(ps *probeServer, view *ProbeServerView, onCPU, onMem, onDi
 		if sys.Uptime > 0 {
 			ps.Uptime = &sys.Uptime
 		}
-		ps.CPUModel, ps.CPUCores = sys.CPUModel, sys.CPUCores
+		ps.CPUModel, ps.CPUCores, ps.CPUThreads = sys.CPUModel, sys.CPUCores, sys.CPUThreads
 		ps.OS, ps.Kernel, ps.Arch = sys.OS, sys.Kernel, sys.Arch
 		if onCPU && sys.HasCPU {
 			cpu := sys.CPUPct

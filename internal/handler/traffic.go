@@ -1301,7 +1301,7 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 					MemUsed: sm.MemUsed, MemTotal: sm.MemTotal,
 					DiskUsed: sm.DiskUsed, DiskTotal: sm.DiskTotal,
 					HasCPU: sm.HasCPU, HasMem: sm.HasMem, HasDisk: sm.HasDisk,
-					Uptime: sm.Uptime, CPUModel: sm.CPUModel, CPUCores: sm.CPUCores,
+					Uptime: sm.Uptime, CPUModel: sm.CPUModel, CPUCores: sm.CPUCores, CPUThreads: sm.CPUThreads,
 					OS: sm.OS, Kernel: sm.Kernel, Arch: sm.Arch,
 				}
 			}

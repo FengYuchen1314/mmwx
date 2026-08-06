@@ -125,21 +125,22 @@ type WSTrafficPayload struct {
 
 // ProbeSysWire 是 agent 上报的系统指标线格式(字段名与 agent sysmetrics.go 的 ProbeSysMetrics 对齐)。
 type ProbeSysWire struct {
-	CPUPct    float64 `json:"cpu_pct"`
-	LoadAvg   string  `json:"loadavg"`
-	MemUsed   int64   `json:"mem_used"`
-	MemTotal  int64   `json:"mem_total"`
-	DiskUsed  int64   `json:"disk_used"`
-	DiskTotal int64   `json:"disk_total"`
-	Uptime    int64   `json:"uptime,omitempty"`
-	CPUModel  string  `json:"cpu_model,omitempty"`
-	CPUCores  int     `json:"cpu_cores,omitempty"`
-	OS        string  `json:"os,omitempty"`
-	Kernel    string  `json:"kernel,omitempty"`
-	Arch      string  `json:"arch,omitempty"`
-	HasCPU    bool    `json:"has_cpu"`
-	HasMem    bool    `json:"has_mem"`
-	HasDisk   bool    `json:"has_disk"`
+	CPUPct     float64 `json:"cpu_pct"`
+	LoadAvg    string  `json:"loadavg"`
+	MemUsed    int64   `json:"mem_used"`
+	MemTotal   int64   `json:"mem_total"`
+	DiskUsed   int64   `json:"disk_used"`
+	DiskTotal  int64   `json:"disk_total"`
+	Uptime     int64   `json:"uptime,omitempty"`
+	CPUModel   string  `json:"cpu_model,omitempty"`
+	CPUCores   int     `json:"cpu_cores,omitempty"`
+	CPUThreads int     `json:"cpu_threads,omitempty"`
+	OS         string  `json:"os,omitempty"`
+	Kernel     string  `json:"kernel,omitempty"`
+	Arch       string  `json:"arch,omitempty"`
+	HasCPU     bool    `json:"has_cpu"`
+	HasMem     bool    `json:"has_mem"`
+	HasDisk    bool    `json:"has_disk"`
 }
 
 // connCountsByServer 存各 server 最近一次上报的 group→当前并发连接数(内存、非持久)。用户视图"当前连接数"用。
@@ -1359,7 +1360,7 @@ func (h *RemoteWSHandler) handleTraffic(wsConn *RemoteWSConnection, payload json
 					MemUsed: sm.MemUsed, MemTotal: sm.MemTotal,
 					DiskUsed: sm.DiskUsed, DiskTotal: sm.DiskTotal,
 					HasCPU: sm.HasCPU, HasMem: sm.HasMem, HasDisk: sm.HasDisk,
-					Uptime: sm.Uptime, CPUModel: sm.CPUModel, CPUCores: sm.CPUCores,
+					Uptime: sm.Uptime, CPUModel: sm.CPUModel, CPUCores: sm.CPUCores, CPUThreads: sm.CPUThreads,
 					OS: sm.OS, Kernel: sm.Kernel, Arch: sm.Arch,
 				}
 			}

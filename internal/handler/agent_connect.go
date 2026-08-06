@@ -290,8 +290,15 @@ func (h *XrayServerHandler) RemoteHeartbeat(w http.ResponseWriter, r *http.Reque
 		log.Printf("[RemoteHeartbeat] Detected Xray restart for token %s... (xray boot count: %d)", token[:8], result.XrayBootCount)
 	}
 
-	if result.PreviousStatus != "connected" {
-		SendServerOnlineNotification(ctx, result.ServerName, clientIP)
+	// 与 WS 和流量上报的恢复策略保持一致：只有本轮离线已经达到容忍阈值、
+	// 且确实发过离线通知，恢复时才发送配对的上线通知。短暂 WS 抖动虽然会
+	// 把状态置为 offline，但 offline_notified 仍为 false，必须保持静默。
+	if result.PreviousStatus == storage.RemoteServerStatusOffline && result.PreviousOfflineNotified {
+		if IsServerUpgrading(result.ServerID) {
+			log.Printf("[RemoteHeartbeat] %s came back online during upgrade window — suppressing online notification", result.ServerName)
+		} else {
+			go SendServerOnlineNotification(context.Background(), result.ServerName, clientIP)
+		}
 	}
 
 	// agent IP 漂移 → 同步刷新已存在节点的 clash_config.server,避免节点继续指向旧 IP

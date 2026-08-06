@@ -72,6 +72,7 @@ type ProbeSysSnapshot struct {
 	Uptime                       int64   `json:"uptime,omitempty"`
 	CPUModel                     string  `json:"cpu_model,omitempty"`
 	CPUCores                     int     `json:"cpu_cores,omitempty"`
+	CPUThreads                   int     `json:"cpu_threads,omitempty"`
 	OS                           string  `json:"os,omitempty"`
 	Kernel                       string  `json:"kernel,omitempty"`
 	Arch                         string  `json:"arch,omitempty"`

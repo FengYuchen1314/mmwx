@@ -11201,15 +11201,16 @@ type HeartbeatUpdate struct {
 
 // HeartbeatResult 包含心跳更新的结果，包括重新启动检测。
 type HeartbeatResult struct {
-	ServerID         int64
-	ServerName       string
-	PreviousStatus   string
-	MmwxRestarted    bool
-	XrayRestarted    bool
-	BootCount        int
-	XrayBootCount    int
-	TokenExpiresSoon bool
-	TokenExpiresAt   *time.Time
+	ServerID                int64
+	ServerName              string
+	PreviousStatus          string
+	PreviousOfflineNotified bool
+	MmwxRestarted           bool
+	XrayRestarted           bool
+	BootCount               int
+	XrayBootCount           int
+	TokenExpiresSoon        bool
+	TokenExpiresAt          *time.Time
 	// IPChanged:本次心跳让 ip_address 或 ip_address_v6 字段发生变化。调用方据此触发 RefreshNodesServerAddress
 	// 同步已存在节点的 clash_config.server,避免小鸡换 IP 后旧节点配置还是旧 IP。
 	IPChanged bool
@@ -11439,11 +11440,12 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 	}
 
 	result := &HeartbeatResult{
-		ServerID:       server.ID,
-		ServerName:     server.Name,
-		PreviousStatus: server.Status,
-		BootCount:      server.BootCount,
-		XrayBootCount:  server.XrayBootCount,
+		ServerID:                server.ID,
+		ServerName:              server.Name,
+		PreviousStatus:          server.Status,
+		PreviousOfflineNotified: server.OfflineNotified,
+		BootCount:               server.BootCount,
+		XrayBootCount:           server.XrayBootCount,
 	}
 
 	// 检测mmwx重启
