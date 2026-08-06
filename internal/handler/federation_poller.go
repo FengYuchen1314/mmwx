@@ -71,6 +71,10 @@ func ingestFederationProbeSys(serverID int64, info map[string]any, probeStore *P
 		return
 	}
 	loadavg, _ := ps["loadavg"].(string)
+	cpuModel, _ := ps["cpu_model"].(string)
+	osName, _ := ps["os"].(string)
+	kernel, _ := ps["kernel"].(string)
+	arch, _ := ps["arch"].(string)
 	snap := ProbeSysSnapshot{
 		CPUPct:    jsonFloat(ps["cpu_pct"]),
 		LoadAvg:   loadavg,
@@ -78,10 +82,15 @@ func ingestFederationProbeSys(serverID int64, info map[string]any, probeStore *P
 		MemTotal:  jsonInt(ps["mem_total"]),
 		DiskUsed:  jsonInt(ps["disk_used"]),
 		DiskTotal: jsonInt(ps["disk_total"]),
-		HasCPU:    jsonBool(ps["has_cpu"]),
-		HasMem:    jsonBool(ps["has_mem"]),
-		HasDisk:   jsonBool(ps["has_disk"]),
-		At:        jsonInt(ps["at"]),
+		Uptime:    jsonInt(ps["uptime"]), CPUModel: cpuModel, CPUCores: int(jsonInt(ps["cpu_cores"])),
+		OS: osName, Kernel: kernel, Arch: arch,
+		UploadSpeed: jsonInt(ps["upload_speed"]), DownloadSpeed: jsonInt(ps["download_speed"]),
+		CumulativeUp: jsonInt(ps["cumulative_up"]), CumulativeDown: jsonInt(ps["cumulative_down"]),
+		HasCPU:     jsonBool(ps["has_cpu"]),
+		HasMem:     jsonBool(ps["has_mem"]),
+		HasDisk:    jsonBool(ps["has_disk"]),
+		HasNetwork: jsonBool(ps["has_network"]),
+		At:         jsonInt(ps["at"]),
 	}
 	probeStore.IngestSys(serverID, snap)
 }

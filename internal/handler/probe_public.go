@@ -84,6 +84,12 @@ type probeServer struct {
 	MemTotal        *int64             `json:"mem_total,omitempty"`
 	DiskUsed        *int64             `json:"disk_used,omitempty"`
 	DiskTotal       *int64             `json:"disk_total,omitempty"`
+	Uptime          *int64             `json:"uptime,omitempty"`
+	CPUModel        string             `json:"cpu_model,omitempty"`
+	CPUCores        int                `json:"cpu_cores,omitempty"`
+	OS              string             `json:"os,omitempty"`
+	Kernel          string             `json:"kernel,omitempty"`
+	Arch            string             `json:"arch,omitempty"`
 	Ping            []probePingSeries  `json:"ping,omitempty"`
 	ExpiresAt       string             `json:"expires_at,omitempty"`
 	RenewalPrice    *float64           `json:"renewal_price,omitempty"`
@@ -250,6 +256,10 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		if h.probeStore != nil {
 			if view, ok := h.probeStore.Snapshot(s.ID, probeListBuckets); ok {
 				fillProbeMetrics(&ps, view, onCPU, onMem, onDisk, onPing, resolver.For(s.ID))
+				if onTraffic && ps.CumulativeUp == nil && view.Sys.HasNetwork {
+					up, down := view.Sys.CumulativeUp, view.Sys.CumulativeDown
+					ps.CumulativeUp, ps.CumulativeDown = &up, &down
+				}
 			}
 		}
 		out = append(out, ps)
@@ -302,6 +312,11 @@ func (h *ProbePublicHandler) setting(ctx context.Context, key string) bool {
 func fillProbeMetrics(ps *probeServer, view *ProbeServerView, onCPU, onMem, onDisk, onPing bool, targetMeta map[string]ProbePingTarget) {
 	if view.HasSys {
 		sys := view.Sys
+		if sys.Uptime > 0 {
+			ps.Uptime = &sys.Uptime
+		}
+		ps.CPUModel, ps.CPUCores = sys.CPUModel, sys.CPUCores
+		ps.OS, ps.Kernel, ps.Arch = sys.OS, sys.Kernel, sys.Arch
 		if onCPU && sys.HasCPU {
 			cpu := sys.CPUPct
 			ps.CPUPct = &cpu

@@ -131,6 +131,12 @@ type ProbeSysWire struct {
 	MemTotal  int64   `json:"mem_total"`
 	DiskUsed  int64   `json:"disk_used"`
 	DiskTotal int64   `json:"disk_total"`
+	Uptime    int64   `json:"uptime,omitempty"`
+	CPUModel  string  `json:"cpu_model,omitempty"`
+	CPUCores  int     `json:"cpu_cores,omitempty"`
+	OS        string  `json:"os,omitempty"`
+	Kernel    string  `json:"kernel,omitempty"`
+	Arch      string  `json:"arch,omitempty"`
 	HasCPU    bool    `json:"has_cpu"`
 	HasMem    bool    `json:"has_mem"`
 	HasDisk   bool    `json:"has_disk"`
@@ -470,6 +476,11 @@ func (h *RemoteWSHandler) buildProbeConfigUpdates(ctx context.Context, serverID 
 		return "0"
 	}
 	updates["probe_collect_cpu"] = b(probeDisguiseMetricCPUKey)
+	if active {
+		updates["probe_collect_info"] = "1"
+	} else {
+		updates["probe_collect_info"] = "0"
+	}
 	updates["probe_collect_mem"] = b(probeDisguiseMetricMemKey)
 	updates["probe_collect_disk"] = b(probeDisguiseMetricDiskKey)
 	updates["probe_collect_ping"] = b(probeDisguiseMetricPingKey)
@@ -1340,13 +1351,23 @@ func (h *RemoteWSHandler) handleTraffic(wsConn *RemoteWSConnection, payload json
 
 	// 伪装探针真数据 → 内存 ring(旧 agent 不上报这两个字段,自动跳过)。
 	if h.probeStore != nil {
-		if sm := trafficPayload.Sysmetrics; sm != nil {
-			h.probeStore.IngestSys(wsConn.ServerID, ProbeSysSnapshot{
-				CPUPct: sm.CPUPct, LoadAvg: sm.LoadAvg,
-				MemUsed: sm.MemUsed, MemTotal: sm.MemTotal,
-				DiskUsed: sm.DiskUsed, DiskTotal: sm.DiskTotal,
-				HasCPU: sm.HasCPU, HasMem: sm.HasMem, HasDisk: sm.HasDisk,
-			})
+		if sm := trafficPayload.Sysmetrics; sm != nil || trafficPayload.System != nil {
+			snap := ProbeSysSnapshot{}
+			if sm != nil {
+				snap = ProbeSysSnapshot{
+					CPUPct: sm.CPUPct, LoadAvg: sm.LoadAvg,
+					MemUsed: sm.MemUsed, MemTotal: sm.MemTotal,
+					DiskUsed: sm.DiskUsed, DiskTotal: sm.DiskTotal,
+					HasCPU: sm.HasCPU, HasMem: sm.HasMem, HasDisk: sm.HasDisk,
+					Uptime: sm.Uptime, CPUModel: sm.CPUModel, CPUCores: sm.CPUCores,
+					OS: sm.OS, Kernel: sm.Kernel, Arch: sm.Arch,
+				}
+			}
+			if trafficPayload.System != nil {
+				snap.CumulativeUp, snap.CumulativeDown = trafficPayload.System.TxTotal, trafficPayload.System.RxTotal
+				snap.HasNetwork = true
+			}
+			h.probeStore.IngestSys(wsConn.ServerID, snap)
 		}
 		if len(trafficPayload.Latency) > 0 {
 			h.probeStore.IngestLatency(wsConn.ServerID, trafficPayload.Latency)

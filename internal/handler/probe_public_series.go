@@ -61,12 +61,21 @@ func (h *ProbeSeriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"success": false})
 	}
 
-	// 伪装未开启 / ping 采集未开启 → 一律 404,不透露任何存在性。
+	metric := r.URL.Query().Get("metric")
+	if metric == "" {
+		metric = "ping"
+	}
+	// 伪装未开启 / 对应采集未开启 → 一律 404,不透露任何存在性。
 	if v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseEnabledKey); v != "1" {
 		notFound()
 		return
 	}
-	if v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricPingKey); v != "1" {
+	if metric == "ping" {
+		if v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricPingKey); v != "1" {
+			notFound()
+			return
+		}
+	} else if metric != "system" {
 		notFound()
 		return
 	}
@@ -113,6 +122,13 @@ func (h *ProbeSeriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	view, ok := h.probeStore.Snapshot(serverID, 0)
 	if !ok {
 		notFound()
+		return
+	}
+	if metric == "system" {
+		json.NewEncoder(w).Encode(map[string]any{
+			"success": true, "series": aggregateProbeSystemSeries(view.System, rng.Buckets, rng.BucketSec),
+			"bucket_sec": rng.BucketSec, "generated_at": time.Now().Unix(),
+		})
 		return
 	}
 
@@ -164,6 +180,89 @@ func (h *ProbeSeriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(resp)
+}
+
+type probeMetricPoint struct {
+	T     int64   `json:"t"`
+	Value float64 `json:"value"`
+}
+
+type probeSystemSeries struct {
+	CPUPct         []probeMetricPoint `json:"cpu_pct"`
+	MemUsed        []probeMetricPoint `json:"mem_used"`
+	MemTotal       []probeMetricPoint `json:"mem_total"`
+	UploadSpeed    []probeMetricPoint `json:"upload_speed"`
+	DownloadSpeed  []probeMetricPoint `json:"download_speed"`
+	CumulativeUp   []probeMetricPoint `json:"cumulative_up"`
+	CumulativeDown []probeMetricPoint `json:"cumulative_down"`
+}
+
+func aggregateProbeSystemSeries(slots []probeSystemSlot, buckets, bucketSec int) probeSystemSeries {
+	out := probeSystemSeries{
+		CPUPct: []probeMetricPoint{}, MemUsed: []probeMetricPoint{}, MemTotal: []probeMetricPoint{},
+		UploadSpeed: []probeMetricPoint{}, DownloadSpeed: []probeMetricPoint{},
+		CumulativeUp: []probeMetricPoint{}, CumulativeDown: []probeMetricPoint{},
+	}
+	if buckets <= 0 || bucketSec <= 0 {
+		return out
+	}
+	now := time.Now().Unix()
+	end := now - now%int64(bucketSec)
+	start := end - int64(buckets-1)*int64(bucketSec)
+	type acc struct {
+		cpu                                                 float64
+		cpuN                                                int64
+		mem, memN, memTotal, up, down, netN, cumUp, cumDown int64
+	}
+	byBucket := make(map[int64]*acc, buckets)
+	for _, s := range slots {
+		b := s.Slot - s.Slot%int64(bucketSec)
+		if b < start || b > end {
+			continue
+		}
+		a := byBucket[b]
+		if a == nil {
+			a = &acc{}
+			byBucket[b] = a
+		}
+		a.cpu += s.CPUSum
+		a.cpuN += s.CPUCount
+		a.mem += s.MemUsedSum
+		a.memN += s.MemCount
+		if s.MemTotal > 0 {
+			a.memTotal = s.MemTotal
+		}
+		a.up += s.UploadSum
+		a.down += s.DownloadSum
+		a.netN += s.NetworkCount
+		if s.CumulativeUp > 0 || s.CumulativeDown > 0 {
+			a.cumUp, a.cumDown = s.CumulativeUp, s.CumulativeDown
+		}
+	}
+	add := func(dst *[]probeMetricPoint, t int64, v float64) {
+		*dst = append(*dst, probeMetricPoint{T: t, Value: v})
+	}
+	for i := 0; i < buckets; i++ {
+		t := start + int64(i*bucketSec)
+		a := byBucket[t]
+		if a == nil {
+			continue
+		}
+		if a.cpuN > 0 {
+			add(&out.CPUPct, t, a.cpu/float64(a.cpuN))
+		}
+		if a.memN > 0 {
+			add(&out.MemUsed, t, float64(a.mem)/float64(a.memN))
+			add(&out.MemTotal, t, float64(a.memTotal))
+		}
+		if a.netN > 0 {
+			add(&out.UploadSpeed, t, float64(a.up)/float64(a.netN))
+			add(&out.DownloadSpeed, t, float64(a.down)/float64(a.netN))
+			add(&out.CumulativeUp, t, float64(a.cumUp))
+			add(&out.CumulativeDown, t, float64(a.cumDown))
+		}
+	}
+	return out
 }
 
 // mergeTargetSlots 把白名单内所有目标的聚合槽按 Slot 相加,得到"全部目标平均"的序列。

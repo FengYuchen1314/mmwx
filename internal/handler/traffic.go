@@ -1293,13 +1293,23 @@ func (h *RemoteTrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// 伪装探针真数据 → 内存 ring。与 WS 分支(remote_ws.go)同一套 ingest,
 	// 否则 HTTP/pull 模式的服务器在伪装页上只有流量/网速、没有 CPU/内存/硬盘/延迟。
 	if h.probeStore != nil {
-		if sm := req.Sysmetrics; sm != nil {
-			h.probeStore.IngestSys(serverID, ProbeSysSnapshot{
-				CPUPct: sm.CPUPct, LoadAvg: sm.LoadAvg,
-				MemUsed: sm.MemUsed, MemTotal: sm.MemTotal,
-				DiskUsed: sm.DiskUsed, DiskTotal: sm.DiskTotal,
-				HasCPU: sm.HasCPU, HasMem: sm.HasMem, HasDisk: sm.HasDisk,
-			})
+		if sm := req.Sysmetrics; sm != nil || req.System != nil {
+			snap := ProbeSysSnapshot{}
+			if sm != nil {
+				snap = ProbeSysSnapshot{
+					CPUPct: sm.CPUPct, LoadAvg: sm.LoadAvg,
+					MemUsed: sm.MemUsed, MemTotal: sm.MemTotal,
+					DiskUsed: sm.DiskUsed, DiskTotal: sm.DiskTotal,
+					HasCPU: sm.HasCPU, HasMem: sm.HasMem, HasDisk: sm.HasDisk,
+					Uptime: sm.Uptime, CPUModel: sm.CPUModel, CPUCores: sm.CPUCores,
+					OS: sm.OS, Kernel: sm.Kernel, Arch: sm.Arch,
+				}
+			}
+			if req.System != nil {
+				snap.CumulativeUp, snap.CumulativeDown = req.System.TxTotal, req.System.RxTotal
+				snap.HasNetwork = true
+			}
+			h.probeStore.IngestSys(serverID, snap)
 		}
 		if len(req.Latency) > 0 {
 			h.probeStore.IngestLatency(serverID, req.Latency)

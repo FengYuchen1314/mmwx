@@ -63,15 +63,37 @@ func parseProbePingTargetOverrides(raw string) map[int64][]ProbePingTarget {
 
 // ProbeSysSnapshot 是一台服务器最新的系统指标(agent 上报的开启项;未开启的字段为 nil 指针语义靠上层处理)。
 type ProbeSysSnapshot struct {
-	CPUPct    float64 `json:"cpu_pct"`
-	LoadAvg   string  `json:"loadavg"`
-	MemUsed   int64   `json:"mem_used"`
-	MemTotal  int64   `json:"mem_total"`
-	DiskUsed  int64   `json:"disk_used"`
-	DiskTotal int64   `json:"disk_total"`
+	CPUPct                       float64 `json:"cpu_pct"`
+	LoadAvg                      string  `json:"loadavg"`
+	MemUsed                      int64   `json:"mem_used"`
+	MemTotal                     int64   `json:"mem_total"`
+	DiskUsed                     int64   `json:"disk_used"`
+	DiskTotal                    int64   `json:"disk_total"`
+	Uptime                       int64   `json:"uptime,omitempty"`
+	CPUModel                     string  `json:"cpu_model,omitempty"`
+	CPUCores                     int     `json:"cpu_cores,omitempty"`
+	OS                           string  `json:"os,omitempty"`
+	Kernel                       string  `json:"kernel,omitempty"`
+	Arch                         string  `json:"arch,omitempty"`
+	UploadSpeed, DownloadSpeed   int64
+	CumulativeUp, CumulativeDown int64
 	// 掩码:agent 只上报开启项,这里记录哪些字段有效(避免 0 值被当成真实数据)。
-	HasCPU, HasMem, HasDisk bool
-	At                      int64 // unix 秒
+	HasCPU, HasMem, HasDisk, HasNetwork bool
+	At                                  int64 // unix 秒
+}
+
+// probeSystemSlot is a fixed 5-minute aggregate. Keeping 288 compact values per
+// server bounds memory while still allowing 1h/6h/24h API views.
+type probeSystemSlot struct {
+	Slot                         int64 `json:"t"`
+	CPUSum                       float64
+	CPUCount                     int64
+	MemUsedSum                   int64
+	MemCount                     int64
+	MemTotal                     int64
+	UploadSum, DownloadSum       int64
+	NetworkCount                 int64
+	CumulativeUp, CumulativeDown int64
 }
 
 // ProbeLatencySample 是一次 ping 的结果(agent 上报)。
@@ -125,12 +147,15 @@ const (
 )
 
 type probeServerMetrics struct {
-	sys       ProbeSysSnapshot
-	hasSys    bool
-	latency   map[string][]probeLatencyPoint // targetKey -> 最近 capN 个原始点(算 current 用)
-	agg       map[string][]probeAggSlot      // targetKey -> 最近 288 个 5 分钟槽(历史展示用)
-	lastAt    map[string]int64               // targetKey -> 已 ingest 的最新采样时刻,用于去重
-	updatedAt int64
+	sys                    ProbeSysSnapshot
+	hasSys                 bool
+	latency                map[string][]probeLatencyPoint // targetKey -> 最近 capN 个原始点(算 current 用)
+	agg                    map[string][]probeAggSlot      // targetKey -> 最近 288 个 5 分钟槽(历史展示用)
+	lastAt                 map[string]int64               // targetKey -> 已 ingest 的最新采样时刻,用于去重
+	system                 []probeSystemSlot
+	lastNetAt              int64
+	lastNetUp, lastNetDown int64
+	updatedAt              int64
 }
 
 // ProbeMetricsStore 内存 ring:每服务器最新系统指标 + 每目标原始点 + 5 分钟聚合槽。并发安全。
@@ -169,9 +194,44 @@ func (s *ProbeMetricsStore) IngestSys(serverID int64, snap ProbeSysSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m := s.ensure(serverID)
+	if snap.HasNetwork {
+		if m.lastNetAt > 0 && now > m.lastNetAt && snap.CumulativeUp >= m.lastNetUp && snap.CumulativeDown >= m.lastNetDown {
+			dt := now - m.lastNetAt
+			snap.UploadSpeed = (snap.CumulativeUp - m.lastNetUp) / dt
+			snap.DownloadSpeed = (snap.CumulativeDown - m.lastNetDown) / dt
+		}
+		m.lastNetAt, m.lastNetUp, m.lastNetDown = now, snap.CumulativeUp, snap.CumulativeDown
+	}
 	m.sys = snap
 	m.hasSys = true
+	updateProbeSystemSlot(m, snap, now)
 	m.updatedAt = now
+}
+
+func updateProbeSystemSlot(m *probeServerMetrics, snap ProbeSysSnapshot, now int64) {
+	slotAt := now - now%probeAggSlotSec
+	if len(m.system) == 0 || m.system[len(m.system)-1].Slot != slotAt {
+		m.system = append(m.system, probeSystemSlot{Slot: slotAt})
+		if len(m.system) > probeAggMaxSlots {
+			m.system = m.system[len(m.system)-probeAggMaxSlots:]
+		}
+	}
+	slot := &m.system[len(m.system)-1]
+	if snap.HasCPU {
+		slot.CPUSum += snap.CPUPct
+		slot.CPUCount++
+	}
+	if snap.HasMem {
+		slot.MemUsedSum += snap.MemUsed
+		slot.MemCount++
+		slot.MemTotal = snap.MemTotal
+	}
+	if snap.HasNetwork {
+		slot.UploadSum += snap.UploadSpeed
+		slot.DownloadSum += snap.DownloadSpeed
+		slot.NetworkCount++
+		slot.CumulativeUp, slot.CumulativeDown = snap.CumulativeUp, snap.CumulativeDown
+	}
 }
 
 // IngestLatency 追加一批 ping 结果:写原始点 ring + 累进 5 分钟聚合槽。
@@ -266,6 +326,7 @@ type ProbeServerView struct {
 	HasSys  bool
 	Sys     ProbeSysSnapshot
 	Latency map[string]ProbeTargetSeries
+	System  []probeSystemSlot
 }
 
 // Snapshot 返回某服务器的指标快照拷贝,每目标最多带 maxSlots 个最近的聚合槽。
@@ -294,7 +355,12 @@ func (s *ProbeMetricsStore) Snapshot(serverID int64, maxSlots int) (*ProbeServer
 		}
 		lat[k] = ProbeTargetSeries{CurrentMs: cur, Slots: cp}
 	}
-	return &ProbeServerView{HasSys: m.hasSys, Sys: m.sys, Latency: lat}, true
+	system := m.system
+	if maxSlots > 0 && len(system) > maxSlots {
+		system = system[len(system)-maxSlots:]
+	}
+	systemCopy := append([]probeSystemSlot(nil), system...)
+	return &ProbeServerView{HasSys: m.hasSys, Sys: m.sys, Latency: lat, System: systemCopy}, true
 }
 
 // QualityStats 返回某服务器各探测目标在指定时间窗口内的质量统计。
