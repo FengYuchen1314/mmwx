@@ -174,6 +174,17 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.7-beta.1 (2026-08-07)
+- 🌈 补全探针数据(cpu、os)
+- 🌈 补全探针数据(日流量)
+- 🌈 补全探针数据
+- 🛠️ fix: 偶发修改套餐、用户导致子账户失效
+- 🛠️ fix: mirror.gh-proxy.com失效
+- 🛠️ fix: mirror.gh-proxy.com失效
+- 🛠️ fix: 服务器无法删除
+- 🛠️ fix: pg_dump版本自适应
+- 🛠️ fix: pg_dump版本自适应
+- 🛠️ fix: 禁止绑定第二个TG管理员
 ### v0.4.6 (2026-08-05)
 - 🛠️ fix: 备份恢复失败
 - 🛠️ fix: 修改节点路由出站节点未同步
