@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -213,6 +214,53 @@ type DailyUserNodeTraffic struct {
 	NodeID                                             int64
 	Username                                           string
 	Uplink, Downlink, WeightedUplink, WeightedDownlink float64
+}
+
+// ServerDailyTraffic is the authoritative per-calendar-day traffic for one
+// server. The selected source matches the server traffic view: system ledger for
+// system-source servers, Xray node ledger otherwise.
+type ServerDailyTraffic struct {
+	ServerID int64  `json:"-"`
+	Date     string `json:"date"`
+	Uplink   int64  `json:"uplink"`
+	Downlink int64  `json:"downlink"`
+}
+
+func (r *TrafficRepository) ListServerDailyTraffic(ctx context.Context, days int, now time.Time) ([]ServerDailyTraffic, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("traffic repository not initialized")
+	}
+	if days <= 0 {
+		days = 30
+	}
+	cutoff := trafficLedgerDate(now.AddDate(0, 0, -(days - 1)))
+	const query = `
+SELECT n.server_id,n.date,SUM(n.uplink),SUM(n.downlink)
+FROM traffic_daily_nodes n
+JOIN remote_servers s ON s.id=n.server_id
+WHERE n.date>=? AND COALESCE(s.traffic_source,'xray')<>'system'
+GROUP BY n.server_id,n.date
+UNION ALL
+SELECT y.server_id,y.date,SUM(y.uplink),SUM(y.downlink)
+FROM traffic_daily_system_servers y
+JOIN remote_servers s ON s.id=y.server_id
+WHERE y.date>=? AND COALESCE(s.traffic_source,'xray')='system'
+GROUP BY y.server_id,y.date
+ORDER BY 1,2`
+	rows, err := r.db.QueryContext(ctx, query, cutoff, cutoff)
+	if err != nil {
+		return nil, fmt.Errorf("list server daily traffic: %w", err)
+	}
+	defer rows.Close()
+	out := make([]ServerDailyTraffic, 0, days*4)
+	for rows.Next() {
+		var row ServerDailyTraffic
+		if err := rows.Scan(&row.ServerID, &row.Date, &row.Uplink, &row.Downlink); err != nil {
+			return nil, fmt.Errorf("scan server daily traffic: %w", err)
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 func normalizeTrafficRange(value string, now time.Time) (string, string, error) {

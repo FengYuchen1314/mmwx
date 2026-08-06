@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"miaomiaowux/internal/license"
@@ -20,6 +21,9 @@ type ProbePublicHandler struct {
 	wsHandler      *RemoteWSHandler
 	probeStore     *ProbeMetricsStore // 真探针数据(cpu/mem/disk/ping),来自 agent 上报的内存 ring
 	licenseManager *license.Manager
+	dailyMu        sync.Mutex
+	dailyAt        time.Time
+	dailyTraffic   map[int64][]probeDailyTraffic
 }
 
 func (h *ProbePublicHandler) SetLicenseManager(manager *license.Manager) { h.licenseManager = manager }
@@ -78,25 +82,33 @@ type probeServer struct {
 	CumulativeDown *int64 `json:"cumulative_down,omitempty"` // 累计下行(SystemRxCycle)
 	Online         bool   `json:"online"`
 	// 真探针字段(聚合数值,用户已接受公开;不含任何主机标识)
-	CPUPct          *float64           `json:"cpu_pct,omitempty"`
-	LoadAvg         string             `json:"loadavg,omitempty"`
-	MemUsed         *int64             `json:"mem_used,omitempty"`
-	MemTotal        *int64             `json:"mem_total,omitempty"`
-	DiskUsed        *int64             `json:"disk_used,omitempty"`
-	DiskTotal       *int64             `json:"disk_total,omitempty"`
-	Uptime          *int64             `json:"uptime,omitempty"`
-	CPUModel        string             `json:"cpu_model,omitempty"`
-	CPUCores        int                `json:"cpu_cores,omitempty"`
-	OS              string             `json:"os,omitempty"`
-	Kernel          string             `json:"kernel,omitempty"`
-	Arch            string             `json:"arch,omitempty"`
-	Ping            []probePingSeries  `json:"ping,omitempty"`
-	ExpiresAt       string             `json:"expires_at,omitempty"`
-	RenewalPrice    *float64           `json:"renewal_price,omitempty"`
-	RenewalCycle    string             `json:"renewal_cycle,omitempty"`
-	RenewalCurrency string             `json:"renewal_currency,omitempty"`
-	RenewalPriceCNY *float64           `json:"renewal_price_cny,omitempty"`
-	ReturnRoutes    []probeReturnRoute `json:"return_routes,omitempty"`
+	CPUPct          *float64            `json:"cpu_pct,omitempty"`
+	LoadAvg         string              `json:"loadavg,omitempty"`
+	MemUsed         *int64              `json:"mem_used,omitempty"`
+	MemTotal        *int64              `json:"mem_total,omitempty"`
+	DiskUsed        *int64              `json:"disk_used,omitempty"`
+	DiskTotal       *int64              `json:"disk_total,omitempty"`
+	Uptime          *int64              `json:"uptime,omitempty"`
+	CPUModel        string              `json:"cpu_model,omitempty"`
+	CPUCores        int                 `json:"cpu_cores,omitempty"`
+	OS              string              `json:"os,omitempty"`
+	Kernel          string              `json:"kernel,omitempty"`
+	Arch            string              `json:"arch,omitempty"`
+	Ping            []probePingSeries   `json:"ping,omitempty"`
+	ExpiresAt       string              `json:"expires_at,omitempty"`
+	RenewalPrice    *float64            `json:"renewal_price,omitempty"`
+	RenewalCycle    string              `json:"renewal_cycle,omitempty"`
+	RenewalCurrency string              `json:"renewal_currency,omitempty"`
+	RenewalPriceCNY *float64            `json:"renewal_price_cny,omitempty"`
+	ReturnRoutes    []probeReturnRoute  `json:"return_routes,omitempty"`
+	DailyTraffic    []probeDailyTraffic `json:"daily_traffic,omitempty"`
+}
+
+type probeDailyTraffic struct {
+	Date     string `json:"date"`
+	Uplink   int64  `json:"uplink"`
+	Downlink int64  `json:"downlink"`
+	Total    int64  `json:"total"`
 }
 
 type probeReturnRoute struct {
@@ -188,6 +200,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	}
 
 	servers, _ := h.repo.ListRemoteServers(ctx)
+	dailyTraffic := h.loadDailyTraffic(ctx, servers, 30)
 	var returnRoutes map[int64][]storage.ServerReturnRoute
 	if showReturnRoute {
 		ids := make([]int64, 0, len(idSet))
@@ -210,6 +223,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 			RegionName: s.RegionName, RegionCity: s.RegionCity,
 			TelecomPaidPeer: s.TelecomPaidPeer,
 		}
+		ps.DailyTraffic = dailyTraffic[s.ID]
 		if onSpeed {
 			up, down := s.CurrentUploadSpeed, s.CurrentDownloadSpeed
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
@@ -291,6 +305,48 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		}
 	}
 	return payload, nil
+}
+
+// loadDailyTraffic caches the compact 30-day ledger projection for one minute.
+// buildPayload is shared by HTTP polling and WS broadcasting, so querying the
+// ledger on every 5-second payload would create needless database read load.
+func (h *ProbePublicHandler) loadDailyTraffic(ctx context.Context, servers []storage.RemoteServer, days int) map[int64][]probeDailyTraffic {
+	h.dailyMu.Lock()
+	defer h.dailyMu.Unlock()
+	if h.dailyTraffic != nil && time.Since(h.dailyAt) < time.Minute {
+		return h.dailyTraffic
+	}
+	now := time.Now()
+	rows, err := h.repo.ListServerDailyTraffic(ctx, days, now)
+	if err != nil {
+		return h.dailyTraffic
+	}
+	values := make(map[int64]map[string]probeDailyTraffic)
+	for _, row := range rows {
+		if values[row.ServerID] == nil {
+			values[row.ServerID] = make(map[string]probeDailyTraffic)
+		}
+		values[row.ServerID][row.Date] = probeDailyTraffic{
+			Date: row.Date, Uplink: row.Uplink, Downlink: row.Downlink, Total: row.Uplink + row.Downlink,
+		}
+	}
+	out := make(map[int64][]probeDailyTraffic, len(servers))
+	start := now.AddDate(0, 0, -(days - 1))
+	for _, server := range servers {
+		serverID, byDate := server.ID, values[server.ID]
+		list := make([]probeDailyTraffic, 0, days)
+		for i := 0; i < days; i++ {
+			date := start.AddDate(0, 0, i).Format("2006-01-02")
+			item, ok := byDate[date]
+			if !ok {
+				item = probeDailyTraffic{Date: date}
+			}
+			list = append(list, item)
+		}
+		out[serverID] = list
+	}
+	h.dailyAt, h.dailyTraffic = now, out
+	return out
 }
 
 func safeProviderURL(raw string) string {

@@ -1037,6 +1037,12 @@ func NewTrafficRepositoryFromConfig(cfg DatabaseConfig) (*TrafficRepository, err
 		u.User = url.UserPassword(cfg.Username, cfg.Password)
 		values := u.Query()
 		values.Set("sslmode", cfg.SSLMode)
+		// The schema intentionally remains compatible with SQLite and therefore
+		// uses TIMESTAMP WITHOUT TIME ZONE. Force every PostgreSQL session to UTC;
+		// otherwise CURRENT_TIMESTAMP is cast using the server/session timezone and
+		// offline detection (which compares UTC cutoffs) can see fresh heartbeats as
+		// several hours old after a migration.
+		values.Set("timezone", "UTC")
 		u.RawQuery = values.Encode()
 		dsn = u.String()
 	}
@@ -11299,15 +11305,16 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeat(ctx context.Context, tok
 	// agent 端 detectPublicIPv4 偶发失败上报空字段时,保留上次正确的 v4/v6 值,避免 master 反向连接断链。
 	const stmt = `UPDATE remote_servers SET
 		status = ?,
-		last_heartbeat = CURRENT_TIMESTAMP,
+		last_heartbeat = ?,
 		ip_address = COALESCE(NULLIF(?, ''), ip_address),
 		ip_address_v6 = COALESCE(NULLIF(?, ''), ip_address_v6),
 		offline_since = NULL,
 		offline_notified = 0,
-		updated_at = CURRENT_TIMESTAMP
+		updated_at = ?
 		WHERE token = ?`
 
-	res, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusConnected, ipAddress, ipAddressV6, token)
+	now := time.Now().UTC()
+	res, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusConnected, now, ipAddress, ipAddressV6, now, token)
 	if err != nil {
 		return false, nil, fmt.Errorf("update remote server heartbeat: %w", err)
 	}
@@ -11352,9 +11359,10 @@ func (r *TrafficRepository) MarkRemoteServerOfflineByID(ctx context.Context, ser
 		// 已经不是 connected 就不动 — 避免重复发下线通知(比如已经被 collector 标过了)
 		return prevStatus, name, ip, nil
 	}
+	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx,
-		`UPDATE remote_servers SET status = ?, current_upload_speed = 0, current_download_speed = 0, offline_since = CURRENT_TIMESTAMP, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?`,
-		RemoteServerStatusOffline, serverID, RemoteServerStatusConnected,
+		`UPDATE remote_servers SET status = ?, current_upload_speed = 0, current_download_speed = 0, offline_since = ?, offline_notified = 0, updated_at = ? WHERE id = ? AND status = ?`,
+		RemoteServerStatusOffline, now, now, serverID, RemoteServerStatusConnected,
 	)
 	if err != nil {
 		return prevStatus, name, ip, fmt.Errorf("mark server offline: %w", err)
@@ -11393,9 +11401,10 @@ func (r *TrafficRepository) UpdateRemoteServerLastActivity(ctx context.Context, 
 		}
 	}
 
-	const stmt = `UPDATE remote_servers SET status = ?, last_heartbeat = CURRENT_TIMESTAMP, offline_since = NULL, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	const stmt = `UPDATE remote_servers SET status = ?, last_heartbeat = ?, offline_since = NULL, offline_notified = 0, updated_at = ? WHERE id = ?`
 
-	_, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusConnected, serverID)
+	now := time.Now().UTC()
+	_, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusConnected, now, now, serverID)
 	if err != nil {
 		return currentStatus, serverName, ipAddress, prevOfflineNotified, fmt.Errorf("update remote server last activity: %w", err)
 	}
@@ -11472,7 +11481,7 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 	// 防止 agent 端 detectPublicIPv4 偶发失败(空字段)导致 db 里上一次正确的 v4 被清空。
 	const stmt = `UPDATE remote_servers SET
 		status = ?,
-		last_heartbeat = CURRENT_TIMESTAMP,
+		last_heartbeat = ?,
 		ip_address = COALESCE(NULLIF(?, ''), ip_address),
 		ip_address_v6 = COALESCE(NULLIF(?, ''), ip_address_v6),
 		boot_time = ?,
@@ -11484,11 +11493,13 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 		time_offset_seconds = ?,
 		offline_since = NULL,
 		offline_notified = 0,
-		updated_at = CURRENT_TIMESTAMP
+		updated_at = ?
 		WHERE token = ?`
 
+	now := time.Now().UTC()
 	_, err = r.db.ExecContext(ctx, stmt,
 		RemoteServerStatusConnected,
+		now,
 		update.IPAddress,
 		update.IPAddressV6,
 		update.BootTime,
@@ -11498,6 +11509,7 @@ func (r *TrafficRepository) UpdateRemoteServerHeartbeatWithRestart(ctx context.C
 		update.ListenPort,
 		pullAddress,
 		update.TimeOffsetSeconds,
+		now,
 		token)
 	if err != nil {
 		return nil, fmt.Errorf("update remote server heartbeat: %w", err)
@@ -11781,9 +11793,10 @@ func (r *TrafficRepository) UpdateRemoteServerSpeed(ctx context.Context, id int6
 		return errors.New("remote server id is required")
 	}
 
-	const stmt = `UPDATE remote_servers SET current_upload_speed = ?, current_download_speed = ?, speed_updated_at = CURRENT_TIMESTAMP, status = 'connected', last_heartbeat = CURRENT_TIMESTAMP, offline_since = NULL, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	const stmt = `UPDATE remote_servers SET current_upload_speed = ?, current_download_speed = ?, speed_updated_at = ?, status = 'connected', last_heartbeat = ?, offline_since = NULL, offline_notified = 0, updated_at = ? WHERE id = ?`
 
-	result, err := r.db.ExecContext(ctx, stmt, uploadSpeed, downloadSpeed, id)
+	now := time.Now().UTC()
+	result, err := r.db.ExecContext(ctx, stmt, uploadSpeed, downloadSpeed, now, now, now, id)
 	if err != nil {
 		return fmt.Errorf("update remote server speed: %w", err)
 	}
@@ -11810,9 +11823,10 @@ func (r *TrafficRepository) UpdateRemoteServerSpeedByToken(ctx context.Context, 
 		return errors.New("token is required")
 	}
 
-	const stmt = `UPDATE remote_servers SET current_upload_speed = ?, current_download_speed = ?, speed_updated_at = CURRENT_TIMESTAMP, status = 'connected', last_heartbeat = CURRENT_TIMESTAMP, offline_since = NULL, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE token = ?`
+	const stmt = `UPDATE remote_servers SET current_upload_speed = ?, current_download_speed = ?, speed_updated_at = ?, status = 'connected', last_heartbeat = ?, offline_since = NULL, offline_notified = 0, updated_at = ? WHERE token = ?`
 
-	result, err := r.db.ExecContext(ctx, stmt, uploadSpeed, downloadSpeed, token)
+	now := time.Now().UTC()
+	result, err := r.db.ExecContext(ctx, stmt, uploadSpeed, downloadSpeed, now, now, now, token)
 	if err != nil {
 		return fmt.Errorf("update remote server speed by token: %w", err)
 	}
@@ -12329,9 +12343,10 @@ func (r *TrafficRepository) MarkOfflineRemoteServers(ctx context.Context, timeou
 	}
 
 	// 现在执行更新
-	const stmt = `UPDATE remote_servers SET status = ?, current_upload_speed = 0, current_download_speed = 0, offline_since = CURRENT_TIMESTAMP, offline_notified = 0, updated_at = CURRENT_TIMESTAMP WHERE status = ? AND last_heartbeat < ?`
+	const stmt = `UPDATE remote_servers SET status = ?, current_upload_speed = 0, current_download_speed = 0, offline_since = ?, offline_notified = 0, updated_at = ? WHERE status = ? AND last_heartbeat < ?`
 
-	result, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusOffline, RemoteServerStatusConnected, cutoff)
+	now := time.Now().UTC()
+	result, err := r.db.ExecContext(ctx, stmt, RemoteServerStatusOffline, now, now, RemoteServerStatusConnected, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("mark offline remote servers: %w", err)
 	}

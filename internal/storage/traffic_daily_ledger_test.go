@@ -92,6 +92,40 @@ func TestSystemTrafficLedgerAndDuplicateReport(t *testing.T) {
 	}
 }
 
+func TestListServerDailyTrafficUsesConfiguredSource(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "probe-daily.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	xrayRes, err := repo.db.Exec(`INSERT INTO remote_servers(name,token,status,traffic_source) VALUES('x','tx','connected','xray')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sysRes, err := repo.db.Exec(`INSERT INTO remote_servers(name,token,status,traffic_source) VALUES('s','ts','connected','system')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xrayID, _ := xrayRes.LastInsertId()
+	sysID, _ := sysRes.LastInsertId()
+	date := trafficLedgerDate(time.Now())
+	_, _ = repo.db.Exec(`INSERT INTO traffic_daily_nodes(server_id,tag,type,date,uplink,downlink) VALUES(?,?,?,?,?,?)`, xrayID, "in", "inbound", date, 10, 20)
+	_, _ = repo.db.Exec(`INSERT INTO traffic_daily_nodes(server_id,tag,type,date,uplink,downlink) VALUES(?,?,?,?,?,?)`, sysID, "ignored", "inbound", date, 999, 999)
+	_, _ = repo.db.Exec(`INSERT INTO traffic_daily_system_servers(server_id,date,uplink,downlink) VALUES(?,?,?,?)`, sysID, date, 30, 40)
+	rows, err := repo.ListServerDailyTraffic(ctx, 30, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64][2]int64{}
+	for _, row := range rows {
+		got[row.ServerID] = [2]int64{row.Uplink, row.Downlink}
+	}
+	if got[xrayID] != [2]int64{10, 20} || got[sysID] != [2]int64{30, 40} {
+		t.Fatalf("unexpected daily source selection: %#v", got)
+	}
+}
+
 func TestCreateServerDailySnapshotsWritesCompleteBundle(t *testing.T) {
 	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "snapshot-bundle.db"))
 	if err != nil {
