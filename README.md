@@ -49,6 +49,9 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.4.7 (2026-08-06)
+- 🌈 支持更多信息上报
+
 ### v0.4.6 (2026-08-05)
 - 🌈 三网回程测试兜底traceroute
 
