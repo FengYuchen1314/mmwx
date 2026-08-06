@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"miaomiaowux/internal/license"
 	"miaomiaowux/internal/storage"
@@ -573,15 +574,7 @@ func peekInboundClientByEmail(ctx context.Context, rm *RemoteManageHandler, serv
 // 给目标 inbound 加一个 client — 走 agent 原子 add-client,在 inboundsMu 锁内完成 read-modify-write。
 // 主控不再持有 inbound 快照,从根本上消除并发绑套餐丢 client 的问题。
 func addClientToInbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag string, client map[string]interface{}) error {
-	body, _ := json.Marshal(map[string]interface{}{
-		"action": "add-client",
-		"tag":    inboundTag,
-		"client": client,
-	})
-	if _, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body); err != nil {
-		return fmt.Errorf("add-client: %w", err)
-	}
-	return nil
+	return mutateInboundClient(ctx, rm, serverID, inboundTag, "add-client", client)
 }
 
 // extractRealitySNIs 从 outbound JSON 抽出 reality 出站的 SNI(serverName)列表。
@@ -650,22 +643,48 @@ func addInboundSniffingExcludes(ctx context.Context, rm *RemoteManageHandler, se
 		"tag":     inboundTag,
 		"domains": domains,
 	})
-	if _, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body); err != nil {
-		return fmt.Errorf("add-sniffing-exclude: %w", err)
-	}
-	return nil
+	return mutateInbound(ctx, rm, serverID, inboundTag, "add-sniffing-exclude", body)
 }
 
 // 从目标 inbound 移除一个 client(按 email 匹配)。
 // agent 的 matchClientCredential 在 id/password 等主键缺失时会回退到 email,所以这里只传 email 也能匹配。
 func removeClientFromInbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, email string) error {
+	return mutateInboundClient(ctx, rm, serverID, inboundTag, "remove-client", map[string]interface{}{"email": email})
+}
+
+// mutateInboundClient 统一处理所有协议的 client 增删。Agent 会先把新配置原子写盘，再尝试
+// remove+add 热替换运行态 inbound；后一步失败时 HTTP 仍是 200，但响应带 runtime_warning。
+// 忽略它会让整个 inbound 从运行态消失（Reality/SS2022 等全部用户同时超时），直到下次重启。
+func mutateInboundClient(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, action string, client map[string]interface{}) error {
 	body, _ := json.Marshal(map[string]interface{}{
-		"action": "remove-client",
+		"action": action,
 		"tag":    inboundTag,
-		"client": map[string]interface{}{"email": email},
+		"client": client,
 	})
-	if _, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body); err != nil {
-		return fmt.Errorf("remove-client: %w", err)
+	return mutateInbound(ctx, rm, serverID, inboundTag, action, body)
+}
+
+// mutateInbound is the only write path for Agent inbound mutations. Keep the raw
+// request form so non-client actions (for example add-sniffing-exclude) receive
+// the same persisted-config/runtime convergence guarantee.
+func mutateInbound(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag, action string, body []byte) error {
+	raw, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body)
+	if err != nil {
+		return fmt.Errorf("%s: %w", action, err)
+	}
+	var resp struct {
+		RuntimeWarning string `json:"runtime_warning"`
+	}
+	if json.Unmarshal(raw, &resp) == nil && strings.TrimSpace(resp.RuntimeWarning) != "" {
+		log.Printf("[InboundClient] %s persisted but runtime apply failed server=%d tag=%s: %s; restarting xray",
+			action, serverID, inboundTag, resp.RuntimeWarning)
+		// 客户端断开不能中止故障恢复；配置已落盘，必须把运行态恢复起来。
+		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		if rerr := rm.restartXrayWithRecovery(recoveryCtx, serverID, "InboundClientRuntimeRecovery"); rerr != nil {
+			return fmt.Errorf("%s persisted but runtime apply failed (%s), xray restart failed: %w",
+				action, resp.RuntimeWarning, rerr)
+		}
 	}
 	return nil
 }

@@ -439,12 +439,17 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		go h.pusher.PushToAllServersForPackage(context.Background(), req.ID)
 	}
 
-	// 异步同步 xray 用户凭据：对比新旧节点差异，为绑定此套餐的用户添加/移除入站配置
-	go h.syncInboundUsersAfterNodeChange(context.Background(), req.ID, oldNodes, nodes)
+	// 套餐节点与用户凭据必须作为一次操作完成。这里不能后台异步：保存接口若先返回，用户立即
+	// 获取订阅会拿到刚生成的 SS2022 user key，但 Agent/Xray 的 clients 尚未写入，表现为
+	// “套餐里看得到节点但节点不通”。等同步结束后再返回，前端提示成功即代表凭据已经下发。
+	syncCtx, syncCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
+	defer syncCancel()
+	syncWarnings := h.syncInboundUsersAfterNodeChange(syncCtx, req.ID, oldNodes, nodes)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message": "Package updated successfully",
+		"message":  "Package updated successfully",
+		"warnings": syncWarnings,
 	})
 }
 
@@ -484,7 +489,7 @@ func resolveNodeServer(ctx context.Context, repo *storage.TrafficRepository, rm 
 	}
 }
 
-func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Context, packageID int64, oldNodes, newNodes []int64) {
+func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Context, packageID int64, oldNodes, newNodes []int64) []string {
 	oldSet := make(map[int64]bool, len(oldNodes))
 	for _, id := range oldNodes {
 		oldSet[id] = true
@@ -507,13 +512,13 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 	}
 
 	if len(addedNodes) == 0 && len(removedNodes) == 0 {
-		return
+		return nil
 	}
 
 	users, err := h.repo.ListUsersWithPackage(ctx)
 	if err != nil {
 		log.Printf("[PackageUpdate] Failed to list users with package: %v", err)
-		return
+		return []string{"读取套餐用户失败，未能同步节点凭据"}
 	}
 
 	var targetUsers []storage.User
@@ -523,7 +528,7 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 		}
 	}
 	if len(targetUsers) == 0 {
-		return
+		return nil
 	}
 
 	log.Printf("[PackageUpdate] Syncing inbound users for package %d: %d added nodes, %d removed nodes, %d users",
@@ -551,6 +556,7 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 	// 只 routed 节点改 routing rules 才需要重启 xray;非 routed 的 add-client / remove-client
 	// 由 agent 走 HandlerService 热更新,运行态立即生效。同步路径上每台少 ~3s。
 	var mu sync.Mutex
+	var warnings []string
 	restartNeeded := map[int64]bool{}
 	// per-server 收集 routed batch items + inbound add-client items,阶段二 per-server 一次 batch-apply 提交。
 	routedBatch := map[int64][]routedBatchItem{}
@@ -699,14 +705,22 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 		routeWg.Add(1)
 		go func(sid int64, list []routedBatchItem) {
 			defer routeWg.Done()
-			_ = applyRoutedBatchOrFallback(ctx, h.remoteManage, h.repo, sid, list, "PackageUpdate")
+			if ws := applyRoutedBatchOrFallback(ctx, h.remoteManage, h.repo, sid, list, "PackageUpdate"); len(ws) > 0 {
+				mu.Lock()
+				warnings = append(warnings, ws...)
+				mu.Unlock()
+			}
 		}(serverID, items)
 	}
 	for serverID, items := range inboundBatch {
 		routeWg.Add(1)
 		go func(sid int64, list []InboundClientAddItem) {
 			defer routeWg.Done()
-			_ = applyInboundBatchOrFallback(ctx, h.remoteManage, h.repo, sid, list, "PackageUpdate")
+			if ws := applyInboundBatchOrFallback(ctx, h.remoteManage, h.repo, sid, list, "PackageUpdate"); len(ws) > 0 {
+				mu.Lock()
+				warnings = append(warnings, ws...)
+				mu.Unlock()
+			}
 		}(serverID, items)
 	}
 	routeWg.Wait()
@@ -723,6 +737,9 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				if err := addUserToInbound(ctx, h.remoteManage, h.repo, user, fb.ServerID, fb.InboundTag); err != nil {
 					log.Printf("[PackageUpdate] fallback addUserToInbound user=%s server=%d tag=%s: %v",
 						fb.Username, fb.ServerID, fb.InboundTag, err)
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("节点 %s 添加用户 %s 失败", fb.NodeName, fb.Username))
+					mu.Unlock()
 				}
 			}(fb)
 		}
@@ -737,6 +754,7 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 	}
 
 	restartXrayInParallel(ctx, h.remoteManage, restartNeeded, "PackageUpdate")
+	return warnings
 }
 
 // PackageDeleteHandler 处理删除包模板
@@ -770,6 +788,12 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 			defer wg.Done()
 			if err := removeUserFromInbound(ctx, remoteManage, cfg); err != nil {
 				log.Printf("[PackageUnbind] 从入站 %s(server %d)移除用户 %s 失败: %v", cfg.InboundTag, cfg.ServerID, username, err)
+				return
+			}
+			// 只有远端确认摘除（含 runtime warning 自动恢复）后才删凭据记录；失败时保留，
+			// 供对账任务或再次解绑用同一凭据重试，避免生成同 email 的第二套 UUID。
+			if err := repo.DeleteUserInboundConfig(ctx, username, cfg.ServerID, cfg.InboundTag); err != nil {
+				log.Printf("[PackageUnbind] 删除用户 %s 入站 %s 凭据记录失败: %v", username, cfg.InboundTag, err)
 			}
 		}(cfg)
 	}
@@ -796,10 +820,6 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 		}(sa.RoutedNodeID)
 	}
 	wg.Wait()
-
-	if err := repo.DeleteUserInboundConfigs(ctx, username); err != nil {
-		log.Printf("[PackageUnbind] 删除用户 %s 入站配置记录失败: %v", username, err)
-	}
 
 	restartXrayInParallel(ctx, remoteManage, restartNeeded, "PackageUnbind")
 	if pusher != nil {
@@ -929,10 +949,12 @@ func (h *PackageUnassignHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		if err := removeUserFromInbound(ctx, h.remoteManage, cfg); err != nil {
 			log.Printf("[PackageUnassign] Failed to remove user %s from inbound %s on server %d: %v",
 				req.Username, cfg.InboundTag, cfg.ServerID, err)
+			continue
 		}
-	}
-	if err := h.repo.DeleteUserInboundConfigs(ctx, req.Username); err != nil {
-		log.Printf("[PackageUnassign] Failed to delete user inbound config records: %v", err)
+		if err := h.repo.DeleteUserInboundConfig(ctx, req.Username, cfg.ServerID, cfg.InboundTag); err != nil {
+			log.Printf("[PackageUnassign] Failed to delete user %s inbound %s credential record: %v",
+				req.Username, cfg.InboundTag, err)
+		}
 	}
 
 	// 路由出站子账号:从 active 状态下线,凭据保留供续费恢复。
@@ -1537,16 +1559,7 @@ func addUserToInbound(ctx context.Context, rm *RemoteManageHandler, repo *storag
 	}
 
 	// 原子 add-client:agent 端在 inboundsMu 内做 read-modify-write,自带幂等(已存在则 no-op)。
-	body, _ := json.Marshal(map[string]interface{}{
-		"action": "add-client",
-		"tag":    inboundTag,
-		"client": credential,
-	})
-	if _, err := rm.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/inbounds", body); err != nil {
-		return fmt.Errorf("add-client: %w", err)
-	}
-
-	return nil
+	return mutateInboundClient(ctx, rm, serverID, inboundTag, "add-client", credential)
 }
 
 // extractClientByEmail 在 inbound.settings 的 clients / users / accounts 数组里按 email 找现存 client,
@@ -1581,15 +1594,7 @@ func removeUserFromInbound(ctx context.Context, rm *RemoteManageHandler, cfg sto
 	if err := json.Unmarshal([]byte(cfg.CredentialJSON), &savedCred); err != nil || savedCred == nil {
 		return fmt.Errorf("parse saved credential: %v", err)
 	}
-	body, _ := json.Marshal(map[string]interface{}{
-		"action": "remove-client",
-		"tag":    cfg.InboundTag,
-		"client": savedCred,
-	})
-	if _, err := rm.forwardToRemoteServer(ctx, cfg.ServerID, "POST", "/api/child/inbounds", body); err != nil {
-		return fmt.Errorf("remove-client: %w", err)
-	}
-	return nil
+	return mutateInboundClient(ctx, rm, cfg.ServerID, cfg.InboundTag, "remove-client", savedCred)
 }
 
 // shadowsocksKeyLength 根据 SS method 返回 password 应有的字节数（base64 解码后）。

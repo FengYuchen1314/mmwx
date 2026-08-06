@@ -60,7 +60,7 @@ curl -sL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install.sh |
 
 > 默认使用 host 网络模式 — 便于 agent 反向连接、多端口场景,也避免后续新增端口又要改 compose。
 >
-> **Docker 下开启 HTTPS**:推荐在主控**宿主机**上装一个 agent,用它的 nginx 对外反代主控(容器内没有 systemd,容器内跑 nginx 维护性差)。主控容器只需提供 `12889` 的 http 面板。做法见下方「Docker 开启 HTTPS」。
+> 镜像已内置 Nginx，无需 systemd。使用 host 网络后，主控可直接申请、部署证书并管理 HTTPS；请确保宿主机的 80/443 端口未被其他服务占用。
 
 ```bash
 docker run -d \
@@ -93,15 +93,13 @@ services:
       - ./rule_templates:/app/rule_templates
 ```
 
-#### Docker 开启 HTTPS（宿主机 agent 反代）
+#### Docker 开启 HTTPS
 
-Docker 主控自身开 HTTPS 推荐用宿主机 agent 反代（容器内无 systemd，内置 nginx 维护性差）：
+1. 确认宿主机 80/443 端口未被占用，并使用上述 host 网络方式启动；
+2. 在「证书管理」添加 DNS 提供商，申请与主控域名匹配的证书；
+3. 将证书部署到主控。系统会生成反向代理配置，并直接启动或重载容器内的 Nginx。
 
-1. 在主控宿主机上装一个 agent，`master_url` 配成 `http://127.0.0.1:12889`（本机直连）；
-2. 在主控「服务管理」里给这台 agent 安装 nginx；
-3. 点「反代主控」按钮：主控自动申请证书并下发，agent 的 nginx 对外 443 反代到 `127.0.0.1:12889`，主控域名即可走 HTTPS。
-
-> 备选：容器内置 nginx 也能开 HTTPS（镜像已预装），但需 host 网络或额外映射 80/443，不推荐。
+也可以使用宿主机已有的 Nginx/Caddy 反代 `127.0.0.1:12889`。两种方式只选一种，避免争用 80/443。
 
 ### 方式 3：二进制部署
 

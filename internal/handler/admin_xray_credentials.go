@@ -190,14 +190,11 @@ func xrayCredentialRemoteKey(serverID int64, inboundTag, protocol string, creden
 }
 
 func replaceInboundClientCredential(ctx context.Context, rm *RemoteManageHandler, serverID int64, inboundTag string, oldCred, newCred map[string]interface{}) error {
-	removeBody, _ := json.Marshal(map[string]interface{}{"action": "remove-client", "tag": inboundTag, "client": oldCred})
-	if _, err := rm.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/inbounds", removeBody); err != nil {
+	if err := mutateInboundClient(ctx, rm, serverID, inboundTag, "remove-client", oldCred); err != nil {
 		return fmt.Errorf("remove old client: %w", err)
 	}
-	addBody, _ := json.Marshal(map[string]interface{}{"action": "add-client", "tag": inboundTag, "client": newCred})
-	if _, err := rm.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/inbounds", addBody); err != nil {
-		rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "add-client", "tag": inboundTag, "client": oldCred})
-		_, _ = rm.forwardToRemoteServer(ctx, serverID, http.MethodPost, "/api/child/inbounds", rollbackBody)
+	if err := mutateInboundClient(ctx, rm, serverID, inboundTag, "add-client", newCred); err != nil {
+		_ = mutateInboundClient(ctx, rm, serverID, inboundTag, "add-client", oldCred)
 		return fmt.Errorf("add new client: %w", err)
 	}
 	return nil

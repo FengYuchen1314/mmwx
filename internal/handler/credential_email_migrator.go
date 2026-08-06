@@ -190,12 +190,7 @@ func (m *CredentialEmailMigrator) migrateOne(ctx context.Context, c storage.User
 	//
 	// 顺序换成 remove → add:remove 把老的删掉,clients 里没了 → add 真正写入新 cred。
 	// 中间空窗 ~毫秒级(同一 agent inboundsMu 串行,基本无缝),客户端短期重连即可。
-	rmBody, _ := json.Marshal(map[string]interface{}{
-		"action": "remove-client",
-		"tag":    c.InboundTag,
-		"client": oldCred,
-	})
-	if _, err := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", rmBody); err != nil {
+	if err := mutateInboundClient(ctx, m.rm, c.ServerID, c.InboundTag, "remove-client", oldCred); err != nil {
 		// 孤儿数据:user_inbound_configs 里有记录但 agent xray 已经没这个 inbound 了
 		// (历史 inbound 删除时没级联清理 user_inbound_configs)。这条 client 在 agent 端不存在,
 		// add/remove 都没意义 — 直接 UPDATE DB 把 credential_json 的 email 改成新格式,
@@ -211,21 +206,11 @@ func (m *CredentialEmailMigrator) migrateOne(ctx context.Context, c storage.User
 		return fmt.Errorf("remove-client (old): %w", err)
 	}
 
-	addBody, _ := json.Marshal(map[string]interface{}{
-		"action": "add-client",
-		"tag":    c.InboundTag,
-		"client": newCred,
-	})
-	if _, err := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", addBody); err != nil {
+	if err := mutateInboundClient(ctx, m.rm, c.ServerID, c.InboundTag, "add-client", newCred); err != nil {
 		// add 失败:老 client 已 remove,新 client 没加 → 用户失联。
 		// agent /api/child/inbounds 实现是写文件 + runtime apply,失败前通常已经写盘,
 		// 但保险起见这里把老 cred 再 add 回去,恢复原状。
-		rollback, _ := json.Marshal(map[string]interface{}{
-			"action": "add-client",
-			"tag":    c.InboundTag,
-			"client": oldCred,
-		})
-		if _, rbErr := m.rm.forwardToRemoteServer(ctx, c.ServerID, "POST", "/api/child/inbounds", rollback); rbErr != nil {
+		if rbErr := mutateInboundClient(ctx, m.rm, c.ServerID, c.InboundTag, "add-client", oldCred); rbErr != nil {
 			log.Printf("[CredEmailMigrate] CRITICAL: rollback add-client failed user=%s server=%d tag=%s: %v (manual fix needed)",
 				c.Username, c.ServerID, c.InboundTag, rbErr)
 		}

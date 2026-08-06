@@ -3,12 +3,15 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 
 	"miaomiaowux/internal/storage"
 )
+
+var errInboundRuntimeConvergence = errors.New("inbound clients persisted but runtime convergence failed")
 
 // collectInboundClientAddItem 从 master InboundCache 拿 protocol/settings,算好 cred,
 // 返回 batch item。**不调 agent / 不写 DB**。
@@ -84,11 +87,19 @@ func applyInboundBatchOrFallback(ctx context.Context, rm *RemoteManageHandler, r
 	if len(items) == 0 {
 		return nil
 	}
-	err := applyInboundClientsBatchToAgent(ctx, rm, repo, serverID, items)
+	err := applyInboundClientsBatchToAgent(ctx, rm, repo, serverID, items, label)
 	if err == nil {
 		return nil
 	}
-	if err != ErrAgentBatchNotSupported {
+	// The batch has already changed config.json. Per-item fallback would see every
+	// client as an idempotent no-op and would not retry runtime replacement, while
+	// incorrectly reporting success. Surface the failure and keep DB credentials
+	// for deterministic recovery instead.
+	if errors.Is(err, errInboundRuntimeConvergence) {
+		log.Printf("[%s] inbound batch persisted but xray runtime did not converge server=%d: %v", label, serverID, err)
+		return []string{fmt.Sprintf("服务器 %d 的用户凭据已保存，但 Xray 运行态恢复失败", serverID)}
+	}
+	if !errors.Is(err, ErrAgentBatchNotSupported) {
 		log.Printf("[%s] inbound batch-apply server=%d failed: %v — falling back to per-item", label, serverID, err)
 	} else {
 		log.Printf("[%s] agent server=%d 不支持 batch-apply,fallback per-item", label, serverID)
@@ -132,7 +143,7 @@ type InboundClientAddItem struct {
 // 老 agent(无 batch-apply 端点)→ 返回 ErrAgentBatchNotSupported,caller 应 fallback 逐个 addUserToInbound。
 // 全成功 → 批量 SaveUserInboundConfig 写 DB,返回 nil。
 // agent 个别 item 报 err(如 inbound 不存在)→ 跳过该 item 的 DB 写入,其它仍写入,函数仍返回 nil。
-func applyInboundClientsBatchToAgent(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []InboundClientAddItem) error {
+func applyInboundClientsBatchToAgent(ctx context.Context, rm *RemoteManageHandler, repo *storage.TrafficRepository, serverID int64, items []InboundClientAddItem, label string) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -167,15 +178,29 @@ func applyInboundClientsBatchToAgent(ctx context.Context, rm *RemoteManageHandle
 	}
 
 	var resp struct {
-		Success        bool     `json:"success"`
-		InboundResults []string `json:"inbound_results"`
-		Message        string   `json:"message"`
+		Success         bool     `json:"success"`
+		InboundResults  []string `json:"inbound_results"`
+		RuntimeWarnings []string `json:"runtime_warnings"`
+		Message         string   `json:"message"`
 	}
 	if jerr := json.Unmarshal(raw, &resp); jerr != nil {
 		return fmt.Errorf("parse batch-apply response: %w", jerr)
 	}
 	if !resp.Success {
 		return fmt.Errorf("batch-apply rejected: %s", resp.Message)
+	}
+
+	// Agent 已经把 clients 持久化到 config.json，但 HandlerService/embedded runtime
+	// 可能无法热替换某些入站（SS2022 是最常见的场景）。以前主控忽略这里的 warning，
+	// DB 和磁盘都显示用户已存在，运行中的 Xray 却仍使用旧 clients，节点会一直不可用到下次重启。
+	// 配置已经落盘，此时用带恢复保护的完整重启把运行态收敛到磁盘配置。
+	if len(resp.RuntimeWarnings) > 0 {
+		log.Printf("[%s] inbound runtime apply warning server=%d: %s; restarting xray to apply persisted clients",
+			label, serverID, strings.Join(resp.RuntimeWarnings, "; "))
+		if rerr := rm.restartXrayWithRecovery(ctx, serverID, label+"RuntimeRecovery"); rerr != nil {
+			return fmt.Errorf("%w: runtime apply warning (%s), restart failed: %v",
+				errInboundRuntimeConvergence, strings.Join(resp.RuntimeWarnings, "; "), rerr)
+		}
 	}
 
 	// 写 user_inbound_configs:跳过 agent 端返回 err: 的 item(常见:inbound tag 不存在)。
