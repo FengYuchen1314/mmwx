@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -107,28 +108,24 @@ func hmacSum(key, msg []byte) []byte {
 	return m.Sum(nil)
 }
 
-// devPreviewInitData 是本地浏览器预览时前端注入的哨兵值(见 webapp_page.go 的 __DEVPREVIEW__ 分支)。
-const devPreviewInitData = "__devpreview__"
-
-// validateInitData(方法)在纯函数校验之外加一层 dev preview 旁路:
-// 仅当 webapp_dev_preview=true 且收到哨兵值时,以第一个 admin_tg_id 身份放行,方便浏览器直接开发调试。
-// 生产环境(dev preview 关闭)永远走签名校验,哨兵值无效。
+// validateInitData 永远校验 Telegram 签名。即使开启 WebAppDevPreview 也不得
+// 合成管理员身份：部分第三方 TG 客户端不提供 initData，旧的固定哨兵值
+// 会让任意用户落入第一个管理员身份。本地预览只允许显式传入真实、
+// 未过期的 ?initData= 签名串。
 func (s *Service) validateInitData(initData string) (int64, string, error) {
-	if s.cfg.WebAppDevPreview && initData == devPreviewInitData {
-		if len(s.cfg.AdminTGIDs) == 0 {
-			return 0, "", errors.New("dev preview 需在 admin_tg_ids 配置至少一个管理员")
-		}
-		return s.cfg.AdminTGIDs[0], "devpreview", nil
-	}
 	return validateInitData(initData, s.cfg.TGBotToken)
 }
 
 // webAppMe 校验 initData → 反查账号 → 聚合账号/流量/节点/订阅。
 func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
-	initData := r.Header.Get("X-Telegram-Init-Data")
-	if initData == "" {
-		initData = r.URL.Query().Get("initData")
+	// 身份响应绝不能使用 GET。部分用户给 /api/* 配了 Cloudflare Cache Everything，
+	// 即使源站返回 no-store，第三方规则仍可能按 URL 复用上一个管理员的响应；POST
+	// 默认不进入 CDN 缓存，从协议层切断跨用户响应复用。
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+		return
 	}
+	initData := r.Header.Get("X-Telegram-Init-Data")
 	tgID, handle, err := s.validateInitData(initData)
 	if err != nil {
 		writeJSONResp(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
@@ -155,9 +152,18 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	isAdmin := s.cfg.IsAdmin(tgID) && info.Bound && info.IsActive && info.IsPrimaryAdmin && info.Role == "admin"
+	// 历史版本曾可能把普通 TG 误绑到首个管理员。不能因为数据库里存在这条绑定
+	// 就把管理员账号数据返回给非白名单 TG；要求管理员先在网页端解除错误绑定。
+	if info.IsPrimaryAdmin && !isAdmin {
+		log.Printf("[Security] blocked TG Mini App access to primary admin binding: tg_id=%d username=%s", tgID, info.Username)
+		writeJSONResp(w, http.StatusForbidden, map[string]any{
+			"error": "Telegram 绑定异常：当前 TG 无权访问首个管理员账号，请在主控用户管理中解除错误绑定",
+		})
+		return
+	}
 	username := info.Username
 
-	isAdmin := s.cfg.IsAdmin(tgID) && info.Bound && info.IsActive && info.IsPrimaryAdmin && info.Role == "admin"
 	resp := map[string]any{"bound": true, "is_admin": isAdmin}
 	if renewals, err := s.client.RenewalRequestHistory(ctx, tgID); err == nil {
 		resp["renewal_requests"] = renewals
@@ -168,9 +174,15 @@ func (s *Service) webAppMe(w http.ResponseWriter, r *http.Request) {
 
 	// 账号 + 流量 + 套餐
 	if summary, err := s.client.UserSummary(ctx, username); err == nil {
+		displayRole := summary.Role
+		if !isAdmin {
+			// 妙妙屋X只认首个用户 + 配置的 TG ID 为 Mini App 管理员。
+			// 即使数据库手工把其他账号改成 admin，对 TG 也只显示普通用户。
+			displayRole = "user"
+		}
 		resp["account"] = map[string]any{
 			"username":  summary.Username,
-			"role":      summary.Role,
+			"role":      displayRole,
 			"is_active": summary.IsActive,
 			"email":     summary.Email,
 		}
@@ -418,15 +430,6 @@ func (s *Service) webAppRenewalRequest(w http.ResponseWriter, r *http.Request) {
 		writeJSONResp(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return
 	}
-	if r.Method == http.MethodGet {
-		req, err := s.client.RenewalRequestStatus(r.Context(), tgID)
-		if err != nil {
-			writeJSONResp(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSONResp(w, http.StatusOK, map[string]any{"request": req})
-		return
-	}
 	if r.Method != http.MethodPost {
 		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
 		return
@@ -492,6 +495,10 @@ func (s *Service) webAppAdminAnnounce(w http.ResponseWriter, r *http.Request) {
 
 // webAppAdminAnnouncementsList 管理员在 Mini App 查看当前生效公告(列表)。
 func (s *Service) webAppAdminAnnouncementsList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+		return
+	}
 	if _, ok := s.adminTGID(w, r); !ok {
 		return
 	}
@@ -526,8 +533,13 @@ func (s *Service) webAppAdminAnnounceDelete(w http.ResponseWriter, r *http.Reque
 	writeJSONResp(w, http.StatusOK, map[string]any{"success": true})
 }
 
-// webAppAdminInvites GET 列邀请码 + 套餐(供生成表单选套餐)。
+// webAppAdminInvites POST 列邀请码 + 套餐。身份相关响应禁止用 GET，
+// 避免强制 CDN 缓存规则把管理员数据返回给其他 TG 用户。
 func (s *Service) webAppAdminInvites(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+		return
+	}
 	if _, ok := s.adminTGID(w, r); !ok {
 		return
 	}
@@ -632,8 +644,12 @@ func (s *Service) webAppAdminInviteDelete(w http.ResponseWriter, r *http.Request
 	writeJSONResp(w, http.StatusOK, map[string]any{"success": true})
 }
 
-// webAppAdminUsers GET 列用户 + 套餐(搜索在前端做,改套餐下拉用套餐列表)。
+// webAppAdminUsers POST 列用户 + 套餐(搜索在前端做,改套餐下拉用套餐列表)。
 func (s *Service) webAppAdminUsers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]any{"error": "method"})
+		return
+	}
 	if _, ok := s.adminTGID(w, r); !ok {
 		return
 	}
@@ -749,9 +765,11 @@ func setWebAppPrivateHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
 	w.Header().Set("CDN-Cache-Control", "no-store")
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Surrogate-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 	w.Header().Set("Vary", "X-Telegram-Init-Data")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 }
 
 func writeJSONResp(w http.ResponseWriter, code int, v any) {

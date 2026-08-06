@@ -9,7 +9,8 @@ import (
 )
 
 // webAppPage 返回 Mini App 单页(自包含,引 Telegram WebApp SDK)。
-// __DEVPREVIEW__ 注入:仅 webapp_dev_preview=true 时允许从 ?initData= 读取(本地预览),生产为 false。
+// __DEVPREVIEW__ 注入:仅 webapp_dev_preview=true 时允许从 ?initData= 读取
+// 真实 Telegram 签名串。无签名时不得回退为管理员。
 // __THEME__ 注入:跟随主控「默认主题」,anime 时给 <html> 加 theme-anime 类(首屏即生效,无闪烁)。
 func (s *Service) webAppPage(w http.ResponseWriter, r *http.Request) {
 	// Do not let a CDN retain an old Mini App shell after authorization fixes.
@@ -447,6 +448,11 @@ function __xrayToggle(id,running,btn){
 window.__xrayToggle=__xrayToggle;
 function render(d){
  document.getElementById("app").classList.remove("hide");
+ // 第三方客户端可能复用同一 WebView；每次根据服务端响应重置角色菜单，
+ // 避免上一个管理员会话的 DOM 状态残留给普通用户。
+ document.getElementById("nav-invites").classList.add("hide");
+ document.getElementById("nav-users").classList.add("hide");
+ document.getElementById("nav-renewal").classList.add("hide");
  document.getElementById("view-home").innerHTML=renderHome(d);
  document.getElementById("view-traffic").innerHTML=renderTraffic(d);
  document.getElementById("view-status").innerHTML=renderStatus(d);
@@ -499,7 +505,7 @@ function renderInvites(){
 // 加载当前生效公告 → 渲染到 #announce-list(带删除按钮)
 function loadAnnouncements(){
  var box=document.getElementById("announce-list"); if(!box)return;
- fetch("/api/tg-webapp/admin/announcements",{headers:{"X-Telegram-Init-Data":window.__init}})
+ fetch("/api/tg-webapp/admin/announcements",{method:"POST",headers:{"Content-Type":"application/json","X-Telegram-Init-Data":window.__init},body:"{}"})
   .then(function(r){return r.json();})
   .then(function(j){
    var arr=(j&&j.announcements)||[];
@@ -549,7 +555,7 @@ function __postAnnounce(btn){
 window.__postAnnounce=__postAnnounce;
 function loadInvites(){
  document.getElementById("view-invites").innerHTML='<div class="card"><div class="muted">加载中...</div></div>';
- fetch("/api/tg-webapp/admin/invites",{headers:{"X-Telegram-Init-Data":window.__init}})
+ fetch("/api/tg-webapp/admin/invites",{method:"POST",headers:{"Content-Type":"application/json","X-Telegram-Init-Data":window.__init},body:"{}"})
   .then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
   .then(function(j){window.__inv=j;window.__invLoaded=true;renderInvites();})
   .catch(function(){document.getElementById("view-invites").innerHTML='<div class="card">加载失败。</div>';});
@@ -619,7 +625,7 @@ function __filterUsers(){renderUserList();}
 window.__filterUsers=__filterUsers;
 function loadUsers(){
  document.getElementById("view-users").innerHTML='<div class="card"><div class="muted">加载中...</div></div>';
- fetch("/api/tg-webapp/admin/users",{headers:{"X-Telegram-Init-Data":window.__init}})
+ fetch("/api/tg-webapp/admin/users",{method:"POST",headers:{"Content-Type":"application/json","X-Telegram-Init-Data":window.__init},body:"{}"})
   .then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
   .then(function(j){window.__users=j;window.__usersLoaded=true;renderUsers();})
   .catch(function(){document.getElementById("view-users").innerHTML='<div class="card">加载失败。</div>';});
@@ -649,7 +655,7 @@ window.__assignPkg=__assignPkg;
 function load(){
  // The nonce and cache:no-store prevent a CDN rule that ignores the custom
  // Telegram header from reusing another visitor's identity response.
- fetch("/api/tg-webapp/me?_="+Date.now(),{cache:"no-store",headers:{"Cache-Control":"no-cache","X-Telegram-Init-Data":window.__init}})
+ fetch("/api/tg-webapp/me",{method:"POST",cache:"no-store",headers:{"Cache-Control":"no-cache","Content-Type":"application/json","X-Telegram-Init-Data":window.__init},body:"{}"})
   .then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
   .then(render)
   .catch(function(){document.getElementById("app").classList.remove("hide");document.getElementById("view-home").innerHTML='<div class="card">加载失败,请稍后重试。</div>';});
@@ -658,9 +664,9 @@ function load(){
  setScheme();
  if(tg&&tg.onEvent)tg.onEvent("themeChanged",setScheme);
  var initData=(tg&&tg.initData)?tg.initData:"";
- // 本地浏览器预览(webapp_dev_preview=true):无真实 initData 时,优先用 ?initData= 传入的真实签名串,
- // 否则退化为哨兵值 "__devpreview__",后端以第一个 admin_tg_id 身份放行,免 Telegram 直接开发调试。
- if(!initData&&__DEVPREVIEW__){initData=new URLSearchParams(location.search).get("initData")||"__devpreview__";}
+ // 本地浏览器预览也必须显式传入 Telegram 签名的 ?initData=;
+ // 不再使用可伪造的管理员哨兵值。
+ if(!initData&&__DEVPREVIEW__){initData=new URLSearchParams(location.search).get("initData")||"";}
  if(!initData){document.getElementById("notice").classList.remove("hide");return;}
  window.__init=initData;
  if(tg){tg.ready();tg.expand();}
