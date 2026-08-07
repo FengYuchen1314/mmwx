@@ -58,6 +58,22 @@ type RenewalRequest struct {
 	ReviewedAt      string `json:"reviewed_at,omitempty"`
 }
 
+type ServerRenewalResult struct {
+	Processed  bool   `json:"processed"`
+	ServerName string `json:"server_name"`
+	ExpiresAt  string `json:"expires_at"`
+}
+
+func (c *Client) ConfirmServerRenewed(ctx context.Context, serverID int64, expectedDate string) (*ServerRenewalResult, error) {
+	var out ServerRenewalResult
+	if err := c.post(ctx, "/api/admin/tgbot/server-renewed", map[string]any{
+		"server_id": serverID, "expected_date": expectedDate,
+	}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (c *Client) RenewalRequestHistory(ctx context.Context, tgID int64) ([]RenewalRequest, error) {
 	var out struct {
 		Requests []RenewalRequest `json:"requests"`

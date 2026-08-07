@@ -29,6 +29,10 @@ func sendTelegram(ctx context.Context, botToken, chatID, text string, buttons []
 	if len(buttons) > 0 {
 		rows := make([][]map[string]string, 0, len(buttons))
 		for _, button := range buttons {
+			if data := strings.TrimSpace(button.CallbackData); data != "" && len(data) <= 64 {
+				rows = append(rows, []map[string]string{{"text": button.Text, "callback_data": data}})
+				continue
+			}
 			u, err := url.Parse(strings.TrimSpace(button.URL))
 			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 				continue

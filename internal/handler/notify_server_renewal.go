@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -147,14 +148,14 @@ func checkServerRenewal(ctx context.Context, repo *storage.TrafficRepository) {
 			}
 		case plan.DueInDays > 0:
 			if markRenewalNotified(s.ID, plan.Cycle, fmt.Sprintf("d%d", plan.DueInDays)) {
-				SendServerRenewalDueNotification(ctx, s.Name, plan.DueInDays, plan.Cycle, online, plan.ByExpiry, s.ProviderName, s.ProviderURL)
+				SendServerRenewalDueNotification(ctx, s.ID, s.Name, plan.DueInDays, plan.Cycle, online, plan.ByExpiry, s.ProviderName, s.ProviderURL)
 			}
 		}
 	}
 }
 
 // SendServerRenewalDueNotification 服务器将在 N 天后到重置日(=续费日)。
-func SendServerRenewalDueNotification(ctx context.Context, serverName string, daysLeft int, resetDate string, online bool, byExpiry bool, providerName, providerURL string) {
+func SendServerRenewalDueNotification(ctx context.Context, serverID int64, serverName string, daysLeft int, resetDate string, online bool, byExpiry bool, providerName, providerURL string) {
 	state := "在线"
 	if !online {
 		state = "离线"
@@ -169,7 +170,11 @@ func SendServerRenewalDueNotification(ctx context.Context, serverName string, da
 	}
 	event := notify.Event{Type: notify.EventServerRenewalDue, Title: "⏰ 服务器即将到期", Message: message}
 	if providerURL = safeProviderURL(providerURL); providerURL != "" {
-		event.Buttons = []notify.Button{{Text: "💳 去续费", URL: providerURL}}
+		event.Buttons = append(event.Buttons, notify.Button{Text: "💳 去续费", URL: providerURL})
+	}
+	if byExpiry && serverID > 0 {
+		expected := strings.ReplaceAll(resetDate, "-", "")
+		event.Buttons = append(event.Buttons, notify.Button{Text: "✅ 我已续费", CallbackData: fmt.Sprintf("sr:%d:%s", serverID, expected)})
 	}
 	notifyAsyncEvent(ctx, event)
 }

@@ -70,6 +70,7 @@ type Event struct {
 }
 
 type Button struct {
-	Text string
-	URL  string
+	Text         string
+	URL          string
+	CallbackData string
 }

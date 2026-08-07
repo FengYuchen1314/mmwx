@@ -123,6 +123,8 @@ func (h *TGBotAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.reviewRenewalRequest(w, r, false)
 	case path == "renewal-request/fail" && r.Method == http.MethodPost:
 		h.failRenewalRequest(w, r)
+	case path == "server-renewed" && r.Method == http.MethodPost:
+		h.confirmServerRenewed(w, r)
 	case path == "admin-subview" && r.Method == http.MethodGet:
 		h.adminSubview(w, r)
 	// 公告(bot 轮询广播 + miniapp 横幅 + /announce 命令)
@@ -137,6 +139,30 @@ func (h *TGBotAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+func (h *TGBotAPIHandler) confirmServerRenewed(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ServerID     int64  `json:"server_id"`
+		ExpectedDate string `json:"expected_date"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ServerID <= 0 || len(body.ExpectedDate) != 8 {
+		writeJSONError(w, http.StatusBadRequest, "invalid renewal confirmation")
+		return
+	}
+	server, processed, err := h.repo.ConfirmRemoteServerRenewal(r.Context(), body.ServerID, body.ExpectedDate)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	response := map[string]any{"success": true, "processed": processed}
+	if server != nil {
+		response["server_name"] = server.Name
+		if server.ExpiresAt != nil {
+			response["expires_at"] = server.ExpiresAt.Format(time.RFC3339)
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // announcementsPending 供 bot 轮询:未推送的 bot 公告,每条带自己的收件人 tg_id 列表。

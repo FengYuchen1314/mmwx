@@ -10931,6 +10931,52 @@ func (r *TrafficRepository) UpdateRemoteServerProbeMeta(ctx context.Context, id 
 	return nil
 }
 
+// ConfirmRemoteServerRenewal 按服务器配置的续费周期顺延到期日。
+// expectedDate 用于乐观锁和 Telegram 按钮防重：旧通知或重复点击不会再次续期。
+func (r *TrafficRepository) ConfirmRemoteServerRenewal(ctx context.Context, id int64, expectedDate string) (*RemoteServer, bool, error) {
+	server, err := r.GetRemoteServer(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if server.ExpiresAt == nil || server.ExpiresAt.IsZero() {
+		return nil, false, errors.New("server expiry is not configured")
+	}
+	expectedDate = strings.TrimSpace(expectedDate)
+	if server.ExpiresAt.Format("20060102") != expectedDate {
+		return server, false, nil
+	}
+	months := 1
+	switch server.RenewalCycle {
+	case "quarter":
+		months = 3
+	case "half_year":
+		months = 6
+	case "year":
+		months = 12
+	case "month", "":
+	default:
+		return nil, false, errors.New("invalid server renewal cycle")
+	}
+	base := *server.ExpiresAt
+	now := time.Now().In(base.Location())
+	if base.Before(now) {
+		base = now
+	}
+	newExpiry := base.AddDate(0, months, 0)
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE remote_servers SET expires_at=?, updated_at=CURRENT_TIMESTAMP WHERE id=? AND expires_at=?`,
+		newExpiry, id, *server.ExpiresAt)
+	if err != nil {
+		return nil, false, fmt.Errorf("confirm server renewal: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		latest, getErr := r.GetRemoteServer(ctx, id)
+		return latest, false, getErr
+	}
+	server.ExpiresAt = &newExpiry
+	return server, true, nil
+}
+
 // UpdateRemoteServerLocation persists the complete location returned by the
 // license service. Region remains the independently editable flag field.
 func (r *TrafficRepository) UpdateRemoteServerLocation(ctx context.Context, id int64, country, region, city string) error {
