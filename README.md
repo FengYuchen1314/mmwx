@@ -174,6 +174,8 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.7-beta.2 (2026-08-07)
+- 🌈 续费通知增加我已续费按钮
 ### v0.4.7-beta.1 (2026-08-07)
 - 🌈 补全探针数据(cpu、os)
 - 🌈 补全探针数据(日流量)
