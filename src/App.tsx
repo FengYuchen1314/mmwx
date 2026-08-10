@@ -1028,13 +1028,42 @@ function ServerCard({ server, index }: { server: ProbeServer; index: number }) {
   );
 }
 
-function TableMetric({ percent }: { percent?: number }) {
-  if (percent === undefined) return <span className="dash">—</span>;
+function TableMetric({ label, percent }: { label: string; percent?: number }) {
   return (
     <div className="table-metric">
-      <span>{percent.toFixed(1)}%</span>
+      <span className="table-metric-head">
+        <small>{label}</small>
+        <span>{percent === undefined ? "—" : `${percent.toFixed(1)}%`}</span>
+      </span>
       <div className="meter">
-        <i style={{ width: `${Math.min(100, Math.max(0, percent))}%` }} />
+        {percent !== undefined && (
+          <i style={{ width: `${Math.min(100, Math.max(0, percent))}%` }} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TableResources({ server }: { server: ProbeServer }) {
+  const memory = server.mem_total
+    ? pct(server.mem_used, server.mem_total)
+    : undefined;
+  const disk = server.disk_total
+    ? pct(server.disk_used, server.disk_total)
+    : undefined;
+  return (
+    <div className="table-resources">
+      <div className="table-resource-row">
+        <TableMetric label="CPU" percent={server.cpu_pct} />
+      </div>
+      <div className="table-resource-row">
+        <TableMetric label="内存" percent={memory} />
+      </div>
+      <div className="table-resource-row">
+        <TableMetric label="硬盘" percent={disk} />
+      </div>
+      <div className="table-resource-row">
+        <TableTraffic server={server} label="流量" />
       </div>
     </div>
   );
@@ -1047,57 +1076,102 @@ function TablePing({
   ping?: ProbePingSeries[];
   serverIndex: number;
 }) {
-  const [open, setOpen] = useState(false);
+  const [latencyOpen, setLatencyOpen] = useState(false);
+  const [lossOpen, setLossOpen] = useState(false);
   if (!ping?.length) return <span className="dash">—</span>;
   const average = averagePing(ping);
   const lines = [{ ...average, key: "__avg__" }, ...ping];
   return (
     <>
-      <button
-        className="table-ping"
-        type="button"
-        onClick={() => setOpen(true)}
-      >
-        <span>
-          <strong>
-            {average.current_ms < 0
-              ? "超时"
-              : `${average.current_ms.toFixed(0)} ms`}
-          </strong>
-          <b>{average.loss_pct.toFixed(1)}%</b>
-        </span>
-        <em>
-          {average.buckets.map((bucket, index) => (
-            <i
-              key={index}
-              className={
-                bucket.ms < 0 && bucket.loss < 0
-                  ? "none"
-                  : bucket.ms < 0
-                    ? "bad"
-                    : bucket.ms >= 200
-                      ? "warn"
-                      : "good"
-              }
-            />
-          ))}
-        </em>
-      </button>
-      {open && (
+      <div className="table-ping-pair">
+        <button
+          className="table-ping"
+          type="button"
+          onClick={() => setLatencyOpen(true)}
+        >
+          <span>
+            <small>延迟</small>
+            <strong>
+              {average.current_ms < 0
+                ? "超时"
+                : `${average.current_ms.toFixed(0)} ms`}
+            </strong>
+          </span>
+          <em>
+            {average.buckets.map((bucket, index) => (
+              <i
+                key={index}
+                className={
+                  bucket.ms < 0 && bucket.loss < 0
+                    ? "none"
+                    : bucket.ms < 0
+                      ? "bad"
+                      : bucket.ms >= 200
+                        ? "warn"
+                        : "good"
+                }
+              />
+            ))}
+          </em>
+        </button>
+        <button
+          className="table-ping"
+          type="button"
+          onClick={() => setLossOpen(true)}
+        >
+          <span>
+            <small>丢包</small>
+            <b>{average.loss_pct.toFixed(1)}%</b>
+          </span>
+          <em>
+            {average.buckets.map((bucket, index) => (
+              <i
+                key={index}
+                className={
+                  bucket.loss < 0
+                    ? "none"
+                    : bucket.loss >= 20
+                      ? "bad"
+                      : bucket.loss > 0
+                        ? "warn"
+                        : "good"
+                }
+              />
+            ))}
+          </em>
+        </button>
+      </div>
+      {latencyOpen && (
         <TrendDialog
           serverIndex={serverIndex}
           initial={lines}
           targetKey="__avg__"
           title="平均"
           mode="latency"
-          close={() => setOpen(false)}
+          close={() => setLatencyOpen(false)}
+        />
+      )}
+      {lossOpen && (
+        <TrendDialog
+          serverIndex={serverIndex}
+          initial={lines}
+          targetKey="__avg__"
+          title="平均"
+          mode="loss"
+          close={() => setLossOpen(false)}
         />
       )}
     </>
   );
 }
 
-function TableTraffic({ server }: { server: ProbeServer }) {
+function TableTraffic({
+  server,
+  label,
+}: {
+  server: ProbeServer;
+  label?: string;
+}) {
   const [open, setOpen] = useState(false);
   if (server.traffic_used === undefined) return <span className="dash">—</span>;
   return (
@@ -1107,10 +1181,13 @@ function TableTraffic({ server }: { server: ProbeServer }) {
         className="table-traffic table-traffic-button"
         onClick={() => server.daily_traffic?.length && setOpen(true)}
       >
-        <span>
-          {server.traffic_limit
-            ? `${bytes(server.traffic_used, false)} / ${bytes(server.traffic_limit, false)}`
-            : bytes(server.traffic_used, false)}
+        <span className="table-metric-head">
+          {label && <small>{label}</small>}
+          <span>
+            {server.traffic_limit
+              ? `${bytes(server.traffic_used, false)} / ${bytes(server.traffic_limit, false)}`
+              : bytes(server.traffic_used, false)}
+          </span>
         </span>
         {(server.traffic_used_up !== undefined ||
           server.traffic_used_down !== undefined) && (
@@ -1180,52 +1257,45 @@ function ServerTable({ servers }: { servers: ProbeServer[] }) {
             <tr>
               <th>服务器</th>
               <th>状态</th>
-              <th>CPU</th>
-              <th>内存</th>
-              <th>硬盘</th>
+              <th>资源与流量</th>
               <th>网速</th>
-              <th>周期流量</th>
               <th>累计流量</th>
               <th>延迟</th>
               <th>三网回程</th>
-              <th>续费</th>
             </tr>
           </thead>
           <tbody>
             {servers.map((server, index) => {
-              const memory = server.mem_total
-                ? pct(server.mem_used, server.mem_total)
-                : undefined;
-              const disk = server.disk_total
-                ? pct(server.disk_used, server.disk_total)
-                : undefined;
               return (
                 <tr key={`${server.name}-${index}`}>
                   <td className="table-name">
                     <span className="table-name-line">
-                      <Twemoji>
-                        {regionFlag(server.region) &&
-                        !hasLeadingFlag(server.name || "")
-                          ? `${regionFlag(server.region)} ${server.name || `服务器 ${index + 1}`}`
-                          : server.name || `服务器 ${index + 1}`}
-                      </Twemoji>
+                      {server.provider_url ? (
+                        <a
+                          href={server.provider_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          <Twemoji>
+                            {regionFlag(server.region) &&
+                            !hasLeadingFlag(server.name || "")
+                              ? `${regionFlag(server.region)} ${server.name || `服务器 ${index + 1}`}`
+                              : server.name || `服务器 ${index + 1}`}
+                          </Twemoji>
+                        </a>
+                      ) : (
+                        <Twemoji>
+                          {regionFlag(server.region) &&
+                          !hasLeadingFlag(server.name || "")
+                            ? `${regionFlag(server.region)} ${server.name || `服务器 ${index + 1}`}`
+                            : server.name || `服务器 ${index + 1}`}
+                        </Twemoji>
+                      )}
                       <span title={systemTitle(server)}>
                         <SystemIcon server={server} />
                       </span>
                     </span>
-                    {(server.region_name ||
-                      server.region_city ||
-                      server.provider_name) && (
-                      <small>
-                        {[
-                          server.region_name,
-                          server.region_city,
-                          server.provider_name,
-                        ]
-                          .filter(Boolean)
-                          .join(" · ")}
-                      </small>
-                    )}
+                    <TableRenewal server={server} />
                   </td>
                   <td>
                     <span className="table-status">
@@ -1234,13 +1304,7 @@ function ServerTable({ servers }: { servers: ProbeServer[] }) {
                     </span>
                   </td>
                   <td>
-                    <TableMetric percent={server.cpu_pct} />
-                  </td>
-                  <td>
-                    <TableMetric percent={memory} />
-                  </td>
-                  <td>
-                    <TableMetric percent={disk} />
+                    <TableResources server={server} />
                   </td>
                   <td>
                     <span className="table-speed">
@@ -1253,9 +1317,6 @@ function ServerTable({ servers }: { servers: ProbeServer[] }) {
                         {speed(server.download_speed)}
                       </span>
                     </span>
-                  </td>
-                  <td>
-                    <TableTraffic server={server} />
                   </td>
                   <td>
                     {server.cumulative_up !== undefined ||
@@ -1280,9 +1341,6 @@ function ServerTable({ servers }: { servers: ProbeServer[] }) {
                     ) : (
                       <span className="dash">—</span>
                     )}
-                  </td>
-                  <td>
-                    <TableRenewal server={server} />
                   </td>
                 </tr>
               );
