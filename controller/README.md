@@ -5,7 +5,7 @@
   <img height="200px" src="https://raw.githubusercontent.com/iluobei/miaomiaowuX/refs/heads/main/screenshots/mmwx_light.webp" />
 </div>
 
-妙妙屋X 是 [妙妙屋](https://github.com/iluobei/miaomiaowu) 的增强版本，在原有 Clash 订阅管理基础上，新增 Xray 多服务器管理、远程节点部署、流量监控、证书管理等功能。支持主控/子服务器架构，通过 [mmw-agent](https://github.com/iluobei/mmw-agent) 实现远程服务器的统一管理。
+妙妙屋X 是 [妙妙屋](https://github.com/iluobei/miaomiaowu) 的增强版本，在原有 Clash 订阅管理基础上，新增 Xray 多服务器管理、远程节点部署、流量监控、证书管理等功能。支持主控/子服务器架构，通过本仓库的 [Agent](../agent) 实现远程服务器的统一管理。
 
 ## 功能特性
 
@@ -118,7 +118,7 @@ chmod +x mmwx-linux-amd64
 
 ### 远程服务器部署
 
-在主控面板添加远程服务器后，会生成一键安装命令，在远程服务器上执行即可自动安装 [mmw-agent](https://github.com/iluobei/mmw-agent) 并连接到主控。
+在主控面板添加远程服务器后，会生成一键安装命令，在远程服务器上执行即可自动安装本仓库发布的 [Agent](../agent) 并连接到主控。
 
 ## 架构
 

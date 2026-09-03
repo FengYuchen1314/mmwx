@@ -21,6 +21,9 @@ var (
 	Version_x byte = 26
 	Version_y byte = 3
 	Version_z byte = 27
+	// MMWXVersion is injected for monorepo release artifacts. Keeping the
+	// upstream numeric fields as a fallback retains normal development builds.
+	MMWXVersion string
 )
 
 var (
@@ -60,6 +63,9 @@ func init() {
 // Version returns Xray's version as a string, in the form of "x.y.z" where x, y and z are numbers.
 // ".z" part may be omitted in regular releases.
 func Version() string {
+	if MMWXVersion != "" {
+		return MMWXVersion
+	}
 	return fmt.Sprintf("%v.%v.%v", Version_x, Version_y, Version_z)
 }
 

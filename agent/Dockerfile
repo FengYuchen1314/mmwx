@@ -1,11 +1,11 @@
 # mmw-agent Docker 镜像 — embedded xray + 内置 nginx,host 网络模式。
 #
 # Build:
-#   本地:docker build --build-context xray-core-fork=../Xray-core-mmwx -t mmw-agent:test .
-#   CI:  workflow 先 clone fork 到 ../Xray-core-mmwx,再用 --build-context 同上
+#   本地:docker build --build-context xray-core-fork=../xray-core -t mmw-agent:test .
+#   CI:  root workflow passes the monorepo's xray-core/ directory as this context.
 #
 # 为什么需要 --build-context xray-core-fork:
-# go.mod uses a relative replace to ../Xray-core-mmwx,
+# go.mod uses a relative replace to ../xray-core,
 # build context 默认只含 Dockerfile 所在目录,看不到父级 fork 目录。
 # buildkit 的 --build-context 把 fork 作为附加 context 引入,Dockerfile 内 COPY --from 解构。
 
@@ -32,6 +32,7 @@ FROM golang:1.26-bookworm AS builder
 # 多架构:GitHub Actions buildx 会注入 TARGETOS/TARGETARCH
 ARG TARGETOS
 ARG TARGETARCH
+ARG MMWX_VERSION=dev
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -40,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Put the paired Xray fork beside the agent so its relative Go replace resolves.
-COPY --from=xray-core-fork . /build/Xray-core-mmwx
+COPY --from=xray-core-fork . /build/xray-core
 
 # mmw-agent 源码本体
 WORKDIR /build/mmw-agent
@@ -50,7 +51,7 @@ COPY . .
 
 # 编译 — CGO 关 (纯静态;主控也是这个配置),embedded xray-core 是 Go 库静态链接进来
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -trimpath -ldflags="-s -w" -o /out/mmw-agent ./cmd/mmw-agent
+    go build -trimpath -ldflags="-s -w -X mmw-agent/internal/version.Version=${MMWX_VERSION}" -o /out/mmw-agent ./cmd/mmw-agent
 
 # ─── Stage 2: runtime ───
 # Final stage - 用 nginx 官方 Docker base(mainline-bookworm),跟主控 Dockerfile + install-nginx.sh 同款

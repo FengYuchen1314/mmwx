@@ -10,6 +10,12 @@ the paired Xray runtime fork.
 - `probe/` — probe service
 - `xray-core/` — paired Xray runtime fork
 
-Every push to `main` is built and released by GitHub Actions. Release versions
+Every commit pushed to `main` is built and released by GitHub Actions. Release versions
 follow `v0.1.<GitHub run number>`; this is a monotonic SemVer patch sequence
 without automated source commits or release loops.
+
+The root workflow validates all four components, publishes controller and
+Agent images to GHCR, uploads cross-platform binaries to GitHub Releases, and
+packages the probe Worker. Probe deployment activates automatically after
+repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are set;
+its Worker bindings remain managed in Cloudflare and are preserved by Wrangler.

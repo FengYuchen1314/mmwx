@@ -19,7 +19,7 @@ import (
 //	/miaomiaowux/mmwx-linux-amd64      面板二进制(命名与 GitHub release asset 一致)
 //	/miaomiaowux/mmwx-windows-amd64.exe ...
 //	/mmw-agent/version.json            agent 最新版本元数据
-//	/mmw-agent/mmw-agent-linux-amd64   agent 二进制
+//	/mmwx-agent/mmwx-agent-linux-amd64 agent 二进制（历史 CDN 路径）
 //
 // version.json 由 GitHub Actions 在发版时自动生成上传(见 .github/workflows/publish-cdn.yml)。
 

@@ -35,7 +35,7 @@ func NewAgentVersionHandler(rm *RemoteManageHandler, repo *storage.TrafficReposi
 	return &AgentVersionHandler{rm: rm, repo: repo}
 }
 
-const githubLatestReleaseURL = "https://api.github.com/repos/FengYuchen1314/mmw-agent/releases/latest"
+const githubLatestReleaseURL = "https://api.github.com/repos/FengYuchen1314/mmwx/releases/latest"
 
 // 缓存 5 分钟 — 之前 1h 太长,刚发新 release UI 要等一小时才更新,期间"升级"按钮
 // 会因为 compareSemver(current, staleCachedLatest) ≥ 0 被前端 disable,用户没法点。
@@ -202,6 +202,8 @@ func isUpgradeAvailable(current, latest string) bool {
 
 // compareSemver:正数=a>b, 负数=a<b, 0=相等;非数字段走字符串比较。
 func compareSemver(a, b string) int {
+	a = strings.TrimPrefix(strings.TrimSpace(a), "v")
+	b = strings.TrimPrefix(strings.TrimSpace(b), "v")
 	pa := strings.Split(a, ".")
 	pb := strings.Split(b, ".")
 	n := len(pa)

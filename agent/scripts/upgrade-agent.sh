@@ -18,7 +18,7 @@
 #
 set -euo pipefail
 
-REPO="iluobei/mmw-agent"
+REPO="FengYuchen1314/mmwx"
 BIN="/usr/local/bin/mmw-agent"
 TARGET="${1:-latest}"
 
@@ -39,12 +39,12 @@ log "架构: $ARCH_NAME"
 
 # 2. 解析目标版本 path(URL 前缀由镜像链各自接上)
 if [ "$TARGET" = "latest" ]; then
-    PATH_SUFFIX="releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    PATH_SUFFIX="releases/latest/download/mmwx-agent-linux-${ARCH_NAME}"
     log "目标: GitHub latest"
 else
     # 允许带或不带 v 前缀
     case "$TARGET" in v*) TAG="$TARGET" ;; *) TAG="v$TARGET" ;; esac
-    PATH_SUFFIX="releases/download/${TAG}/mmw-agent-linux-${ARCH_NAME}"
+    PATH_SUFFIX="releases/download/${TAG}/mmwx-agent-linux-${ARCH_NAME}"
     log "目标: $TAG"
 fi
 

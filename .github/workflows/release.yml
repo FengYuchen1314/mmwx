@@ -1,0 +1,333 @@
+name: CI, package, and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mmwx-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate all components
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      runtime_version: ${{ steps.version.outputs.runtime_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Calculate release version
+        run: |
+          echo "version=v0.1.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "runtime_version=0.1.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            controller/go.sum
+            agent/go.sum
+            xray-core/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            controller/web/package-lock.json
+            probe/package-lock.json
+      - name: Build controller frontend
+        working-directory: controller/web
+        run: |
+          npm ci
+          npm run build
+      - name: Test controller
+        working-directory: controller
+        run: |
+          go test ./internal/handler ./internal/license ./internal/mcp ./cmd/server
+          go build ./internal/storage
+      - name: Test Agent
+        working-directory: agent
+        run: go test ./...
+      - name: Test paired Xray runtime (offline suite)
+        working-directory: xray-core
+        run: |
+          # Some upstream tests need live public resolvers or the separately
+          # cached geoip.dat. Run the deterministic protocol/core suite here;
+          # the release build below still compiles the entire paired runtime.
+          go test ./core ./app/dispatcher ./app/policy \
+            ./common/crypto ./common/mux ./common/net ./common/protocol/... \
+            ./proxy/anytls ./proxy/mieru ./proxy/socks ./proxy/vless/encoding \
+            ./transport/internet/...
+          go build -o /tmp/mmwx-xray ./main
+      - name: Typecheck and build probe
+        working-directory: probe
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+
+  package:
+    name: Package ${{ matrix.component }} (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: controller
+            directory: controller
+            package: ./cmd/server
+            output: mmwx-controller-linux-amd64
+            goos: linux
+            goarch: amd64
+            version_symbol: miaomiaowux/internal/version.Version
+          - component: controller
+            directory: controller
+            package: ./cmd/server
+            output: mmwx-controller-linux-arm64
+            goos: linux
+            goarch: arm64
+            version_symbol: miaomiaowux/internal/version.Version
+          - component: controller
+            directory: controller
+            package: ./cmd/server
+            output: mmwx-controller-darwin-amd64
+            goos: darwin
+            goarch: amd64
+            version_symbol: miaomiaowux/internal/version.Version
+          - component: controller
+            directory: controller
+            package: ./cmd/server
+            output: mmwx-controller-darwin-arm64
+            goos: darwin
+            goarch: arm64
+            version_symbol: miaomiaowux/internal/version.Version
+          - component: controller
+            directory: controller
+            package: ./cmd/server
+            output: mmwx-controller-windows-amd64.exe
+            goos: windows
+            goarch: amd64
+            version_symbol: miaomiaowux/internal/version.Version
+          - component: agent
+            directory: agent
+            package: ./cmd/mmw-agent
+            output: mmwx-agent-linux-amd64
+            goos: linux
+            goarch: amd64
+            version_symbol: mmw-agent/internal/version.Version
+          - component: agent
+            directory: agent
+            package: ./cmd/mmw-agent
+            output: mmwx-agent-linux-arm64
+            goos: linux
+            goarch: arm64
+            version_symbol: mmw-agent/internal/version.Version
+          - component: agent
+            directory: agent
+            package: ./cmd/mmw-agent
+            output: mmwx-agent-darwin-amd64
+            goos: darwin
+            goarch: amd64
+            version_symbol: mmw-agent/internal/version.Version
+          - component: agent
+            directory: agent
+            package: ./cmd/mmw-agent
+            output: mmwx-agent-darwin-arm64
+            goos: darwin
+            goarch: arm64
+            version_symbol: mmw-agent/internal/version.Version
+          - component: xray
+            directory: xray-core
+            package: ./main
+            output: mmwx-xray-linux-amd64
+            goos: linux
+            goarch: amd64
+            version_symbol: github.com/xtls/xray-core/core.MMWXVersion
+          - component: xray
+            directory: xray-core
+            package: ./main
+            output: mmwx-xray-linux-arm64
+            goos: linux
+            goarch: arm64
+            version_symbol: github.com/xtls/xray-core/core.MMWXVersion
+          - component: xray
+            directory: xray-core
+            package: ./main
+            output: mmwx-xray-windows-amd64.exe
+            goos: windows
+            goarch: amd64
+            version_symbol: github.com/xtls/xray-core/core.MMWXVersion
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: |
+            controller/go.sum
+            agent/go.sum
+            xray-core/go.sum
+      - uses: actions/setup-node@v4
+        if: matrix.component == 'controller'
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: controller/web/package-lock.json
+      - name: Build controller frontend
+        if: matrix.component == 'controller'
+        working-directory: controller/web
+        run: |
+          npm ci
+          npm run build
+      - name: Cross-compile binary
+        env:
+          DIRECTORY: ${{ matrix.directory }}
+          PACKAGE: ${{ matrix.package }}
+          OUTPUT: ${{ matrix.output }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          VERSION_SYMBOL: ${{ matrix.version_symbol }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          pushd "$DIRECTORY"
+          RUNTIME_VERSION="${VERSION#v}"
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X ${VERSION_SYMBOL}=${RUNTIME_VERSION}" \
+            -o "../dist/${OUTPUT}" "$PACKAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: dist/${{ matrix.output }}
+          if-no-files-found: error
+
+  package-probe:
+    name: Package probe
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: probe/package-lock.json
+      - name: Build probe bundle
+        working-directory: probe
+        run: |
+          npm ci
+          npm run build
+          tar -C dist -czf ../mmwx-probe-${{ needs.validate.outputs.version }}.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mmwx-probe-${{ needs.validate.outputs.version }}.tar.gz
+          path: probe/mmwx-probe-${{ needs.validate.outputs.version }}.tar.gz
+
+  publish-containers:
+    name: Publish controller and Agent images
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish controller image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./controller
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-contexts: |
+            xray-core-fork=./xray-core
+          build-args: |
+            MMWX_VERSION=${{ needs.validate.outputs.runtime_version }}
+          tags: |
+            ghcr.io/fengyuchen1314/mmwx-controller:${{ needs.validate.outputs.version }}
+            ghcr.io/fengyuchen1314/mmwx-controller:latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+      - name: Build and publish Agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./agent
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-contexts: |
+            xray-core-fork=./xray-core
+          build-args: |
+            MMWX_VERSION=${{ needs.validate.outputs.runtime_version }}
+          tags: |
+            ghcr.io/fengyuchen1314/mmwx-agent:${{ needs.validate.outputs.version }}
+            ghcr.io/fengyuchen1314/mmwx-agent:latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+
+  release:
+    name: Create GitHub Release
+    needs: [validate, package, package-probe, publish-containers]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum mmwx-* > checksums.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: MMWX ${{ needs.validate.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            release/mmwx-*
+            release/checksums.txt
+
+  deploy-probe:
+    name: Deploy probe to Cloudflare
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: probe/package-lock.json
+      - name: Deploy probe Worker
+        working-directory: probe
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npm ci
+          npm run deploy

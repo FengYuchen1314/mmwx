@@ -783,15 +783,9 @@ esac
 # 注:GitHub Release binary 重定向到 objects.githubusercontent.com(只有 A 记录,无 AAAA),
 # 纯 v6 机器直连 github 会 "network is unreachable" → 会快速失败(近乎即时,非超时)后降级到
 # gh-proxy 反代兜底。
-# 更新 CDN(Cloudflare R2)优先 — CDN_BASE 由后端按 CDN 加速开关注入(默认开启、域名写死),非空才加入;
-# 失败自动降级到 GitHub / gh-proxy。
-CDN_BASE="__MMWX_UPDATE_CDN__"
 MIRRORS=()
-if [ -n "$CDN_BASE" ]; then
-    MIRRORS+=("${CDN_BASE}/mmw-agent/mmw-agent-linux-${ARCH_NAME}")
-fi
-MIRRORS+=("https://github.com/FengYuchen1314/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
-MIRRORS+=("https://gh-proxy.com/https://github.com/FengYuchen1314/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
+MIRRORS+=("https://github.com/FengYuchen1314/mmwx/releases/latest/download/mmwx-agent-linux-${ARCH_NAME}")
+MIRRORS+=("https://gh-proxy.com/https://github.com/FengYuchen1314/mmwx/releases/latest/download/mmwx-agent-linux-${ARCH_NAME}")
 
 # Download binary — 优先用 curl(更普遍),没有就用 wget;两者都没就按发行版包管理器装一个,
 # 杜绝 "wget: command not found" 噪声 / "ERROR: 都没装" 卡死。

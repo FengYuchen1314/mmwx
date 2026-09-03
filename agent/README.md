@@ -20,7 +20,7 @@ docker run -d \
   -v $(pwd)/xray-config:/usr/local/etc/xray \
   -v $(pwd)/nginx-cert:/etc/nginx/cert \
   -v $(pwd)/nginx-servers:/etc/nginx/servers \
-  ghcr.io/iluobei/mmw-agent:latest
+  ghcr.io/fengyuchen1314/mmwx-agent:latest
 ```
 
 或用 [docker-compose.yml](docker-compose.yml):
@@ -38,11 +38,8 @@ docker compose up -d
 
 通过主控前端「添加 server」生成的一键脚本安装,流程跟原来一致 — 自动装 xray binary + 配 systemd + 注册到主控。
 
-```bash
-# 主控 UI 给的安装命令,大致形如:
-curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | bash -s -- \
-    --master https://master.example.com --token xxxxx
-```
+安装脚本由主控按服务器令牌即时生成；请直接复制主控 UI 提供的命令，不要使用
+仓库中的固定安装 URL。
 
 
 

@@ -6,11 +6,10 @@ go 1.26
 // 见 fork 中 proxy/vision_limiter_hook.go + proxy/proxy.go 修改两行。
 // 后续 upstream rebase 流程:cp 新版本 → re-apply 这俩文件 → go build。
 //
-// fork 已发布到 https://github.com/iluobei/Xray-core-mmwx (module 名仍是 github.com/xtls/xray-core)。
-// 这里用相对路径 replace:本地在同级目录 ../xray-core-vision-limiter;
-// CI 在 build 前 git clone 该 fork 到同位置(见 .github/workflows/build.yml)。
-// 不能用 git 版本 replace(=> github.com/iluobei/Xray-core-mmwx),因为 fork module 名 != repo 路径会报错。
-replace github.com/xtls/xray-core => ../Xray-core-mmwx
+// The paired runtime is part of this monorepo. Its module name stays
+// github.com/xtls/xray-core, so a local replace keeps all four components on
+// the same tested revision.
+replace github.com/xtls/xray-core => ../xray-core
 
 require (
 	github.com/gorilla/websocket v1.5.3

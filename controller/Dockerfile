@@ -25,6 +25,7 @@ FROM golang:1.26-bookworm AS backend-builder
 # Declare build arguments for multi-platform support
 ARG TARGETOS
 ARG TARGETARCH
+ARG MMWX_VERSION=dev
 
 WORKDIR /app
 
@@ -38,7 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the paired Xray fork beside /app: go.mod uses a relative replace so the
 # runtime that builds this image is exactly the runtime that supports AnyTLS
 # and Mieru.
-COPY --from=xray-core-fork . /Xray-core-mmwx
+COPY --from=xray-core-fork . /xray-core
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -56,7 +57,7 @@ COPY --from=frontend-builder /app/internal/web/dist ./internal/web/dist
 # Use TARGETOS and TARGETARCH for multi-platform builds
 RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build \
     -trimpath \
-    -ldflags="-s -w" \
+    -ldflags="-s -w -X miaomiaowux/internal/version.Version=${MMWX_VERSION}" \
     -o /app/server \
     ./cmd/server
 
