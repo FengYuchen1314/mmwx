@@ -279,7 +279,7 @@ function SubscriptionsPage() {
   const [items, setItems] = useState<Subscription[]>([])
   const [loading, setLoading] = useState(true)
   useEffect(() => { api<unknown>('/api/subscriptions').then((value) => setItems(asList<Subscription>(value, ['subscriptions']))).finally(() => setLoading(false)) }, [])
-  return <><PageHeader title="订阅链接" description="查看和复制可用的订阅地址" actions={<Button variant="secondary" icon="refresh">刷新订阅</Button>} /><Card className="table-card">{loading ? <Spinner/> : items.length ? <div className="subscription-list">{items.map((item, index) => <div key={String(item.id ?? index)}><span className="subscription-icon"><Icon name="link"/></span><div><strong>{item.name || item.username || '订阅链接'}</strong><small className="mono">{item.url || '安全链接已生成'}</small></div>{item.url && <Button variant="secondary" icon="copy" onClick={() => void navigator.clipboard.writeText(item.url || '')}>复制</Button>}</div>)}</div> : <Empty icon="link" title="暂无可用订阅" text="创建用户并分配节点后，订阅链接会显示在这里。"/>}</Card>
+  return <><PageHeader title="订阅链接" description="查看和复制可用的订阅地址" actions={<Button variant="secondary" icon="refresh">刷新订阅</Button>} /><Card className="table-card">{loading ? <Spinner/> : items.length ? <div className="subscription-list">{items.map((item, index) => <div key={String(item.id ?? index)}><span className="subscription-icon"><Icon name="link"/></span><div><strong>{item.name || item.username || '订阅链接'}</strong><small className="mono">{item.url || '安全链接已生成'}</small></div>{item.url && <Button variant="secondary" icon="copy" onClick={() => void navigator.clipboard.writeText(item.url || '')}>复制</Button>}</div>)}</div> : <Empty icon="link" title="暂无可用订阅" text="创建用户并分配节点后，订阅链接会显示在这里。"/>}</Card></>
 }
 
 function GeneratorPage() {
