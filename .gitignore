@@ -5,3 +5,4 @@ node_modules/
 dist/
 build/
 .tmp-*-gocache/
+.tmp-github-deploy-key/
