@@ -24,6 +24,7 @@ import (
 	"mmw-agent/internal/discovery"
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/limiter"
+	"mmw-agent/internal/shadowtls"
 	"mmw-agent/internal/util"
 	"mmw-agent/internal/version"
 	"mmw-agent/internal/xrayctl"
@@ -58,6 +59,7 @@ type ManageHandler struct {
 	// xrayAccessLogPath 是内嵌 xray 的 access log 文件(见 config.XrayAccessLogPathFor)。
 	// 内嵌模式下 service=xray 读它,而不是查 journalctl -u xray(那个 unit 不存在)。
 	xrayAccessLogPath string
+	shadowTLS         *shadowtls.Manager
 }
 
 func (h *ManageHandler) OnMasterURLChanged(fn func(string)) { h.onMasterURLChanged = fn }
@@ -77,6 +79,7 @@ func NewManageHandler(configToken, restartMethod, restartCommand string) *Manage
 		configToken:    configToken,
 		restartMethod:  restartMethod,
 		restartCommand: restartCommand,
+		shadowTLS:      shadowtls.New(""),
 	}
 }
 
@@ -2475,6 +2478,25 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 		action = "add"
 	}
 
+	// The controller performs the same validation, but it is not trusted as the
+	// final policy boundary. Prepare also changes AnyTLS to a loopback listener;
+	// only the supervised ShadowTLS process may bind its public port.
+	if action == "add" || action == "replace" {
+		if err := validateManagedInbound(req.Inbound); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if _, enabled, err := shadowtls.Prepare(req.Inbound); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		} else if enabled {
+			if err := h.shadowTLS.EnsureAvailable(); err != nil {
+				writeError(w, http.StatusPreconditionFailed, err.Error())
+				return
+			}
+		}
+	}
+
 	// 全局串行化 — 见 inboundsMu 字段注释。所有 inbound CRUD(包括新的 add-client / remove-client)
 	// 走同一把锁,避免并发请求间的 read-modify-write 撕裂。
 	h.inboundsMu.Lock()
@@ -2535,6 +2557,10 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		if err := h.startShadowTLSInbound(req.Inbound); err != nil {
+			writeError(w, http.StatusInternalServerError, "Inbound was saved but ShadowTLS did not start: "+err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
@@ -2577,6 +2603,7 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		h.stopShadowTLSInbound(req.Tag)
 
 		// 配置成功时，运行态报错可接受（可能尚未加载）
 		writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2586,6 +2613,36 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		writeError(w, http.StatusBadRequest, "Invalid action. Must be 'add' or 'remove'")
+	}
+}
+
+func (h *ManageHandler) startShadowTLSInbound(inbound map[string]interface{}) error {
+	config, enabled, err := shadowtls.Prepare(inbound)
+	if err != nil || !enabled {
+		return err
+	}
+	return h.shadowTLS.Start(config)
+}
+
+func (h *ManageHandler) stopShadowTLSInbound(tag string) {
+	if h.shadowTLS != nil {
+		h.shadowTLS.Stop(strings.TrimSpace(tag))
+	}
+}
+
+// ReconcileShadowTLS starts the sidecars described by persisted inbounds after
+// an Agent restart.  A sidecar never owns configuration; Xray's JSON remains
+// the source of truth and carries the mmwxShadowTLS extension alongside its
+// loopback AnyTLS inbound.
+func (h *ManageHandler) ReconcileShadowTLS() {
+	for _, inbound := range h.getInboundsFromConfig() {
+		config, enabled, err := shadowtls.Prepare(inbound)
+		if err != nil || !enabled {
+			continue
+		}
+		if err := h.shadowTLS.Start(config); err != nil {
+			log.Printf("[ShadowTLS] tag=%s failed to start: %v", config.Tag, err)
+		}
 	}
 }
 
@@ -2617,6 +2674,13 @@ func (h *ManageHandler) manageInboundReplace(w http.ResponseWriter, ctx context.
 		_ = h.persistInbound(oldInbound)
 		writeError(w, http.StatusInternalServerError, "persist replacement failed; old inbound restored: "+err.Error())
 		return
+	}
+	if err := h.startShadowTLSInbound(req.Inbound); err != nil {
+		writeError(w, http.StatusInternalServerError, "Inbound was replaced but ShadowTLS did not start: "+err.Error())
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(fmt.Sprint(req.Inbound["protocol"]))) != "anytls" {
+		h.stopShadowTLSInbound(tag)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Inbound replaced successfully"})
 }
@@ -2663,6 +2727,10 @@ func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context
 			})
 			return
 		}
+		if err := h.startShadowTLSInbound(req.Inbound); err != nil {
+			writeError(w, http.StatusInternalServerError, "Inbound was saved but ShadowTLS did not start: "+err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
@@ -2693,6 +2761,7 @@ func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context
 			}
 			return
 		}
+		h.stopShadowTLSInbound(req.Tag)
 
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,

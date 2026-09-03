@@ -10,7 +10,7 @@ go 1.26
 // 这里用相对路径 replace:本地在同级目录 ../xray-core-vision-limiter;
 // CI 在 build 前 git clone 该 fork 到同位置(见 .github/workflows/build.yml)。
 // 不能用 git 版本 replace(=> github.com/iluobei/Xray-core-mmwx),因为 fork module 名 != repo 路径会报错。
-replace github.com/xtls/xray-core => ../xray-core-vision-limiter
+replace github.com/xtls/xray-core => ../Xray-core-mmwx
 
 require (
 	github.com/gorilla/websocket v1.5.3

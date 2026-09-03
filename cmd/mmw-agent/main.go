@@ -407,6 +407,9 @@ func main() {
 	// list 端点里的同名兜底也保留,作 defense-in-depth(配置后续被手改回缺 tag 时仍能修)。
 	// 注:放在 EnsureXrayConfig + 可能的 RestartXray 之后,确保 xray 配置已就位、路径稳定。
 	manageHandler.PromoteAllTagsOnStartup()
+	// ShadowTLS is a separate process, not an Xray transport. Start persisted
+	// sidecars only after Xray's loopback AnyTLS listeners are ready.
+	manageHandler.ReconcileShadowTLS()
 
 	// 创建 agent 客户端
 	agentClient := agent.NewClient(cfg)

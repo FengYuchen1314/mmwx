@@ -45,3 +45,4 @@ sign-local.sh.example
 sign-local.sh
 *_test.go
 !internal/handler/nginx_websites_test.go
+!internal/shadowtls/manager_test.go
