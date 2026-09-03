@@ -312,10 +312,13 @@ jobs:
             release/checksums.txt
 
   deploy-probe:
-    name: Deploy probe to Cloudflare
+    name: Deploy probe to Cloudflare (if configured)
     needs: validate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != ''
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -324,10 +327,11 @@ jobs:
           cache: npm
           cache-dependency-path: probe/package-lock.json
       - name: Deploy probe Worker
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
         working-directory: probe
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           npm ci
           npm run deploy
+      - name: Report skipped deployment
+        if: env.CLOUDFLARE_API_TOKEN == '' || env.CLOUDFLARE_ACCOUNT_ID == ''
+        run: echo "Cloudflare secrets are not configured; probe deployment was skipped."
