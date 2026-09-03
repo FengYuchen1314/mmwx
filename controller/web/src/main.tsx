@@ -48,7 +48,7 @@ const iconPaths: Record<string, string> = {
   folder: 'M3 5h6l2 2h10v12H3V5Z', sliders: 'M4 6h16M4 12h16M4 18h16M8 4v4m8 2v4m-5 2v4', terminal: 'm4 6 5 5-5 5m7 0h9', settings: 'M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Zm8.5-3.5-.1-1.3 2-1.6-2-3.4-2.5 1a9 9 0 0 0-2.2-1.3L15.3 3h-4L11 5.4a9 9 0 0 0-2.2 1.3l-2.5-1-2 3.4 2 1.6L6.2 12l.1 1.3-2 1.6 2 3.4 2.5-1a9 9 0 0 0 2.2 1.3l.3 2.4h4l.4-2.4a9 9 0 0 0 2.2-1.3l2.5 1 2-3.4-2-1.6.1-1.3Z',
   plus: 'M12 5v14M5 12h14', refresh: 'M20 6v5h-5M4 18v-5h5m10.5-2A8 8 0 0 0 6 7.5L4 11m16 2-2 3.5A8 8 0 0 1 4.5 14', search: 'm21 21-4.4-4.4m2.4-5.6a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
   moon: 'M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z', sun: 'M12 4V2m0 20v-2m8-8h2M2 12h2m14-6 1.4-1.4M4.6 19.4 6 18m12 0 1.4 1.4M4.6 4.6 6 6m10 6a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z',
-  logout: 'M10 17l5-5-5-5m5 5H3m9-9h7a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-7', chevron: 'm9 18 6-6-6-6', menu: 'M4 7h16M4 12h16M4 17h16', eye: 'M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z', copy: 'M8 8h12v12H8V8Zm-4 8V4h12', check: 'm5 12 4 4L19 6', close: 'm6 6 12 12M18 6 6 18',
+  logout: 'M10 17l5-5-5-5m5 5H3m9-9h7a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-7', chevron: 'm9 18 6-6-6-6', menu: 'M4 7h16M4 12h16M4 17h16', eye: 'M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z', copy: 'M8 8h12v12H8V8Zm-4 8V4h12', check: 'm5 12 4 4L19 6', close: 'm6 6 12 12M18 6 6 18', shield: 'M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Zm-3-10 2 2 4-4',
 }
 
 function Icon({ name, size = 17 }: { name: string; size?: number }) {
@@ -87,33 +87,188 @@ function Modal({ title, description, onClose, children }: { title: string; descr
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><div className="modal" role="dialog" aria-modal="true"><div className="modal-head"><div><h2>{title}</h2>{description && <p>{description}</p>}</div><Button variant="ghost" onClick={onClose} aria-label="关闭"><Icon name="close" /></Button></div>{children}</div></div>
 }
 
+type LoginResult = Profile & {
+  token?: string
+  error?: string
+  requires_2fa?: boolean
+  two_factor_token?: string
+}
+
+type AuthLanguage = 'zh' | 'en'
+
+const authCopy = {
+  zh: {
+    setupTitle: '注册妙妙屋', loginTitle: '登录妙妙屋', setupLead: '首次安装 · 创建唯一的初始管理员账号', loginLead: '欢迎回来，请登录管理面板',
+    username: '用户名', usernameHint: '3–20 位字母、数字或短横线', usernamePlaceholder: '请输入用户名', usernameError: '用户名须为 3–20 位字母、数字或短横线，不能包含下划线',
+    nickname: '昵称', nicknamePlaceholder: '可选，默认与用户名相同', email: '邮箱', emailPlaceholder: '可选，用于账号识别', emailError: '请输入有效的邮箱地址',
+    password: '密码', passwordPlaceholder: '请输入密码', confirmPassword: '确认密码', confirmPlaceholder: '请再次输入密码', passwordShort: '密码至少需要 8 个字符', passwordLong: '密码不能超过 72 字节', passwordMismatch: '两次输入的密码不一致',
+    remember: '记住我', create: '创建管理员并登录', login: '登录', checking: '正在检查安装状态…', creating: '正在创建管理员…', signingIn: '正在登录…', retry: '重新检查', statusFailed: '无法确认安装状态', statusFailedLead: '为避免误把首次安装显示成普通登录，页面已停止继续。请检查主控连接后重试。',
+    security: '该入口仅在数据库没有用户时开放；创建成功后会永久关闭。', openEdition: 'OPEN EDITION · 无限制', weak: '较弱', fair: '一般', good: '良好', strong: '强',
+    twoFactorTitle: '两步验证', twoFactorLead: '请输入认证器生成的 6 位验证码', code: '验证码', codePlaceholder: '000000', recovery: '使用恢复码', authenticator: '使用验证码', recoveryPlaceholder: '请输入恢复码', verify: '验证并登录', back: '返回账号登录', operationFailed: '操作失败', loginFailed: '登录失败',
+  },
+  en: {
+    setupTitle: 'Create MMWX admin', loginTitle: 'Sign in to MMWX', setupLead: 'First install · create the initial administrator', loginLead: 'Welcome back. Sign in to the control panel.',
+    username: 'Username', usernameHint: '3–20 letters, numbers, or hyphens', usernamePlaceholder: 'Enter username', usernameError: 'Use 3–20 letters, numbers, or hyphens; underscores are not allowed',
+    nickname: 'Display name', nicknamePlaceholder: 'Optional; defaults to username', email: 'Email', emailPlaceholder: 'Optional account email', emailError: 'Enter a valid email address',
+    password: 'Password', passwordPlaceholder: 'Enter password', confirmPassword: 'Confirm password', confirmPlaceholder: 'Enter password again', passwordShort: 'Use at least 8 characters', passwordLong: 'Password cannot exceed 72 bytes', passwordMismatch: 'Passwords do not match',
+    remember: 'Remember me', create: 'Create admin and sign in', login: 'Sign in', checking: 'Checking installation…', creating: 'Creating administrator…', signingIn: 'Signing in…', retry: 'Check again', statusFailed: 'Installation status unavailable', statusFailedLead: 'The page stopped instead of guessing that this is a normal login. Check the controller connection and try again.',
+    security: 'This form is available only while the database has no users. It closes permanently after setup.', openEdition: 'OPEN EDITION · UNLIMITED', weak: 'Weak', fair: 'Fair', good: 'Good', strong: 'Strong',
+    twoFactorTitle: 'Two-factor authentication', twoFactorLead: 'Enter the 6-digit code from your authenticator', code: 'Verification code', codePlaceholder: '000000', recovery: 'Use a recovery code', authenticator: 'Use authenticator code', recoveryPlaceholder: 'Enter recovery code', verify: 'Verify and sign in', back: 'Back to account sign-in', operationFailed: 'Operation failed', loginFailed: 'Sign-in failed',
+  },
+} as const
+
+const setupUsernamePattern = /^[a-zA-Z0-9-]{3,20}$/
+const setupEmailPattern = /^[^\s@]+@[^\s@]+$/
+const passwordByteLength = (value: string) => new TextEncoder().encode(value).length
+
 function AuthPage({ onAuthenticated }: { onAuthenticated: (profile?: Profile) => void }) {
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null)
+  const [statusError, setStatusError] = useState('')
+  const [language, setLanguage] = useState<AuthLanguage>(() => localStorage.getItem('mmwx_auth_language') === 'en' ? 'en' : 'zh')
   const [username, setUsername] = useState('')
   const [nickname, setNickname] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [remember, setRemember] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [phase, setPhase] = useState<'idle' | 'creating' | 'signing-in'>('idle')
+  const [attempted, setAttempted] = useState(false)
   const [error, setError] = useState('')
+  const [twoFactorToken, setTwoFactorToken] = useState('')
+  const [twoFactorCode, setTwoFactorCode] = useState('')
+  const [useRecoveryCode, setUseRecoveryCode] = useState(false)
+  const t = authCopy[language]
 
-  useEffect(() => { publicApi<{ needs_setup: boolean }>('/api/setup/status').then((data) => setNeedsSetup(data.needs_setup)).catch(() => setNeedsSetup(false)) }, [])
-
-  const submit = async (event: FormEvent) => {
-    event.preventDefault(); setBusy(true); setError('')
+  const loadSetupStatus = useCallback(async () => {
+    setNeedsSetup(null)
+    setStatusError('')
     try {
-      if (needsSetup) {
-        await publicApi('/api/setup/init', { method: 'POST', body: JSON.stringify({ username, password, nickname: nickname || username, email }) })
-      }
-      const result = await publicApi<{ token?: string; error?: string; username?: string; nickname?: string; role?: string; is_admin?: boolean }>('/api/login', { method: 'POST', body: JSON.stringify({ username, password, remember_me: remember }) })
-      if (!result.token) throw new Error(result.error ?? '登录失败')
-      saveToken(result.token, remember)
-      onAuthenticated(result)
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '操作失败') } finally { setBusy(false) }
+      const data = await publicApi<{ needs_setup: boolean }>('/api/setup/status')
+      setNeedsSetup(Boolean(data.needs_setup))
+    } catch (reason) {
+      setStatusError(reason instanceof Error ? reason.message : t.statusFailed)
+    }
+  }, [t.statusFailed])
+
+  useEffect(() => { void loadSetupStatus() }, [loadSetupStatus])
+
+  const selectLanguage = (next: AuthLanguage) => {
+    setLanguage(next)
+    localStorage.setItem('mmwx_auth_language', next)
+  }
+  const usernameError = needsSetup && (attempted || username !== '') && !setupUsernamePattern.test(username.trim()) ? t.usernameError : ''
+  const emailError = needsSetup && email !== '' && !setupEmailPattern.test(email.trim()) ? t.emailError : ''
+  const passwordLengthError = needsSetup && (attempted || password !== '')
+    ? (password.trim() === '' || [...password].length < 8 ? t.passwordShort : passwordByteLength(password) > 72 ? t.passwordLong : '')
+    : ''
+  const confirmationError = needsSetup && (attempted || confirmPassword !== '') && (confirmPassword === '' || password !== confirmPassword) ? t.passwordMismatch : ''
+  const passwordScore = Math.min(4,
+    Number([...password].length >= 8) + Number([...password].length >= 12) + Number(/[A-Za-z]/.test(password) && /\d/.test(password)) + Number(/[^A-Za-z0-9]/.test(password)))
+  const strengthLabels = [t.weak, t.weak, t.fair, t.good, t.strong]
+
+  const completeLogin = (result: LoginResult) => {
+    if (!result.token) throw new Error(result.error ?? t.loginFailed)
+    saveToken(result.token, remember)
+    onAuthenticated(result)
   }
 
-  if (needsSetup === null) return <Spinner full />
-  return <main className="auth-shell"><button className="language">文 <span>简体中文</span><Icon name="chevron" size={14}/></button><form className="auth-card" onSubmit={submit}><div className="auth-title"><Logo/><h1>{needsSetup ? '初始化妙妙屋 X' : '登录妙妙屋 X'}</h1><p>{needsSetup ? '创建首位管理员后即可开始使用' : '欢迎回来，请登录管理面板'}</p></div><label><span>用户名</span><input required autoFocus autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="请输入用户名" /></label>{needsSetup && <div className="field-row"><label><span>昵称</span><input value={nickname} onChange={(e) => setNickname(e.target.value)} placeholder="可选" /></label><label><span>邮箱</span><input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="可选" /></label></div>}<label><span>密码</span><input required minLength={needsSetup ? 8 : undefined} type="password" autoComplete={needsSetup ? 'new-password' : 'current-password'} value={password} onChange={(e) => setPassword(e.target.value)} placeholder="请输入密码" /></label>{!needsSetup && <label className="remember"><input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /><span>记住登录状态</span></label>}{error && <Notice error>{error}</Notice>}<Button type="submit" disabled={busy}>{busy ? '请稍候…' : needsSetup ? '完成初始化' : '登录'}</Button></form><footer>MMWX · OPEN CONTROL PANEL</footer></main>
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    setAttempted(true)
+    setError('')
+
+    if (twoFactorToken) {
+      const code = twoFactorCode.trim()
+      if ((!useRecoveryCode && !/^\d{6}$/.test(code)) || (useRecoveryCode && code === '')) return
+      setBusy(true)
+      setPhase('signing-in')
+      try {
+        const result = await publicApi<LoginResult>(useRecoveryCode ? '/api/login/recovery' : '/api/login/2fa', {
+          method: 'POST',
+          body: JSON.stringify(useRecoveryCode ? { two_factor_token: twoFactorToken, recovery_code: code } : { two_factor_token: twoFactorToken, code }),
+        })
+        completeLogin(result)
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : t.operationFailed)
+      } finally {
+        setBusy(false)
+        setPhase('idle')
+      }
+      return
+    }
+
+    if (!username.trim() || !password) return
+    if (needsSetup && (!setupUsernamePattern.test(username.trim()) || password.trim() === '' || [...password].length < 8 || passwordByteLength(password) > 72 || password !== confirmPassword || Boolean(emailError))) return
+
+    setBusy(true)
+    try {
+      if (needsSetup) {
+        setPhase('creating')
+        await publicApi('/api/setup/init', {
+          method: 'POST',
+          body: JSON.stringify({ username: username.trim(), password, nickname: nickname.trim() || username.trim(), email: email.trim() }),
+        })
+      }
+      setPhase('signing-in')
+      const result = await publicApi<LoginResult>('/api/login', {
+        method: 'POST',
+        body: JSON.stringify({ username: username.trim(), password, remember_me: remember }),
+      })
+      if (result.requires_2fa && result.two_factor_token) {
+        setTwoFactorToken(result.two_factor_token)
+        setTwoFactorCode('')
+        setAttempted(false)
+        return
+      }
+      completeLogin(result)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : t.operationFailed)
+    } finally {
+      setBusy(false)
+      setPhase('idle')
+    }
+  }
+
+  const languageControl = <div className="language" role="group" aria-label="Language"><span>文</span><button type="button" className={language === 'zh' ? 'active' : ''} onClick={() => selectLanguage('zh')}>中文</button><button type="button" className={language === 'en' ? 'active' : ''} onClick={() => selectLanguage('en')}>English</button></div>
+
+  if (needsSetup === null) {
+    if (statusError) return <main className="auth-shell">{languageControl}<section className="auth-card auth-state"><Logo/><h1>{t.statusFailed}</h1><p>{t.statusFailedLead}</p><Notice error>{statusError}</Notice><Button type="button" onClick={() => void loadSetupStatus()}>{t.retry}</Button></section><footer>MMWX · OPEN CONTROL PANEL</footer></main>
+    return <main className="auth-shell">{languageControl}<div className="auth-checking"><Logo/><span>{t.checking}</span></div><footer>MMWX · OPEN CONTROL PANEL</footer></main>
+  }
+
+  const title = twoFactorToken ? t.twoFactorTitle : needsSetup ? t.setupTitle : t.loginTitle
+  const lead = twoFactorToken ? t.twoFactorLead : needsSetup ? t.setupLead : t.loginLead
+  const busyText = phase === 'creating' ? t.creating : t.signingIn
+  const showTitleX = language === 'zh' && !twoFactorToken
+  return <main className="auth-shell">
+    {languageControl}
+    <form className={`auth-card ${needsSetup ? 'setup-card' : ''}`} onSubmit={submit}>
+      <div className="auth-title">
+        <div className="auth-heading"><Logo/><h1>{title}{showTitleX && <em>X</em>}</h1></div>
+        <div className="auth-edition">◆ {t.openEdition}</div>
+        <p>{lead}</p>
+      </div>
+
+      {twoFactorToken ? <>
+        <label><span>{useRecoveryCode ? t.recovery : t.code}</span><input required autoFocus inputMode={useRecoveryCode ? 'text' : 'numeric'} autoComplete="one-time-code" maxLength={useRecoveryCode ? 64 : 6} value={twoFactorCode} onChange={(event) => setTwoFactorCode(useRecoveryCode ? event.target.value : event.target.value.replace(/\D/g, ''))} placeholder={useRecoveryCode ? t.recoveryPlaceholder : t.codePlaceholder} aria-invalid={attempted && ((!useRecoveryCode && !/^\d{6}$/.test(twoFactorCode)) || (useRecoveryCode && !twoFactorCode.trim()))} /></label>
+        <button type="button" className="auth-link" onClick={() => { setUseRecoveryCode(!useRecoveryCode); setTwoFactorCode(''); setAttempted(false); setError('') }}>{useRecoveryCode ? t.authenticator : t.recovery}</button>
+      </> : <>
+        <label><span>{t.username}</span>{needsSetup && <small>{t.usernameHint}</small>}<input required autoFocus autoComplete="username" minLength={needsSetup ? 3 : undefined} maxLength={needsSetup ? 20 : undefined} value={username} onChange={(event) => setUsername(event.target.value)} placeholder={t.usernamePlaceholder} aria-invalid={Boolean((attempted || username) && needsSetup && (!username.trim() || usernameError))} />{(attempted || username) && usernameError && <small className="field-error">{usernameError}</small>}</label>
+        {needsSetup && <div className="field-row"><label><span>{t.nickname}</span><input maxLength={80} autoComplete="nickname" value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder={t.nicknamePlaceholder} /></label><label><span>{t.email}</span><input type="email" maxLength={254} autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder={t.emailPlaceholder} aria-invalid={Boolean((attempted || email) && emailError)} />{(attempted || email) && emailError && <small className="field-error">{emailError}</small>}</label></div>}
+        <label><span>{t.password}</span><div className="password-input"><input required type={showPassword ? 'text' : 'password'} autoComplete={needsSetup ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={t.passwordPlaceholder} aria-invalid={Boolean(needsSetup && (attempted || password) && (!password || passwordLengthError))} /><button type="button" onClick={() => setShowPassword(!showPassword)} aria-label={showPassword ? 'Hide password' : 'Show password'}>{showPassword ? '◉' : '◎'}</button></div>{(attempted || password) && passwordLengthError && <small className="field-error">{passwordLengthError}</small>}{needsSetup && password && !passwordLengthError && <div className="password-strength" data-score={passwordScore}><span>{[1, 2, 3, 4].map((value) => <i key={value} className={passwordScore >= value ? 'active' : ''} />)}</span><small>{strengthLabels[passwordScore]}</small></div>}</label>
+        {needsSetup && <label><span>{t.confirmPassword}</span><div className="password-input"><input required type={showPassword ? 'text' : 'password'} autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder={t.confirmPlaceholder} aria-invalid={Boolean((attempted || confirmPassword) && (!confirmPassword || confirmationError))} /></div>{(attempted || confirmPassword) && confirmationError && <small className="field-error">{confirmationError}</small>}</label>}
+        {!needsSetup && <label className="remember"><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} /><span>{t.remember}</span></label>}
+        {needsSetup && <div className="setup-security"><Icon name="shield" size={15}/><span>{t.security}</span></div>}
+      </>}
+
+      {error && <Notice error>{error}</Notice>}
+      <Button type="submit" disabled={busy}>{busy ? busyText : twoFactorToken ? t.verify : needsSetup ? t.create : t.login}</Button>
+      {twoFactorToken && <button type="button" className="auth-link centered" onClick={() => { setTwoFactorToken(''); setTwoFactorCode(''); setUseRecoveryCode(false); setAttempted(false); setError('') }}>{t.back}</button>}
+    </form>
+    <footer>MMWX · OPEN CONTROL PANEL</footer>
+  </main>
 }
 
 function App() {

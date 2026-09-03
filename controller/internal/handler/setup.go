@@ -8,11 +8,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/mail"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -44,6 +47,44 @@ type setupResponse struct {
 	Restarting  bool   `json:"restarting,omitempty"`
 }
 
+const (
+	setupRequestMaxBytes  = 64 << 10
+	setupPasswordMinRunes = 8
+	setupPasswordMaxBytes = 72 // bcrypt only considers at most 72 bytes.
+	setupNicknameMaxRunes = 80
+	setupEmailMaxBytes    = 254
+)
+
+func validateSetupPassword(password string) error {
+	if strings.TrimSpace(password) == "" {
+		return errors.New("密码不能为空")
+	}
+	if utf8.RuneCountInString(password) < setupPasswordMinRunes {
+		return fmt.Errorf("密码至少需要 %d 个字符", setupPasswordMinRunes)
+	}
+	if len([]byte(password)) > setupPasswordMaxBytes {
+		return fmt.Errorf("密码不能超过 %d 字节", setupPasswordMaxBytes)
+	}
+	return nil
+}
+
+func validateSetupProfile(nickname, email string) error {
+	if utf8.RuneCountInString(nickname) > setupNicknameMaxRunes {
+		return fmt.Errorf("昵称不能超过 %d 个字符", setupNicknameMaxRunes)
+	}
+	if email == "" {
+		return nil
+	}
+	if len([]byte(email)) > setupEmailMaxBytes {
+		return errors.New("邮箱地址过长")
+	}
+	address, err := mail.ParseAddress(email)
+	if err != nil || !strings.EqualFold(address.Address, email) {
+		return errors.New("邮箱格式不正确")
+	}
+	return nil
+}
+
 // 返回一个处理程序，用于检查是否需要初始设置
 func NewSetupStatusHandler(repo *storage.TrafficRepository) http.Handler {
 	if repo == nil {
@@ -51,6 +92,7 @@ func NewSetupStatusHandler(repo *storage.TrafficRepository) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		logger.Info("[初始化检查] 收到初始化状态检查请求",
 			"method", r.Method,
 			"remote_addr", r.RemoteAddr,
@@ -99,7 +141,12 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 		panic("initial setup handler requires repository")
 	}
 
+	// The setup endpoint is public by necessity. Serialize attempts so two
+	// simultaneous first-run requests cannot create two administrator accounts.
+	var setupMu sync.Mutex
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		logger.Info("[初始化] 收到初始化请求",
 			"method", r.Method,
 			"remote_addr", r.RemoteAddr,
@@ -109,6 +156,9 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 			writeError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
 			return
 		}
+
+		setupMu.Lock()
+		defer setupMu.Unlock()
 
 		// 检查是否还需要设置
 		users, err := repo.ListUsers(r.Context(), 1)
@@ -127,6 +177,7 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, setupRequestMaxBytes)
 		var payload setupRequest
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			logger.Error("[初始化] 解析请求体失败", "error", err)
@@ -135,7 +186,9 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 		}
 
 		username := strings.TrimSpace(payload.Username)
-		password := strings.TrimSpace(payload.Password)
+		// Passwords are intentionally not trimmed: silently changing a password
+		// here makes the immediately following login fail for otherwise valid input.
+		password := payload.Password
 		nickname := strings.TrimSpace(payload.Nickname)
 		email := strings.TrimSpace(payload.Email)
 		avatarURL := strings.TrimSpace(payload.AvatarURL)
@@ -155,8 +208,12 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 			return
 		}
 
-		if password == "" {
-			writeError(w, http.StatusBadRequest, errors.New("密码不能为空"))
+		if err := validateSetupPassword(password); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := validateSetupProfile(nickname, email); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 
@@ -220,6 +277,9 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 		_ = setupRepo.UpdateUserRole(r.Context(), username, storage.RoleAdmin)
 		_ = setupRepo.UpdateUserStatus(r.Context(), username, true)
 		if err := setupRepo.SetPrimaryAdminUsername(r.Context(), username); err != nil {
+			// Do not leave a half-initialized database that permanently hides the
+			// setup page but has no recorded owner.
+			_ = setupRepo.DeleteUser(r.Context(), username)
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("保存主控所有者失败: %w", err))
 			return
 		}
