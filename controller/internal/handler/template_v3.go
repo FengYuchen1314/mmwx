@@ -1,0 +1,996 @@
+package handler
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
+	"miaomiaowux/internal/auth"
+	"miaomiaowux/internal/logger"
+	"miaomiaowux/internal/storage"
+
+	"gopkg.in/yaml.v3"
+)
+
+// TemplateV3Handler handles v3 template operations
+type TemplateV3Handler struct {
+	repo *storage.TrafficRepository
+}
+
+// NewTemplateV3Handler creates a new v3 template handler
+func NewTemplateV3Handler(repo *storage.TrafficRepository) *TemplateV3Handler {
+	return &TemplateV3Handler{repo: repo}
+}
+
+// ServeHTTP handles HTTP requests for v3 template operations
+func (h *TemplateV3Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/admin/template-v3")
+
+	switch {
+	case path == "" || path == "/":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleListTemplates(w, r)
+	case path == "/process" || path == "/process/":
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleProcessTemplate(w, r)
+	case path == "/preview" || path == "/preview/":
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handlePreviewTemplate(w, r)
+	case path == "/preview-with-tags" || path == "/preview-with-tags/":
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handlePreviewWithTags(w, r)
+	case path == "/convert-v2" || path == "/convert-v2/":
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleConvertV2Template(w, r)
+	case path == "/analyze-subscription" || path == "/analyze-subscription/":
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleAnalyzeSubscription(w, r)
+	case path == "/region-filters" || path == "/region-filters/":
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h.handleGetRegionFilters(w, r)
+	default:
+		http.Error(w, "Not found", http.StatusNotFound)
+	}
+}
+
+// processTemplateRequest represents the request body for processing a v3 template
+type processTemplateRequest struct {
+	TemplateName string           `json:"template_name"` // Name of template file in rule_templates/
+	Proxies      []map[string]any `json:"proxies"`       // List of proxy nodes to inject
+}
+
+// previewTemplateRequest represents the request body for previewing a v3 template
+type previewTemplateRequest struct {
+	TemplateContent string           `json:"template_content"` // Raw template content
+	Proxies         []map[string]any `json:"proxies"`          // List of proxy nodes to inject
+}
+
+// handleProcessTemplate processes a v3 template file with provided proxies
+func (h *TemplateV3Handler) handleProcessTemplate(w http.ResponseWriter, r *http.Request) {
+	var req processTemplateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "无效的请求格式")
+		return
+	}
+
+	templateName := strings.TrimSpace(req.TemplateName)
+	if templateName == "" {
+		writeJSONError(w, http.StatusBadRequest, "模板名称不能为空")
+		return
+	}
+
+	// Security: Prevent directory traversal
+	if strings.Contains(templateName, "..") || strings.Contains(templateName, "/") || strings.Contains(templateName, "\\") {
+		writeJSONError(w, http.StatusBadRequest, "无效的模板名称")
+		return
+	}
+	username := auth.UsernameFromContext(r.Context())
+	if !canUserViewRuleTemplate(r.Context(), h.repo, username, templateName) {
+		writeJSONError(w, http.StatusForbidden, "无权使用该模板")
+		return
+	}
+
+	// Read template file
+	templatesDir := "rule_templates"
+	templatePath := filepath.Join(templatesDir, templateName)
+
+	content, err := os.ReadFile(templatePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, "模板文件不存在")
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, "读取模板文件失败")
+		}
+		return
+	}
+
+	// Process the template
+	result, err := h.processV3Template(string(content), req.Proxies)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "处理模板失败: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"content": result,
+	})
+}
+
+// handlePreviewTemplate previews a v3 template with provided content and proxies
+func (h *TemplateV3Handler) handlePreviewTemplate(w http.ResponseWriter, r *http.Request) {
+	var req previewTemplateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "无效的请求格式")
+		return
+	}
+
+	if strings.TrimSpace(req.TemplateContent) == "" {
+		writeJSONError(w, http.StatusBadRequest, "模板内容不能为空")
+		return
+	}
+
+	// Process the template
+	result, err := h.processV3Template(req.TemplateContent, req.Proxies)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "处理模板失败: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"content": result,
+	})
+}
+
+// handlePreviewWithTags previews a v3 template with template filename and selected tags
+func (h *TemplateV3Handler) handlePreviewWithTags(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TemplateFilename string   `json:"template_filename"`
+		SelectedTags     []string `json:"selected_tags"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "无效的请求格式")
+		return
+	}
+
+	if req.TemplateFilename == "" {
+		writeJSONError(w, http.StatusBadRequest, "模板文件名不能为空")
+		return
+	}
+
+	// Security: Prevent directory traversal
+	if strings.Contains(req.TemplateFilename, "..") || strings.Contains(req.TemplateFilename, "/") || strings.Contains(req.TemplateFilename, "\\") {
+		writeJSONError(w, http.StatusBadRequest, "无效的模板文件名")
+		return
+	}
+	username := auth.UsernameFromContext(r.Context())
+	if !canUserViewRuleTemplate(r.Context(), h.repo, username, req.TemplateFilename) {
+		writeJSONError(w, http.StatusForbidden, "无权使用该模板")
+		return
+	}
+
+	// Read template file
+	templatesDir := "rule_templates"
+	templatePath := filepath.Join(templatesDir, req.TemplateFilename)
+
+	templateContent, err := os.ReadFile(templatePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, "模板文件不存在")
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, "读取模板文件失败")
+		}
+		return
+	}
+
+	// Get nodes from database
+	nodes, err := h.repo.ListNodes(r.Context(), username)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "获取节点列表失败")
+		return
+	}
+
+	// 按用户配置的节点顺序排序
+	if settings, err := h.repo.GetUserSettings(r.Context(), username); err == nil && len(settings.NodeOrder) > 0 {
+		sortNodesByNodeOrder(nodes, settings.NodeOrder)
+	}
+
+	// 构建节点 ID -> 名称 / 节点映射(链式、中转组都按 ID 解析当前名)
+	nodeIDToName := make(map[int64]string, len(nodes))
+	nodeByID := make(map[int64]storage.Node, len(nodes))
+	for _, node := range nodes {
+		nodeIDToName[node.ID] = node.NodeName
+		nodeByID[node.ID] = node
+	}
+
+	selectedTagsSet := make(map[string]bool)
+	for _, tag := range req.SelectedTags {
+		selectedTagsSet[tag] = true
+	}
+
+	// buildPreviewProxy:预览路径(admin 直接用节点 ClashConfig,无套餐凭据/routed 逻辑)。
+	// name 取当前 NodeName;链式/中转组 dialer-proxy 按 ID 取当前名。
+	buildPreviewProxy := func(node storage.Node) (map[string]any, bool) {
+		var proxyConfig map[string]any
+		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
+			return nil, false
+		}
+		proxyConfig["name"] = node.NodeName
+		if node.ChainProxyNodeID != nil {
+			if targetName, ok := nodeIDToName[*node.ChainProxyNodeID]; ok {
+				proxyConfig["dialer-proxy"] = targetName
+			}
+		}
+		if len(node.RelayGroupNodeIDs) > 0 && node.RelayGroupName != "" {
+			proxyConfig["dialer-proxy"] = node.RelayGroupName
+		}
+		return proxyConfig, true
+	}
+
+	// Filter nodes by selected tags and enabled status
+	var proxies []map[string]any
+	inRootProxies := make(map[string]bool)
+	for _, node := range nodes {
+		if !node.Enabled {
+			continue
+		}
+		if len(req.SelectedTags) > 0 && !node.HasAnyTag(selectedTagsSet) {
+			continue
+		}
+		proxyConfig, ok := buildPreviewProxy(node)
+		if !ok {
+			continue
+		}
+		proxies = append(proxies, proxyConfig)
+		inRootProxies[node.NodeName] = true
+	}
+
+	// 中转组:生成 url-test 组(成员按 ID 取当前名);补全被过滤但被组引用的成员。
+	relayGroupMap := make(map[string]map[string]any)
+	var relayGroupOrder []string
+	var extraProxies []map[string]any
+	for _, node := range nodes {
+		if !node.Enabled || len(node.RelayGroupNodeIDs) == 0 || node.RelayGroupName == "" {
+			continue
+		}
+		if len(req.SelectedTags) > 0 && !node.HasAnyTag(selectedTagsSet) {
+			continue
+		}
+		if _, exists := relayGroupMap[node.RelayGroupName]; exists {
+			continue
+		}
+		var groupProxies []string
+		for _, rid := range node.RelayGroupNodeIDs {
+			member, ok := nodeByID[rid]
+			if !ok || !member.Enabled {
+				continue
+			}
+			groupProxies = append(groupProxies, member.NodeName)
+			if !inRootProxies[member.NodeName] {
+				if pc, ok := buildPreviewProxy(member); ok {
+					extraProxies = append(extraProxies, pc)
+					inRootProxies[member.NodeName] = true
+				}
+			}
+		}
+		if len(groupProxies) > 0 {
+			relayGroupMap[node.RelayGroupName] = map[string]any{
+				"name": node.RelayGroupName, "type": "url-test", "proxies": groupProxies,
+				"url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50,
+			}
+			relayGroupOrder = append(relayGroupOrder, node.RelayGroupName)
+		}
+	}
+	var relayGroups []map[string]any
+	for _, groupName := range relayGroupOrder {
+		relayGroups = append(relayGroups, relayGroupMap[groupName])
+	}
+	proxies = append(proxies, extraProxies...)
+
+	if len(proxies) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "没有符合条件的节点")
+		return
+	}
+
+	// Process the template
+	result, err := h.processV3Template(string(templateContent), proxies)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "处理模板失败: "+err.Error())
+		return
+	}
+	if len(relayGroups) > 0 {
+		if rg, rgErr := injectRelayGroupsIntoTemplate(result, relayGroups); rgErr == nil {
+			result = rg
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"content": result,
+	})
+}
+
+// processV3Template processes a v3 template with the given proxies.
+// Surge 模板(内容含 [Proxy Group]/[General] 段头)走 Surge 注入,其余按 Clash YAML 处理。
+func (h *TemplateV3Handler) processV3Template(templateContent string, proxies []map[string]any) (string, error) {
+	if looksLikeSurgeTemplate(templateContent) {
+		return injectProxiesIntoSurgeTemplate(templateContent, proxies)
+	}
+
+	// Create processor with empty providers (v3 doesn't use external providers)
+	processor := substore.NewTemplateV3Processor(nil, nil)
+
+	// Process the template
+	result, err := processor.ProcessTemplate(templateContent, proxies)
+	if err != nil {
+		return "", err
+	}
+
+	// Inject proxies into the result
+	result, err = injectProxiesIntoTemplate(result, proxies)
+	if err != nil {
+		return "", err
+	}
+	result, err = restoreTemplateProxyGroupOrder(templateContent, result)
+	if err != nil {
+		return "", err
+	}
+
+	return result, nil
+}
+
+// restoreTemplateProxyGroupOrder treats the bound template's proxy-groups
+// sequence as authoritative. Processing may expand or remove groups and later
+// stages may append generated groups, but existing template groups must never
+// be reordered. Generated groups retain their relative order at the end.
+func restoreTemplateProxyGroupOrder(templateContent, generatedContent string) (string, error) {
+	var templateDoc, generatedDoc yaml.Node
+	if err := yaml.Unmarshal([]byte(templateContent), &templateDoc); err != nil {
+		return generatedContent, err
+	}
+	if err := yaml.Unmarshal([]byte(generatedContent), &generatedDoc); err != nil {
+		return generatedContent, err
+	}
+	templateGroups := findYAMLSequence(&templateDoc, "proxy-groups")
+	generatedGroups := findYAMLSequence(&generatedDoc, "proxy-groups")
+	if templateGroups == nil || generatedGroups == nil || len(generatedGroups.Content) < 2 {
+		return generatedContent, nil
+	}
+
+	desiredNames := make([]string, 0, len(templateGroups.Content))
+	for _, group := range templateGroups.Content {
+		if name := yamlMappingString(group, "name"); name != "" {
+			desiredNames = append(desiredNames, name)
+		}
+	}
+	used := make([]bool, len(generatedGroups.Content))
+	reordered := make([]*yaml.Node, 0, len(generatedGroups.Content))
+	for _, name := range desiredNames {
+		for index, group := range generatedGroups.Content {
+			if !used[index] && yamlMappingString(group, "name") == name {
+				used[index] = true
+				reordered = append(reordered, group)
+				break
+			}
+		}
+	}
+	for index, group := range generatedGroups.Content {
+		if !used[index] {
+			reordered = append(reordered, group)
+		}
+	}
+	generatedGroups.Content = reordered
+	out, err := MarshalYAMLWithIndent(&generatedDoc)
+	if err != nil {
+		return generatedContent, err
+	}
+	return RemoveUnicodeEscapeQuotes(string(out)), nil
+}
+
+func findYAMLSequence(doc *yaml.Node, key string) *yaml.Node {
+	if doc == nil || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	root := doc.Content[0]
+	for index := 0; index+1 < len(root.Content); index += 2 {
+		if root.Content[index].Value == key && root.Content[index+1].Kind == yaml.SequenceNode {
+			return root.Content[index+1]
+		}
+	}
+	return nil
+}
+
+func yamlMappingString(node *yaml.Node, key string) string {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return ""
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		if node.Content[index].Value == key {
+			return node.Content[index+1].Value
+		}
+	}
+	return ""
+}
+
+// looksLikeSurgeTemplate 通过 Surge 特有的段头判断内容是否为 Surge 配置(预览按内容判断时用)。
+func looksLikeSurgeTemplate(content string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.EqualFold(trimmed, "[General]"),
+			strings.EqualFold(trimmed, "[Proxy Group]"),
+			strings.EqualFold(trimmed, "[Proxy]"),
+			strings.EqualFold(trimmed, "[Rule]"):
+			return true
+		}
+	}
+	return false
+}
+
+// injectProxiesIntoTemplate injects proxy nodes into the template's proxies section
+func injectProxiesIntoTemplate(templateContent string, proxies []map[string]any) (string, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(templateContent), &root); err != nil {
+		return "", err
+	}
+
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return templateContent, nil
+	}
+
+	rootMap := root.Content[0]
+	if rootMap.Kind != yaml.MappingNode {
+		return templateContent, nil
+	}
+
+	// Find proxies key and inject nodes
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		keyNode := rootMap.Content[i]
+		if keyNode.Value == "proxies" {
+			// Create new proxies sequence
+			proxiesNode := &yaml.Node{
+				Kind: yaml.SequenceNode,
+				Tag:  "!!seq",
+			}
+
+			// Add each proxy as a mapping node
+			for _, proxy := range proxies {
+				proxyNode := mapToYAMLNode(proxy)
+				proxiesNode.Content = append(proxiesNode.Content, proxyNode)
+			}
+
+			rootMap.Content[i+1] = proxiesNode
+			break
+		}
+	}
+
+	// Marshal back to YAML
+	var buf strings.Builder
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&root); err != nil {
+		return "", err
+	}
+	encoder.Close()
+
+	// Post-process to remove quotes from emoji strings and convert Unicode escapes
+	result := RemoveUnicodeEscapeQuotes(buf.String())
+	return result, nil
+}
+
+// injectRelayGroupsIntoTemplate 把中转组(url-test 代理组)追加进模板的 proxy-groups 数组。
+// 组的成员引用节点当前名(生成时按 ID 解析,改名无影响);必须在孤儿裁剪前调用。
+func injectRelayGroupsIntoTemplate(templateContent string, relayGroups []map[string]any) (string, error) {
+	if len(relayGroups) == 0 {
+		return templateContent, nil
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(templateContent), &root); err != nil {
+		return templateContent, err
+	}
+	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
+		return templateContent, nil
+	}
+	rootMap := root.Content[0]
+	if rootMap.Kind != yaml.MappingNode {
+		return templateContent, nil
+	}
+
+	for i := 0; i < len(rootMap.Content); i += 2 {
+		if rootMap.Content[i].Value == "proxy-groups" {
+			groupsNode := rootMap.Content[i+1]
+			if groupsNode.Kind == yaml.SequenceNode {
+				for _, rg := range relayGroups {
+					groupsNode.Content = append(groupsNode.Content, mapToYAMLNode(rg))
+				}
+			}
+			break
+		}
+	}
+
+	var buf strings.Builder
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&root); err != nil {
+		return templateContent, err
+	}
+	encoder.Close()
+	return RemoveUnicodeEscapeQuotes(buf.String()), nil
+}
+
+// mapToYAMLNode converts a map to a YAML mapping node
+func mapToYAMLNode(m map[string]any) *yaml.Node {
+	node := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Tag:  "!!map",
+	}
+
+	// Define preferred key order for proxy nodes
+	keyOrder := []string{"name", "type", "server", "port", "password", "uuid", "alterId", "cipher", "udp", "tls", "skip-cert-verify", "sni", "servername", "network", "ws-opts", "grpc-opts", "reality-opts", "flow", "client-fingerprint", "dialer-proxy"}
+
+	// Add keys in preferred order first
+	addedKeys := make(map[string]bool)
+	for _, key := range keyOrder {
+		if value, ok := m[key]; ok {
+			addKeyValueToNode(node, key, value)
+			addedKeys[key] = true
+		}
+	}
+
+	// Add remaining keys
+	for key, value := range m {
+		if !addedKeys[key] {
+			addKeyValueToNode(node, key, value)
+		}
+	}
+
+	return node
+}
+
+// addKeyValueToNode adds a key-value pair to a YAML mapping node
+func addKeyValueToNode(node *yaml.Node, key string, value any) {
+	keyNode := &yaml.Node{
+		Kind:  yaml.ScalarNode,
+		Tag:   "!!str",
+		Value: key,
+	}
+
+	valueNode := anyToYAMLNode(value)
+	node.Content = append(node.Content, keyNode, valueNode)
+}
+
+// anyToYAMLNode converts any value to a YAML node
+func anyToYAMLNode(v any) *yaml.Node {
+	switch val := v.(type) {
+	case string:
+		return &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: val,
+		}
+	case int:
+		return &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!int",
+			Value: intToString(val),
+		}
+	case int64:
+		return &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!int",
+			Value: int64ToString(val),
+		}
+	case float64:
+		// Check if it's actually an integer
+		if val == float64(int(val)) {
+			return &yaml.Node{
+				Kind:  yaml.ScalarNode,
+				Tag:   "!!int",
+				Value: intToString(int(val)),
+			}
+		}
+		return &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!float",
+			Value: floatToString(val),
+		}
+	case bool:
+		return &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!bool",
+			Value: boolToString(val),
+		}
+	case []any:
+		seqNode := &yaml.Node{
+			Kind: yaml.SequenceNode,
+			Tag:  "!!seq",
+		}
+		for _, item := range val {
+			seqNode.Content = append(seqNode.Content, anyToYAMLNode(item))
+		}
+		return seqNode
+	case []string:
+		// 中转组成员列表(groupProxies)是 []string;不处理会落到 default 变空字符串。
+		seqNode := &yaml.Node{
+			Kind: yaml.SequenceNode,
+			Tag:  "!!seq",
+		}
+		for _, item := range val {
+			seqNode.Content = append(seqNode.Content, anyToYAMLNode(item))
+		}
+		return seqNode
+	case map[string]any:
+		return mapToYAMLNode(val)
+	default:
+		// Fallback: convert to string
+		return &yaml.Node{
+			Kind:  yaml.ScalarNode,
+			Tag:   "!!str",
+			Value: "",
+		}
+	}
+}
+
+func intToString(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var result []byte
+	negative := n < 0
+	if negative {
+		n = -n
+	}
+	for n > 0 {
+		result = append([]byte{byte('0' + n%10)}, result...)
+		n /= 10
+	}
+	if negative {
+		result = append([]byte{'-'}, result...)
+	}
+	return string(result)
+}
+
+func int64ToString(n int64) string {
+	return intToString(int(n))
+}
+
+func floatToString(f float64) string {
+	// Simple float to string conversion
+	return strings.TrimRight(strings.TrimRight(
+		strings.Replace(string(rune(int(f))), "", "", -1),
+		"0"), ".")
+}
+
+func boolToString(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// convertV2Request represents the request body for converting a v2 template
+type convertV2Request struct {
+	Content string `json:"content"` // V2 template content (ACL4SSR format)
+}
+
+// handleConvertV2Template converts a v2 template to v3 format
+func (h *TemplateV3Handler) handleConvertV2Template(w http.ResponseWriter, r *http.Request) {
+	var req convertV2Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "无效的请求格式")
+		return
+	}
+
+	if strings.TrimSpace(req.Content) == "" {
+		writeJSONError(w, http.StatusBadRequest, "模板内容不能为空")
+		return
+	}
+
+	// Convert v2 to v3
+	result, err := substore.ConvertACLToV3(req.Content)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "转换失败: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"proxy_groups":   result.ProxyGroups,
+		"rules":          result.Rules,
+		"rule_providers": result.RuleProviders,
+	})
+}
+
+// analyzeSubscriptionRequest represents the request body for analyzing a subscription
+type analyzeSubscriptionRequest struct {
+	SubscriptionFilename string `json:"subscription_filename"` // Filename in subscribes/
+	SubscriptionContent  string `json:"subscription_content"`  // Or direct content
+}
+
+// handleAnalyzeSubscription analyzes a subscription and generates V3 template config
+func (h *TemplateV3Handler) handleAnalyzeSubscription(w http.ResponseWriter, r *http.Request) {
+	var req analyzeSubscriptionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "无效的请求格式")
+		return
+	}
+
+	var content string
+
+	// Get content from filename or direct content
+	if req.SubscriptionFilename != "" {
+		// Security: Prevent directory traversal
+		if strings.Contains(req.SubscriptionFilename, "..") || strings.Contains(req.SubscriptionFilename, "/") {
+			writeJSONError(w, http.StatusBadRequest, "无效的文件名")
+			return
+		}
+
+		filePath := filepath.Join("subscribes", req.SubscriptionFilename)
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeJSONError(w, http.StatusNotFound, "订阅文件不存在")
+			} else {
+				writeJSONError(w, http.StatusInternalServerError, "读取订阅文件失败")
+			}
+			return
+		}
+		content = string(data)
+	} else if req.SubscriptionContent != "" {
+		content = req.SubscriptionContent
+	} else {
+		writeJSONError(w, http.StatusBadRequest, "请提供订阅文件名或内容")
+		return
+	}
+
+	// Get all node names from database for better analysis
+	username := auth.UsernameFromContext(r.Context())
+	nodes, err := h.repo.ListNodes(r.Context(), username)
+	var allNodeNames []string
+	if err == nil {
+		for _, node := range nodes {
+			if node.Enabled {
+				allNodeNames = append(allNodeNames, node.NodeName)
+			}
+		}
+	}
+
+	// Analyze the subscription
+	result, err := substore.AnalyzeSubscription(content, allNodeNames)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "分析订阅失败: "+err.Error())
+		return
+	}
+
+	// Generate V3 template
+	templateContent := substore.GenerateV3TemplateFromAnalysis(result)
+	templateContent, err = appendRuleProvidersToTemplate(templateContent, result.RuleProviders)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "生成模板失败: "+err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"analysis":         result,
+		"template_content": templateContent,
+	})
+}
+
+// appendRuleProvidersToTemplate 补齐订阅分析器已识别、但模板生成器未输出的 rule-providers。
+// rules 中的 RULE-SET 依赖这些顶层定义，必须保留 provider 的全部原始字段。
+func appendRuleProvidersToTemplate(templateContent string, providers map[string]any) (string, error) {
+	if len(providers) == 0 {
+		return templateContent, nil
+	}
+
+	var generated map[string]any
+	if err := yaml.Unmarshal([]byte(templateContent), &generated); err != nil {
+		return "", fmt.Errorf("parse generated template: %w", err)
+	}
+	if _, exists := generated["rule-providers"]; exists {
+		return templateContent, nil
+	}
+
+	providerYAML, err := yaml.Marshal(map[string]any{"rule-providers": providers})
+	if err != nil {
+		return "", fmt.Errorf("marshal rule-providers: %w", err)
+	}
+	return strings.TrimRight(templateContent, "\n") + "\n\n" + string(providerYAML), nil
+}
+
+// handleGetRegionFilters returns the available region filters
+func (h *TemplateV3Handler) handleGetRegionFilters(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"region_filters":       substore.ExtendedRegionFilters,
+		"other_exclude_filter": substore.OtherRegionExcludeFilter,
+	})
+}
+
+// handleListTemplates 返回所有 V3 模板列表
+// 扫描 rule_templates 目录中以 _v3.yaml 结尾的文件
+func (h *TemplateV3Handler) handleListTemplates(w http.ResponseWriter, r *http.Request) {
+	templatesDir := "rule_templates"
+
+	entries, err := os.ReadDir(templatesDir)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "读取模板目录失败: "+err.Error())
+		return
+	}
+
+	type templateInfo struct {
+		Name      string            `json:"name"`                // 显示名称（去掉 _v3.yaml 后缀）
+		Filename  string            `json:"filename"`            // 完整文件名
+		Type      string            `json:"type"`                // "clash"(.yaml/.yml) 或 "surge"(.conf)
+		Variables map[string]string `json:"variables,omitempty"` // 模板自定义变量(仅 Clash)
+	}
+
+	var templates []templateInfo
+	username := auth.UsernameFromContext(r.Context())
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		isClash := strings.HasSuffix(name, ".yaml") || strings.HasSuffix(name, ".yml")
+		isSurge := strings.HasSuffix(name, ".conf")
+		if !isClash && !isSurge {
+			continue
+		}
+		if !canUserViewRuleTemplate(r.Context(), h.repo, username, name) {
+			continue
+		}
+
+		displayName := strings.TrimSuffix(name, ".yaml")
+		displayName = strings.TrimSuffix(displayName, ".yml")
+		displayName = strings.TrimSuffix(displayName, ".conf")
+		displayName = strings.TrimSuffix(displayName, "_v3")
+		displayName = strings.TrimSuffix(displayName, "__v3")
+		displayName = strings.TrimSuffix(displayName, "_surge")
+		displayName = strings.TrimSuffix(displayName, "__surge")
+		displayName = strings.ReplaceAll(displayName, "_", " ")
+
+		tmplType := "clash"
+		var variables map[string]string
+		if isSurge {
+			tmplType = "surge"
+		} else if content, err := os.ReadFile(filepath.Join(templatesDir, name)); err == nil {
+			// 仅 Clash 模板提取 YAML 自定义变量
+			variables = substore.ExtractTemplateVariables(string(content))
+		}
+
+		templates = append(templates, templateInfo{
+			Name:      displayName,
+			Filename:  name,
+			Type:      tmplType,
+			Variables: variables,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"templates": templates,
+	})
+}
+
+// isSurgeTemplateFile 判断模板文件是否为 Surge 格式(.conf 扩展名)。
+func isSurgeTemplateFile(filename string) bool {
+	return strings.HasSuffix(strings.ToLower(filename), ".conf")
+}
+
+// isSurgeClientType 判断订阅请求的 ?t= 客户端类型是否属于 Surge 系
+// (走 Surge 文本输出、可套用 Surge 默认模板)。
+func isSurgeClientType(clientType string) bool {
+	switch strings.ToLower(strings.TrimSpace(clientType)) {
+	case "surge", "surgemac", "clash-to-surge":
+		return true
+	}
+	return false
+}
+
+// injectProxiesIntoSurgeTemplate 把节点列表序列化为 Surge [Proxy] 段的节点行,
+// 注入到模板 [Proxy] 段中(替换段内已有的非注释行,保留注释与其它段落原样)。
+// 地区分组靠模板里的 policy-regex-filter + include-all-proxies=1 从这些节点里筛选,
+// 因此这里只负责把节点写进 [Proxy] 段,不处理策略组展开。
+func injectProxiesIntoSurgeTemplate(templateContent string, proxies []map[string]any) (string, error) {
+	surgeProxies := make([]substore.Proxy, 0, len(proxies))
+	for _, p := range proxies {
+		proxy := substore.Proxy(p)
+		normalizeSurgeProxyNumbers(proxy)
+		surgeProxies = append(surgeProxies, proxy)
+	}
+
+	producer := substore.NewSurgeProducer()
+	produced, err := producer.Produce(surgeProxies, "", &substore.ProduceOptions{})
+	if err != nil {
+		return "", err
+	}
+	proxyLines, ok := produced.(string)
+	if !ok {
+		return "", fmt.Errorf("unexpected surge producer result type: %T", produced)
+	}
+	proxyLines = strings.TrimRight(proxyLines, "\n")
+
+	// Produce 会静默丢弃 Surge 不支持的节点类型(内部对失败节点 continue)。
+	// 这里逐个 ProduceOne 探测一遍,把被过滤的节点名+类型打进日志,方便排查
+	// "为什么订阅里少了几个节点"。仅用于日志,实际输出仍以上面 Produce 结果为准。
+	var filtered []string
+	for _, p := range surgeProxies {
+		if _, perr := producer.ProduceOne(p, "", &substore.ProduceOptions{}); perr != nil {
+			name, _ := p["name"].(string)
+			typ, _ := p["type"].(string)
+			filtered = append(filtered, fmt.Sprintf("%s(%s)", name, typ))
+		}
+	}
+	if len(filtered) > 0 {
+		logger.Info("[Surge模板] 部分节点因类型不受 Surge 支持被过滤",
+			"filtered_count", len(filtered), "total", len(surgeProxies), "nodes", strings.Join(filtered, ", "))
+	}
+
+	lines := strings.Split(templateContent, "\n")
+	var out []string
+	inProxySection := false
+	injected := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// 段落头:[Xxx]
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inProxySection = strings.EqualFold(trimmed, "[Proxy]")
+			out = append(out, line)
+			if inProxySection {
+				// 进入 [Proxy] 段:先写入节点行,随后跳过段内原有的非注释内容
+				if proxyLines != "" {
+					out = append(out, proxyLines)
+				}
+				injected = true
+			}
+			continue
+		}
+		if inProxySection {
+			// 段内保留注释(占位说明),丢弃其它内容(避免残留占位节点)
+			if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+				out = append(out, line)
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+
+	// 模板里没有 [Proxy] 段:追加一个
+	if !injected {
+		out = append(out, "", "[Proxy]")
+		if proxyLines != "" {
+			out = append(out, proxyLines)
+		}
+	}
+
+	return strings.Join(out, "\n"), nil
+}

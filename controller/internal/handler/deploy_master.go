@@ -1,0 +1,391 @@
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"miaomiaowux/internal/storage"
+	"miaomiaowux/templates"
+)
+
+func localPanelBackend(masterURL string) string {
+	u := strings.TrimPrefix(masterURL, "https://")
+	u = strings.TrimPrefix(u, "http://")
+	if idx := strings.Index(u, ":"); idx != -1 {
+		if port := strings.Split(u[idx+1:], "/")[0]; port != "" {
+			return "http://127.0.0.1:" + port
+		}
+	}
+	return "http://127.0.0.1:12889"
+}
+
+func getDomainFromMasterURL(repo *storage.TrafficRepository, ctx context.Context) string {
+	masterURL, _ := repo.GetSystemSetting(ctx, "master_url")
+	if masterURL == "" {
+		return ""
+	}
+	masterURL = strings.TrimPrefix(masterURL, "https://")
+	masterURL = strings.TrimPrefix(masterURL, "http://")
+	host := strings.Split(masterURL, ":")[0]
+	return strings.TrimRight(host, "/")
+}
+
+func (h *CertificateHandler) findCertForDomain(ctx context.Context, domain string, serverID int64) (*storage.Certificate, error) {
+	cert, err := h.repo.FindDeployableCertByDomain(ctx, domain, serverID)
+	if err == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
+		return cert, nil
+	}
+	rootDomain := extractRootDomain(domain)
+	wildcardDomain := "*." + rootDomain
+	cert, err = h.repo.FindDeployableCertByDomain(ctx, wildcardDomain, serverID)
+	if err == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
+		return cert, nil
+	}
+	if rootDomain != domain {
+		cert, err = h.repo.FindDeployableCertByDomain(ctx, rootDomain, serverID)
+		if err == nil && cert != nil && cert.CertPEM != "" && cert.KeyPEM != "" {
+			return cert, nil
+		}
+	}
+	return nil, fmt.Errorf("未找到域名 %s 的有效证书", domain)
+}
+
+// GetMasterCertStatus 返回主控证书是否待部署
+func (h *CertificateHandler) GetMasterCertStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	pending, _ := h.repo.GetSystemSetting(ctx, "master_cert_pending")
+	masterURL, _ := h.repo.GetSystemSetting(ctx, "master_url")
+	domain := getDomainFromMasterURL(h.repo, ctx)
+
+	// HTTPS 是否已启用三取一:master_url 是 https:// / 请求经反代带 X-Forwarded-Proto=https /
+	// 用户手动勾了「外部已配 HTTPS」开关。后两者覆盖「用户自建反代、Go 后端仍以 http 对内服务」场景,
+	// 避免证书页一直误报「开启 HTTPS」。
+	externalHTTPS, _ := h.repo.GetSystemSetting(ctx, "external_https")
+	httpsEnabled := strings.HasPrefix(masterURL, "https://") ||
+		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") ||
+		externalHTTPS == "1"
+
+	// is_docker / panel_port:前端据此决定是否显示「宿主机 agent 反代主控」入口
+	// (仅 Docker 部署的主控需要——直装主控自己内置 nginx 开 HTTPS)。
+	panelPort := os.Getenv("PORT")
+	if panelPort == "" {
+		panelPort = "12889"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"success":       true,
+		"pending":       pending == "true" && domain != "",
+		"domain":        domain,
+		"https_enabled": httpsEnabled,
+		"is_docker":     isDocker(),
+		"panel_port":    panelPort,
+	})
+}
+
+// DeployMasterCert 部署主控证书：安装 Nginx（如需）+ 配置 SSL + 更新 master_url
+func (h *CertificateHandler) DeployMasterCert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	domain := getDomainFromMasterURL(h.repo, ctx)
+	if domain == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "未配置主控域名"})
+		return
+	}
+
+	cert, err := h.findCertForDomain(ctx, domain, 0)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "未找到主控域名的有效证书"})
+		return
+	}
+
+	if !isNginxInstalled() {
+		log.Printf("[DeployMasterCert] Nginx 未安装，开始安装...")
+		if err := installNginxLocal(); err != nil {
+			log.Printf("[DeployMasterCert] Nginx 安装失败: %v", err)
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("Nginx 安装失败: %s", err.Error())})
+			return
+		}
+		log.Printf("[DeployMasterCert] Nginx 安装成功")
+	}
+
+	if err := deployLocalNginxWithCert(domain, cert); err != nil {
+		log.Printf("[DeployMasterCert] Nginx 配置部署失败: %v", err)
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("Nginx 配置失败: %s", err.Error())})
+		return
+	}
+
+	newMasterURL := "https://" + domain
+	_ = h.repo.SetSystemSetting(ctx, "master_url", newMasterURL)
+	_ = h.repo.SetSystemSetting(ctx, "master_cert_pending", "")
+	log.Printf("[DeployMasterCert] 主控证书部署成功，master_url 已更新为 %s", newMasterURL)
+
+	if h.onMasterURLChanged != nil {
+		go h.onMasterURLChanged(context.Background(), newMasterURL)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"success":        true,
+		"message":        "主控证书部署成功",
+		"new_master_url": newMasterURL,
+	})
+}
+
+func findNginxBinary() string {
+	for _, p := range []string{"/usr/local/nginx/sbin/nginx", "/usr/sbin/nginx", "/usr/bin/nginx"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("nginx"); err == nil {
+		return p
+	}
+	return ""
+}
+
+func isNginxInstalled() bool {
+	return findNginxBinary() != ""
+}
+
+func validateManagedNginx(nginxBin string) error {
+	if filepath.Clean(nginxBin) != "/usr/local/nginx/sbin/nginx" {
+		return fmt.Errorf(
+			"检测到非妙妙屋X管理的 Nginx（%s）；为避免覆盖用户配置，请先卸载系统 Nginx，再通过妙妙屋X安装",
+			nginxBin,
+		)
+	}
+
+	output, err := exec.Command(nginxBin, "-V").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("无法读取 Nginx 版本信息: %w", err)
+	}
+	info := string(output)
+	current := parseNginxVersion(info)
+	if current == "" || compareSemver(current, minimumManagedNginxVersion) < 0 {
+		return fmt.Errorf(
+			"当前 Nginx %s 不兼容（要求 >= %s）；请使用 install-nginx.sh 重新安装",
+			current,
+			minimumManagedNginxVersion,
+		)
+	}
+	requiredModules := []string{
+		"--with-http_ssl_module",
+		"--with-http_v2_module",
+		"--with-http_v3_module",
+		"--with-http_realip_module",
+		"--with-stream_ssl_module",
+		"--with-stream_ssl_preread_module",
+	}
+	for _, module := range requiredModules {
+		if !strings.Contains(info, module) {
+			return fmt.Errorf("当前 Nginx 缺少 %s；请使用 install-nginx.sh 重新安装", module)
+		}
+	}
+	return nil
+}
+
+func installNginxLocal() error {
+	// Docker 镜像里 nginx 已经 apt 预装 + symlink 兼容(见 Dockerfile),不用跑 install-nginx.sh —
+	// 那个脚本依赖 systemctl daemon-reload + enable --now,容器里没 systemd 会失败。
+	// findNginxBinary() 在 docker 镜像里通过 /usr/local/nginx/sbin/nginx 这条 symlink 找得到。
+	if isDocker() {
+		return nil
+	}
+	cmd := exec.Command("bash", "-o", "pipefail", "-c", "curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// ensureNginxRunning 让 nginx 在跑:先尝试 `nginx -s reload`(已跑 → 重载 OK);失败说明没跑或 PID 文件丢,
+// 兜底拉起守护进程。
+//   - Docker 模式:直接 `nginx`(无参数会以 daemon 形式 fork);容器内没 systemd,systemctl 调用无意义
+//   - 裸机:`systemctl start nginx`(配合 install-nginx.sh 装好的 systemd unit + enable 开机自启)
+//
+// 三处 nginx 配置部署函数(EnableHTTPS / deployLocalNginx / deployLocalNginxWithCert)统一用本 helper。
+func ensureNginxRunning(nginxBin string) error {
+	if err := exec.Command(nginxBin, "-s", "reload").Run(); err == nil {
+		return nil
+	}
+	if isDocker() {
+		return exec.Command(nginxBin).Run()
+	}
+	return exec.Command("systemctl", "start", "nginx").Run()
+}
+
+const dockerNginxEnabledMarker = "/app/data/nginx/enabled"
+
+func markDockerNginxEnabled() error {
+	if !isDocker() {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dockerNginxEnabledMarker), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(dockerNginxEnabledMarker, []byte("1\n"), 0o644)
+}
+
+func isPort443InUse() bool {
+	ln, err := net.Listen("tcp", ":443")
+	if err != nil {
+		return true
+	}
+	ln.Close()
+	return false
+}
+
+func (h *CertificateHandler) EnableHTTPS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	domain := getDomainFromMasterURL(h.repo, ctx)
+	if domain == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "未配置主控域名"})
+		return
+	}
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	rootDomain := extractRootDomain(domain)
+
+	cert, err := h.findCertForDomain(ctx, domain, 0)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "未找到主控域名的有效证书"})
+		return
+	}
+
+	if !isNginxInstalled() {
+		log.Printf("[EnableHTTPS] Nginx 未安装，开始安装...")
+		if err := installNginxLocal(); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("Nginx 安装失败: %s", err.Error())})
+			return
+		}
+	}
+
+	nginxBin := findNginxBinary()
+	if nginxBin == "" {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": "未找到 nginx 可执行文件"})
+		return
+	}
+	if err := validateManagedNginx(nginxBin); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
+		return
+	}
+
+	dirs := []string{"/usr/local/nginx/conf", "/usr/local/nginx/servers", "/usr/local/nginx/stream_servers", "/usr/local/nginx/cert", "/usr/local/nginx/html"}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("创建目录失败: %v", err)})
+			return
+		}
+	}
+
+	nginxConf, err := templates.ReadFile("tunnel/nginx.conf")
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("读取 nginx.conf 模板失败: %v", err)})
+		return
+	}
+	if err := os.WriteFile("/usr/local/nginx/nginx.conf", nginxConf, 0644); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("写入 nginx.conf 失败: %v", err)})
+		return
+	}
+
+	domainTpl, err := templates.ReadFile("tunnel/domain_proxy.conf")
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("读取 domain_proxy.conf 模板失败: %v", err)})
+		return
+	}
+	certName := certDeployFilename(cert.Domain)
+	domainConf := strings.ReplaceAll(string(domainTpl), "{domain}", domain)
+	domainConf = strings.ReplaceAll(domainConf, "{root_domain}", rootDomain)
+	domainConf = strings.ReplaceAll(domainConf, "{cert_name}", certName)
+	masterURLRaw, _ := h.repo.GetSystemSetting(ctx, "master_url")
+	domainConf = strings.ReplaceAll(domainConf, "{proxy_pass_server}", localPanelBackend(masterURLRaw))
+	if err := os.WriteFile(filepath.Join("/usr/local/nginx/servers", domain+".conf"), []byte(domainConf), 0644); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("写入 domain.conf 失败: %v", err)})
+		return
+	}
+
+	if !isPort443InUse() {
+		fallbackTpl, err := templates.ReadFile("tunnel/xray_fallback_443.conf")
+		if err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("读取 xray_fallback_443.conf 模板失败: %v", err)})
+			return
+		}
+		if err := os.WriteFile(filepath.Join("/usr/local/nginx/stream_servers", domain+"_443.conf"), fallbackTpl, 0644); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("写入 443 配置失败: %v", err)})
+			return
+		}
+	}
+
+	certPath := filepath.Join("/usr/local/nginx/cert", certName+".pem")
+	keyPath := filepath.Join("/usr/local/nginx/cert", certName+".key")
+	if err := os.WriteFile(certPath, []byte(cert.CertPEM), 0644); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("写入证书失败: %v", err)})
+		return
+	}
+	if err := os.WriteFile(keyPath, []byte(cert.KeyPEM), 0600); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("写入密钥失败: %v", err)})
+		return
+	}
+
+	if output, err := exec.Command(nginxBin, "-t").CombinedOutput(); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("Nginx 配置检测失败: %s", string(output))})
+		return
+	}
+
+	if err := ensureNginxRunning(nginxBin); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("Nginx 启动失败: %v", err)})
+		return
+	}
+	if err := markDockerNginxEnabled(); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "message": fmt.Sprintf("保存 Docker HTTPS 启用状态失败: %v", err)})
+		return
+	}
+
+	newMasterURL := "https://" + domain
+	_ = h.repo.SetSystemSetting(ctx, "master_url", newMasterURL)
+	log.Printf("[EnableHTTPS] HTTPS 已启用，master_url=%s, port443_in_use=%v", newMasterURL, isPort443InUse())
+
+	if h.onMasterURLChanged != nil {
+		go h.onMasterURLChanged(context.Background(), newMasterURL)
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"success":        true,
+		"message":        fmt.Sprintf("已为 %s 开启 HTTPS 访问", domain),
+		"new_master_url": newMasterURL,
+	})
+
+	// Docker 端口映射要求主控继续监听容器内 0.0.0.0，且主控是 PID 1；此处若发送
+	// SIGTERM 会连同刚启动的 Nginx 一起结束。裸机才通过服务重启切换到回环监听。
+	if !isDocker() {
+		go func() {
+			time.Sleep(2 * time.Second)
+			log.Printf("[EnableHTTPS] Restarting service to bind 127.0.0.1 only")
+			p, _ := os.FindProcess(os.Getpid())
+			_ = p.Signal(syscall.SIGTERM)
+		}()
+	}
+}

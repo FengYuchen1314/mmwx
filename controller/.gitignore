@@ -1,0 +1,80 @@
+# ---> Go
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+traffic-info-*
+.claude 
+build
+
+internal/web/dist
+data/*
+.vscode
+VERSION.md
+miaomiaowu.db
+# 前端 source 已迁私有 repo;本地开发者 clone 到该目录后,git 不会追踪到任何前端文件。
+# 历史上已 commit 的文件需要 `git rm -r miaomiaowux-frontend/` 显式从 index 移除一次。
+miaomiaowux-frontend/
+.idea
+VALIDATION_INTEGRATION_PLAN.md
+
+test/
+docs/
+server
+CLAUDE.md
+e2e
+MERGE_PLAN.md
+*_test.go
+!internal/handler/protocol_catalog_test.go
+!internal/handler/xray_build_inbound_test.go
+INTRODUCTION.md
+subscribes
+mmwx.db
+data
+deploy.sh
+miaomiaowux-frontend
+MCP_PLAN.md
+*_test.go
+!internal/storage/database_config_test.go
+!internal/storage/package_assignment_test.go
+!internal/storage/traffic_daily_ledger_test.go
+!internal/storage/traffic_ledger_stress_test.go
+!internal/storage/traffic_daily_backfill_test.go
+!internal/storage/remote_heartbeat_notification_test.go
+!internal/storage/server_renewal_confirm_test.go
+!internal/handler/traffic_period_baseline_test.go
+!internal/license/ip_region_test.go
+!internal/handler/protocol_catalog_test.go
+!internal/handler/xray_build_inbound_test.go
+
+# The controller embeds this self-maintained frontend at build time. Keep the
+# source and its compiled embed assets, but never vendor node_modules.
+!web/
+!web/**
+web/node_modules/
+!internal/web/
+!internal/web/dist/
+!internal/web/dist/**
+AGENTS.md
