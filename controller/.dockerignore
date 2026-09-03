@@ -13,10 +13,6 @@ dist/
 *.exe
 server
 
-# Dependencies
-node_modules/
-miaomiaowux-frontend/node_modules/
-
 # IDE
 .vscode/
 .idea/

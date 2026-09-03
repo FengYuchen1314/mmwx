@@ -1,24 +1,3 @@
-# Build stage for frontend
-# 用 BUILDPLATFORM(构建机原生架构,通常 amd64)构建,避免 arm64 在 QEMU 模拟下跑 npm ci 缓慢/网络超时。
-# 前端产物(internal/web/dist)是架构无关的静态文件,只需构建一次,供各架构后端 COPY。
-FROM --platform=$BUILDPLATFORM node:20-slim AS frontend-builder
-
-WORKDIR /app
-
-# Copy frontend package files
-COPY web/package*.json ./web/
-
-# Install dependencies
-WORKDIR /app/web
-# 加长网络超时,容忍 CI 偶发的 registry 抖动
-RUN npm ci --fetch-timeout=600000
-
-# Copy frontend source
-COPY web/ ./
-
-# Build frontend (will output to ../internal/web/dist)
-RUN npm run build
-
 # Build stage for backend
 FROM golang:1.26-bookworm AS backend-builder
 
@@ -49,9 +28,6 @@ RUN go mod download
 
 # Copy source code
 COPY . .
-
-# Copy built frontend from previous stage (vite outputs to /app/internal/web/dist)
-COPY --from=frontend-builder /app/internal/web/dist ./internal/web/dist
 
 # Build backend with optimizations (CGO enabled for SQLite WAL support)
 # Use TARGETOS and TARGETARCH for multi-platform builds
@@ -125,12 +101,12 @@ VOLUME ["/app/data", "/app/subscribes"]
 # is preserved.
 ENV BIND_HOST=0.0.0.0
 
-# 主控 HTTP 后端以及容器内托管的 Nginx HTTP/HTTPS 入口。
+# 主控 API 后端以及容器内托管的 Nginx HTTP/HTTPS 入口。
 EXPOSE 80 443 12889
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:12889/ || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:12889/healthz || exit 1
 
 # Set entrypoint
 ENTRYPOINT ["/entrypoint.sh"]

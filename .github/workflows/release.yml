@@ -39,26 +39,6 @@ jobs:
             controller/go.sum
             agent/go.sum
             xray-core/go.sum
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: |
-            controller/web/package-lock.json
-            probe/package-lock.json
-      - name: Build controller frontend
-        working-directory: controller/web
-        run: |
-          npm ci
-          npm run build
-      - name: Preserve controller frontend for release packages
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: controller-web-dist
-          path: controller/internal/web/dist
-          if-no-files-found: error
-          retention-days: 1
       - name: Test controller
         working-directory: controller
         run: |
@@ -78,12 +58,6 @@ jobs:
             ./proxy/anytls ./proxy/mieru ./proxy/socks ./proxy/vless/encoding \
             ./transport/internet/...
           go build -o /tmp/mmwx-xray ./main
-      - name: Typecheck and build probe
-        working-directory: probe
-        run: |
-          npm ci
-          npm run typecheck
-          npm run build
 
   package:
     name: Package ${{ matrix.component }} (${{ matrix.goos }}/${{ matrix.goarch }})
@@ -188,12 +162,6 @@ jobs:
             controller/go.sum
             agent/go.sum
             xray-core/go.sum
-      - name: Reuse validated controller frontend
-        if: matrix.component == 'controller'
-        uses: actions/download-artifact@v4
-        with:
-          name: controller-web-dist
-          path: controller/internal/web/dist
       - name: Cross-compile binary
         env:
           DIRECTORY: ${{ matrix.directory }}
@@ -215,30 +183,6 @@ jobs:
         with:
           name: ${{ matrix.output }}
           path: dist/${{ matrix.output }}
-          if-no-files-found: error
-
-  package-probe:
-    name: Package probe
-    needs: validate
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: probe/package-lock.json
-      - name: Build probe bundle
-        working-directory: probe
-        run: |
-          npm ci
-          npm run build
-          tar -C dist -czf ../mmwx-probe-${{ needs.validate.outputs.version }}.tar.gz .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mmwx-probe-${{ needs.validate.outputs.version }}.tar.gz
-          path: mmwx-probe-${{ needs.validate.outputs.version }}.tar.gz
           if-no-files-found: error
 
   publish-containers:
@@ -284,7 +228,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [validate, package, package-probe, publish-containers]
+    needs: [validate, package, publish-containers]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -308,61 +252,3 @@ jobs:
           files: |
             release/mmwx-*
             release/checksums.txt
-
-  deploy-probe:
-    name: Deploy probe to Cloudflare (if configured)
-    needs: validate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
-          cache-dependency-path: probe/package-lock.json
-      - name: Deploy probe Worker
-        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
-        working-directory: probe
-        run: |
-          npm ci
-          npm run deploy
-      - name: Report skipped deployment
-        if: env.CLOUDFLARE_API_TOKEN == '' || env.CLOUDFLARE_ACCOUNT_ID == ''
-        run: echo "Cloudflare secrets are not configured; probe deployment was skipped."
-
-  deploy-vps:
-    name: Deploy controller to production VPS
-    needs: release
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
-      VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
-      VPS_HOST: 185.99.135.224
-      VPS_USER: root
-    steps:
-      - name: Configure restricted deployment SSH key
-        if: env.VPS_SSH_PRIVATE_KEY != '' && env.VPS_SSH_KNOWN_HOSTS != ''
-        shell: bash
-        run: |
-          install -d -m 700 "$HOME/.ssh"
-          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 644 "$HOME/.ssh/known_hosts"
-      - name: Deploy latest controller image without replacing data
-        if: env.VPS_SSH_PRIVATE_KEY != '' && env.VPS_SSH_KNOWN_HOSTS != ''
-        shell: bash
-        run: |
-          ssh -T -i "$HOME/.ssh/id_ed25519" \
-            -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            "$VPS_USER@$VPS_HOST"
-      - name: Report skipped VPS deployment
-        if: env.VPS_SSH_PRIVATE_KEY == '' || env.VPS_SSH_KNOWN_HOSTS == ''
-        run: echo "VPS SSH secrets are not configured; deployment was skipped."

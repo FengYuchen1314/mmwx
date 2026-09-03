@@ -36,7 +36,6 @@ import (
 	inttgbot "miaomiaowux/internal/tgbot"
 	"miaomiaowux/internal/traffic"
 	"miaomiaowux/internal/version"
-	"miaomiaowux/internal/web"
 	ruletemplates "miaomiaowux/rule_templates"
 	"miaomiaowux/subscribes"
 
@@ -894,10 +893,6 @@ func main() {
 	if encVal, _ := repo.GetSystemSetting(context.Background(), "require_encryption"); encVal == "true" {
 		cryptoConfig.SetRequireEncryption(true)
 	}
-	// 启动时把 DB 里的默认主题注入到下发的 index.html(无 cookie 的用户首屏据此套主题,无闪烁)
-	if theme, _ := repo.GetSystemSetting(context.Background(), handler.DefaultThemeKey); theme != "" {
-		web.SetDefaultTheme(theme)
-	}
 	// 更新走 CDN 加速开关:默认开启(域名写死在代码);DB 里显式存 "0"/"false" 才关闭 → 回退直连 GitHub
 	if v, _ := repo.GetSystemSetting(context.Background(), handler.UpdateCDNEnabledKey); v == "0" || v == "false" {
 		handler.SetUpdateCDNEnabled(false)
@@ -1028,16 +1023,13 @@ func main() {
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
 	})))
-	// 默认主题(flat / pixel):PUT 保存后重读并同步注入到 index.html,让新用户首屏立即用新默认
+	// 默认主题(flat / pixel):保留为 API 客户端可读写的系统设置。
 	mux.Handle("/api/admin/system-settings/default-theme", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			systemSettingsHandler.GetDefaultTheme(w, r)
 		case http.MethodPut:
 			systemSettingsHandler.SetDefaultTheme(w, r)
-			if theme, _ := repo.GetSystemSetting(r.Context(), handler.DefaultThemeKey); theme != "" {
-				web.SetDefaultTheme(theme)
-			}
 		default:
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
@@ -1291,13 +1283,11 @@ func main() {
 	subRateLimiter.SetSkipLocalIP(secCfg.SkipLocalIP)
 	go subRateLimiter.StartCleanup(context.Background())
 
-	// 自定义静态资源目录 data/public/(Docker 下随 data 卷持久化、二进制下就是工作目录旁)。
-	// 前端 dist 是编译进二进制的只读 embed.FS,用户无法往里放图片;这是唯一能在 Docker/二进制
-	// 部署里放自定义壁纸等图片的位置:把图片丢进 data/public/,再在设置里引用 /public/xxx.jpg。
-	// ServeMux 里 "/public/" 比 "/" 更具体 → 优先命中,不会被 SPA 兜底吞掉。
-	publicDir := filepath.Join(dataDir, "public")
-	_ = os.MkdirAll(publicDir, 0755)
-	mux.Handle("/public/", http.StripPrefix("/public/", http.FileServer(http.Dir(publicDir))))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.Trim(r.URL.Path, "/")
@@ -1306,8 +1296,6 @@ func main() {
 		isTempSub := strings.HasPrefix(path, "t/") && len(path) == 10
 
 		// 暴力探测封禁检查：仅对 /x/ 短链探测路径生效(失败计数也只来自 /x/ 与临时订阅)。
-		// SPA 路由(/nodes、/users 等单段 alphanumeric)、静态资源、临时订阅一律放行,
-		// 否则被封 IP 连前端 UI 都无法加载(SPA 路由与短码长得一样,不能一并拦截)。
 		if strings.HasPrefix(path, "x/") && bruteForceProtector.IsBlocked(clientIP, r.URL.Path) {
 			http.NotFound(w, r)
 			return
@@ -1342,8 +1330,8 @@ func main() {
 			}
 		}
 
-		// 否则，传递给 Web 处理程序
-		web.Handler().ServeHTTP(w, r)
+		// 本项目不再内置前端；未知路径统一返回 404。
+		http.NotFound(w, r)
 	})
 
 	// 嵌入式 MCP server(streamable-HTTP):供 OpenClaw 等 agent 运维。鉴权在工具调用时按 API 令牌经 mux 复用现有链。

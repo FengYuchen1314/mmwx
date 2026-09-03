@@ -1150,7 +1150,7 @@ func (h *SystemSettingsHandler) SetSubscriptionOutputFormat(w http.ResponseWrite
 }
 
 // DefaultThemeKey 是「默认主题」系统设置的 KV 键。值:"flat"(扁平)/ "pixel"(妙妙屋像素风,默认)。
-// 无 mmw-theme-style cookie 的用户首屏用它决定初始主题(由 web.SetDefaultTheme 注入 index.html)。
+// 保留该设置供外部 API 客户端读取其默认显示主题。
 const DefaultThemeKey = "default_theme"
 
 func (h *SystemSettingsHandler) GetDefaultTheme(w http.ResponseWriter, r *http.Request) {
