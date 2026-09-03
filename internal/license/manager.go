@@ -40,24 +40,18 @@ type Status struct {
 	HardRevoked bool `json:"hard_revoked,omitempty"`
 }
 
-// Status.HasFeature 已废弃 — Status 没有 license key / machine_id,无法验签。
-// 调用方应使用 Manager.HasFeature(name)。本函数保留只为不破坏外部依赖,**永远返回 false**。
-// 这是有意为之:fork 主控的人如果只看 Status.Features 数组绕过 Manager.HasFeature,得到的是 false。
+// Status.HasFeature is a compatibility helper. This distribution has no paid
+// feature tier, so every named capability is available.
 func (s *Status) HasFeature(_ string) bool {
-	return false
+	return true
 }
 
 var defaultStatus = Status{
 	Valid:      true,
-	MaxServers: 1,
-	Plan: &PlanInfo{
-		Name:        "TRIAL",
-		DisplayName: "试用版",
-		MaxServers:  1,
-		MaxNodes:    5,
-		MaxUsers:    3,
-		Features:    nil,
-	},
+	MaxServers: 0, // 0 is unlimited in the open build.
+	// A nil plan deliberately avoids exposing an edition name in legacy status
+	// views. Zero quotas represent unlimited capacity.
+	Plan: nil,
 }
 
 // SettingsGetter is kept for backward compatibility.
@@ -148,12 +142,10 @@ func (m *Manager) SetUsageReporter(r UsageReporter) {
 	m.usage = r
 }
 
-const DefaultServerURL = "https://license.miaomiaowux.com"
-
 func NewManager(settings SettingsStore, machineID string) *Manager {
 	return &Manager{
 		status:    defaultStatus,
-		serverURL: DefaultServerURL,
+		serverURL: "",
 		machineID: machineID,
 		settings:  settings,
 		client:    &http.Client{Timeout: 15 * time.Second},
@@ -161,16 +153,13 @@ func NewManager(settings SettingsStore, machineID string) *Manager {
 }
 
 func (m *Manager) Start(ctx context.Context) {
-	ctx, m.cancel = context.WithCancel(ctx)
-
-	m.loadSettings(ctx)
-	m.loadPersistedStatus(ctx)
-
-	if m.key != "" && m.serverURL != "" {
-		m.activate(ctx)
-	}
-
-	go m.heartbeatLoop(ctx)
+	// This distribution has no license service, online activation, telemetry, or
+	// paid feature tier. Keep the manager as a compatibility seam for handlers
+	// that still receive it, but make it entirely local and non-enforcing.
+	_, m.cancel = context.WithCancel(ctx)
+	m.mu.Lock()
+	m.status = defaultStatus
+	m.mu.Unlock()
 }
 
 func (m *Manager) Stop() {
@@ -186,9 +175,7 @@ func (m *Manager) GetStatus() Status {
 }
 
 func (m *Manager) IsValid() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.isValidLocked()
+	return true
 }
 
 // isValidLocked 是 IsValid 的无锁版,调用方须持有 m.mu(R 或 W)。
@@ -207,20 +194,13 @@ func (m *Manager) isValidLocked() bool {
 // QuotaEnforced 仅在「配置了 license key」时为 true。
 // 无 key 的开源自建主控走 defaultStatus(MaxServers=1),不能拿它当配额执行——否则会把自建砍到只剩 1 台。
 func (m *Manager) QuotaEnforced() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.key != ""
+	return false
 }
 
 // EffectiveServerQuota 返回当前生效的服务器配额:有效且有 Plan → Plan.MaxServers,否则 0。
 // 走 isValidLocked(含 24h grace / HardRevoked),天然继承 429/网络故障容错——临时拿不到 license 不会误判配额变少。
 func (m *Manager) EffectiveServerQuota() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if !m.isValidLocked() || m.status.Plan == nil {
-		return 0
-	}
-	return m.status.Plan.MaxServers
+	return 0
 }
 
 // HasFeature 校验当前 license 是否启用某 PRO feature。
@@ -228,31 +208,11 @@ func (m *Manager) EffectiveServerQuota() int {
 // per-feature ed25519 token 验签 → 没私钥就签不出有效 token。
 // IsValid 失败 / 没 FeatureTokens / token 验签失败 → 一律 false (fail-closed)。
 func (m *Manager) HasFeature(name string) bool {
-	if !m.IsValid() {
-		return false
-	}
-	m.mu.RLock()
-	plan := m.status.Plan
-	expiresAt := m.status.ExpiresAt
-	licenseKey := m.key
-	machineID := m.machineID
-	m.mu.RUnlock()
-
-	if plan == nil || plan.FeatureTokens == nil {
-		return false
-	}
-	tokenB64, ok := plan.FeatureTokens[name]
-	if !ok || tokenB64 == "" {
-		return false
-	}
-	return VerifyFeatureToken(licenseKey, machineID, name, expiresAt, tokenB64)
+	return strings.TrimSpace(name) != ""
 }
 
 func (m *Manager) Refresh(ctx context.Context) {
-	m.loadSettings(ctx)
-	if m.key != "" && m.serverURL != "" {
-		m.activate(ctx)
-	}
+	_ = ctx
 }
 
 func (m *Manager) withinGracePeriod() bool {
@@ -263,17 +223,9 @@ func (m *Manager) withinGracePeriod() bool {
 }
 
 func (m *Manager) loadSettings(ctx context.Context) {
-	if m.settings == nil {
-		return
-	}
-	if key, err := m.settings.GetSystemSetting(ctx, "license_key"); err == nil && key != "" {
-		m.key = key
-	}
-	// 可选 override:不写则用 DefaultServerURL。
-	// 测试环境用:在 system_settings 表写 license_server_url=https://iloli.vip:2233
-	if url, err := m.settings.GetSystemSetting(ctx, "license_server_url"); err == nil && url != "" {
-		m.serverURL = url
-	}
+	// Retained only so older callers compile. Community builds do not read or
+	// use license credentials/settings at all.
+	_ = ctx
 }
 
 func (m *Manager) loadPersistedStatus(ctx context.Context) {

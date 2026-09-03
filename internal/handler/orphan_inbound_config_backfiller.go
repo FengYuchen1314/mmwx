@@ -60,7 +60,7 @@ func (m *OrphanInboundConfigBackfiller) runOnce(ctx context.Context) {
 	}
 
 	// 1. 真实非 admin 用户白名单 + email → username 反查(给 user.email 直绑场景用)
-	users, err := m.repo.ListUsers(ctx, 100000)
+	users, err := m.repo.ListUsers(ctx, 0)
 	if err != nil {
 		log.Printf("[OrphanInboundBackfill] list users failed: %v", err)
 		return

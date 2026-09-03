@@ -155,7 +155,7 @@ func (r *TrafficRepository) BuildEmailAttributor(ctx context.Context) (*EmailAtt
 		a.userServerTags[c.Username][c.ServerID] = append(a.userServerTags[c.Username][c.ServerID], c.InboundTag)
 	}
 
-	users, err := r.ListUsers(ctx, 100000)
+	users, err := r.ListUsers(ctx, 0)
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,11 @@ module miaomiaowux
 
 go 1.26
 
+// AnyTLS and Mieru are provided by our paired Xray fork. Keep the dependency
+// explicit so a release cannot silently fall back to upstream Xray and accept
+// an inbound the runtime is unable to start.
+replace github.com/xtls/xray-core => ../Xray-core-mmwx
+
 require (
 	github.com/MMWOrg/mmwX-plugins/proxyparser v0.1.7
 	github.com/alibabacloud-go/darabonba-openapi/v2 v2.1.16

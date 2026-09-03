@@ -5293,17 +5293,21 @@ func (r *TrafficRepository) GetUser(ctx context.Context, username string) (User,
 	return user, nil
 }
 
-// 返回最多按创建时间排序的限制用户。
+// ListUsers returns users by creation time. A positive limit paginates the
+// caller; limit <= 0 deliberately means no count cap for the community build.
 func (r *TrafficRepository) ListUsers(ctx context.Context, limit int) ([]User, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	if limit <= 0 {
-		limit = 10
+	query := `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC`
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		rows, err = r.db.QueryContext(ctx, query+` LIMIT ?`, limit)
+	} else {
+		rows, err = r.db.QueryContext(ctx, query)
 	}
-
-	rows, err := r.db.QueryContext(ctx, `SELECT username, password_hash, COALESCE(email, ''), COALESCE(nickname, ''), COALESCE(avatar_url, ''), COALESCE(role, ''), is_active, COALESCE(remark, ''), COALESCE(package_id, 0), COALESCE(is_reset, 0), COALESCE(reset_day, 1), package_end_date, speed_limit_override, device_limit_override, traffic_limit_override, COALESCE(node_speed_limit_overrides, '{}'), COALESCE(node_device_limit_overrides, '{}'), created_at, updated_at FROM users ORDER BY created_at ASC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}

@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"strconv"
 
@@ -33,8 +32,6 @@ const (
 	settingUserRoutedOutboundEnabled    = "user_routed_outbound_enabled"
 	settingUserQuotaRoutedOutbound      = "user_quota_routed_outbound"
 	settingUserRoutedOutboundDailyLimit = "user_routed_outbound_daily_limit"
-	defaultUserQuotaRoutedOutbound      = 2
-	defaultUserRoutedOutboundDailyLimit = 5
 )
 
 // 合法的可见页面 key(白名单,防止前端传入任意路由)。
@@ -69,7 +66,7 @@ func NewUserPermissionsHandler(repo *storage.TrafficRepository) *UserPermissions
 
 // loadUserPermConfig 从 system_settings 读全局策略(包级,供其他 handler 复用)。
 func loadUserPermConfig(ctx context.Context, repo *storage.TrafficRepository) UserPermissionsConfig {
-	cfg := UserPermissionsConfig{Pages: []string{}}
+	cfg := UserPermissionsConfig{Pages: []string{}, RoutedOutboundEnabled: true}
 	if raw, _ := repo.GetSystemSetting(ctx, settingUserPeracmPages); raw != "" {
 		var pages []string
 		if json.Unmarshal([]byte(raw), &pages) == nil {
@@ -80,31 +77,9 @@ func loadUserPermConfig(ctx context.Context, repo *storage.TrafficRepository) Us
 			}
 		}
 	}
-	atoi := func(key string) int {
-		if v, _ := repo.GetSystemSetting(ctx, key); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-				return n
-			}
-		}
-		return 0
-	}
-	cfg.QuotaTemplate = atoi(settingUserQuotaTemplate)
-	cfg.QuotaOverride = atoi(settingUserQuotaOverride)
-	cfg.QuotaSubscribe = atoi(settingUserQuotaSubscribe)
-	// 路由出站开关 + 配额
-	if raw, _ := repo.GetSystemSetting(ctx, settingUserRoutedOutboundEnabled); raw == "1" {
-		cfg.RoutedOutboundEnabled = true
-	}
-	if v := atoi(settingUserQuotaRoutedOutbound); v > 0 {
-		cfg.QuotaRoutedOutbound = v
-	} else {
-		cfg.QuotaRoutedOutbound = defaultUserQuotaRoutedOutbound
-	}
-	if v := atoi(settingUserRoutedOutboundDailyLimit); v > 0 {
-		cfg.DailyLimitRoutedOutbound = v
-	} else {
-		cfg.DailyLimitRoutedOutbound = defaultUserRoutedOutboundDailyLimit
-	}
+	// Count and daily-operation settings are intentionally ignored. All zero
+	// values in the response mean unlimited; routed outbounds are available to
+	// every user who otherwise has access to their node.
 	return cfg
 }
 
@@ -125,40 +100,13 @@ func userIsAdmin(ctx context.Context, repo *storage.TrafficRepository, username 
 
 // checkUserQuota 包级配额校验,供各 create handler 调用。admin 不受限。
 func checkUserQuota(ctx context.Context, repo *storage.TrafficRepository, username, resource string) error {
-	if userIsAdmin(ctx, repo, username) {
-		return nil
-	}
-	cfg := loadUserPermConfig(ctx, repo)
-	var used, max int
-	switch resource {
-	case "template":
-		// 「模板」= 旧 DB 模板(templates) + 规则模板(rule_templates,即「模板管理」页面)之和。
-		// rule-templates 是文件型模板,原先只有全局上限、不受 per-user 配额约束 —— 这里一并纳入。
-		tpl, _ := repo.CountUserTemplates(ctx, username)
-		rt, _ := repo.CountUserRuleTemplates(ctx, username)
-		used = tpl + rt
-		max = cfg.QuotaTemplate
-	case "override":
-		// 「覆写」= 覆写脚本(override_scripts) + 覆写规则(custom_rules) 之和
-		ovr, _ := repo.CountUserOverrideScripts(ctx, username)
-		cr, _ := repo.CountUserCustomRules(ctx, username)
-		used = ovr + cr
-		max = cfg.QuotaOverride
-	case "subscribe":
-		used, _ = repo.CountUserSubscribeFiles(ctx, username)
-		max = cfg.QuotaSubscribe
-	case "routed_outbound":
-		if !cfg.RoutedOutboundEnabled {
-			return fmt.Errorf("路由出站功能未开放,请联系管理员开启")
-		}
-		used, _ = repo.CountUserRoutedOutbounds(ctx, username)
-		max = cfg.QuotaRoutedOutbound
-	default:
-		return nil
-	}
-	if max > 0 && used >= max {
-		return fmt.Errorf("已达到%s数量上限 (%d/%d)", quotaLabel(resource), used, max)
-	}
+	// No user-, node-, or resource-count quotas exist in this distribution.
+	// Leave this shared hook in place so every existing creation path becomes
+	// unlimited together, including routes that callers invoke directly.
+	_ = ctx
+	_ = repo
+	_ = username
+	_ = resource
 	return nil
 }
 

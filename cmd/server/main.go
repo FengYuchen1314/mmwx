@@ -210,8 +210,6 @@ func main() {
 	cryptoConfig := handler.NewCryptoConfig(masterIdentity, securechan.NewSessionCache(1*time.Hour))
 
 	licenseManager := license.NewManager(repo, license.GetMachineID())
-	// 注入 usage 来源,让心跳把"本机当前 used_servers/nodes/users" 上报给 license 服务器。
-	licenseManager.SetUsageReporter(repo)
 	licenseManager.Start(context.Background())
 	defer licenseManager.Stop()
 
@@ -544,32 +542,6 @@ func main() {
 	limiterPusher.SetLicenseManager(licenseManager)
 	remoteWSHandler.SetLimiterPusher(limiterPusher)
 	remoteWSHandler.SetLicenseManager(licenseManager)
-	// license 从失效恢复为有效时,主动重推所有 embedded 服务器的限速(失效期被 gate 漏下发的补上)。
-	licenseManager.SetOnRecover(func() {
-		limiterPusher.PushToAllEmbeddedServers(context.Background())
-	})
-	// license「服务器配额」变化(到期/降级/恢复)时,重算 per-server xray 授权并下发给在线 agent:
-	// 超额服务器停 xray、拿到名额的启 xray。
-	licenseManager.SetOnQuotaChange(func() {
-		remoteWSHandler.ReconcileServerQuota(context.Background())
-	})
-	// PRO 特性丢失(降级/到期/解绑)时撤销已下发到 agent 的配置。
-	// 与 SetOnRecover 成对:恢复时补推,丢失时清零。agent 侧限速是内存态,
-	// 只"停止下发"不会让存量限速失效 —— 必须主动推一份清零配置覆盖掉。
-	licenseManager.SetOnFeatureLost(func(feature string) {
-		if feature == "limiter" {
-			limiterPusher.RevokeAllEmbeddedServers(context.Background())
-		}
-	})
-	// 5min 定期兜底:即便漏了某次事件触发(如下发时 agent 恰好离线),也能在下个周期把
-	// 授权重新对齐(agent 侧幂等,值没变不会反复启停 xray)。
-	go func() {
-		ticker := time.NewTicker(5 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			remoteWSHandler.ReconcileServerQuota(context.Background())
-		}
-	}()
 	xrayServerHandler.SetLimiterPusher(limiterPusher)
 	xrayServerHandler.SetLicenseManager(licenseManager)
 
@@ -578,7 +550,7 @@ func main() {
 	remoteManageHandler.SetSubscribeDir(subscribeDir)
 	remoteWSHandler.SetServerAddressChangeCallback(remoteManageHandler.SyncServerAddressChange)
 	remoteManageHandler.SetCrypto(cryptoConfig)
-	remoteManageHandler.SetLicenseManager(licenseManager) // syncInboundsToNodes 路径里 license budget 检查需要
+	remoteManageHandler.SetLicenseManager(licenseManager) // compatibility injection; it never enforces a quota
 	// inbound cache: 套餐绑/换绑时 in-memory 算 cred 用,从 xray config snapshot 派生。
 	inboundCache := handler.NewInboundCache()
 	remoteManageHandler.SetInboundCache(inboundCache)
@@ -898,10 +870,6 @@ func main() {
 		log.Printf("[Child Mode] Management API registered at /api/child/*")
 	}
 
-	// Xray 示例 API（仅限管理员）
-	xrayExamplesHandler := handler.NewXrayExamplesHandler("Xray-examples")
-	mux.Handle("/api/admin/xray-examples", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayExamplesHandler.HandleGetProtocolCombinations)))
-
 	// Xray 密钥生成 API（仅限管理员）
 	xrayKeyGenHandler := handler.NewXrayKeyGeneratorHandler()
 	mux.Handle("/api/admin/xray/generate-keys", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(xrayKeyGenHandler.GenerateKeys)))
@@ -909,6 +877,7 @@ func main() {
 
 	// 高层 inbound 构建器:吃高层意图拼出完整入站(供 MCP/自动化,无需复刻前端配置逻辑)
 	buildInboundHandler := handler.NewBuildInboundHandler()
+	mux.Handle("/api/admin/protocol-profiles", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(buildInboundHandler.HandleProfiles)))
 	mux.Handle("/api/admin/xray/build-inbound", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(buildInboundHandler.HandleBuildInbound)))
 
 	// 系统设置 API（仅限管理员）
@@ -1013,9 +982,6 @@ func main() {
 		}
 	})))
 	mux.HandleFunc("/api/public/login-wallpaper", systemSettingsHandler.GetLoginWallpaperPublic)
-	// 登录页展示许可证称号:免鉴权,仅 name/display_name/valid(见 handler 注释)
-	mux.Handle("/api/public/license-badge", handler.NewLicenseBadgePublicHandler(repo, licenseManager))
-	mux.Handle("/api/admin/system-settings/license-badge", auth.RequireAdmin(tokenStore, userRepo, handler.NewLicenseBadgeDisplayHandler(repo)))
 
 	// 真探针数据的内存 ring(cpu/mem/disk/ping,来自 agent 上报)。用户选「仅内存实时滚动」不建表。
 	// 单例:读侧给 ProbePublicHandler,写侧 P3 注入 remoteWSHandler。
@@ -1231,22 +1197,6 @@ func main() {
 			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
 		}
 	})))
-
-	// 许可证 API
-	licenseHandler := handler.NewLicenseHandler(repo, licenseManager)
-	mux.Handle("/api/admin/license/status", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(licenseHandler.GetStatus)))
-	mux.Handle("/api/admin/license/usage", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(licenseHandler.GetUsage)))
-	mux.Handle("/api/admin/license/settings", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			licenseHandler.GetSettings(w, r)
-		case http.MethodPut:
-			licenseHandler.UpdateSettings(w, r)
-		default:
-			http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
-		}
-	})))
-	mux.Handle("/api/user/license/status", auth.RequireToken(tokenStore, userRepo, http.HandlerFunc(licenseHandler.UserGetStatus)))
 
 	// 通知配置 API（仅限管理员）
 	notifyConfigHandler := handler.NewNotifyConfigHandler(repo)

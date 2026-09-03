@@ -6,15 +6,15 @@ FROM --platform=$BUILDPLATFORM node:20-slim AS frontend-builder
 WORKDIR /app
 
 # Copy frontend package files
-COPY miaomiaowux-frontend/package*.json ./miaomiaowux-frontend/
+COPY web/package*.json ./web/
 
 # Install dependencies
-WORKDIR /app/miaomiaowux-frontend
+WORKDIR /app/web
 # 加长网络超时,容忍 CI 偶发的 registry 抖动
 RUN npm ci --fetch-timeout=600000
 
 # Copy frontend source
-COPY miaomiaowux-frontend/ ./
+COPY web/ ./
 
 # Build frontend (will output to ../internal/web/dist)
 RUN npm run build
@@ -26,11 +26,6 @@ FROM golang:1.26-bookworm AS backend-builder
 ARG TARGETOS
 ARG TARGETARCH
 
-# License signing public key — 编译时通过 -ldflags -X 注入 internal/license 包,源码默认空。
-# GitHub Actions workflow / docker buildx 命令传入 --build-arg LICENSE_PUB_KEY=...
-# 未传时 build 仍成功但镜像里的二进制 PRO 不可用(所有许可证响应验签 fail)。
-ARG LICENSE_PUB_KEY=""
-
 WORKDIR /app
 
 # Install build dependencies (gcc needed for CGO)
@@ -39,6 +34,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libc6-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy the paired Xray fork beside /app: go.mod uses a relative replace so the
+# runtime that builds this image is exactly the runtime that supports AnyTLS
+# and Mieru.
+COPY --from=xray-core-fork . /Xray-core-mmwx
 
 # Copy go mod files
 COPY go.mod go.sum ./
@@ -56,7 +56,7 @@ COPY --from=frontend-builder /app/internal/web/dist ./internal/web/dist
 # Use TARGETOS and TARGETARCH for multi-platform builds
 RUN CGO_ENABLED=1 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build \
     -trimpath \
-    -ldflags="-s -w -X 'miaomiaowux/internal/license.licenseSignPubKeyB64=${LICENSE_PUB_KEY}'" \
+    -ldflags="-s -w" \
     -o /app/server \
     ./cmd/server
 

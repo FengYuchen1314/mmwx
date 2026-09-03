@@ -375,24 +375,6 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		return
 	}
 
-	if h.licenseManager != nil {
-		status := h.licenseManager.GetStatus()
-		maxServers := 5
-		if status.Plan != nil {
-			maxServers = status.Plan.MaxServers
-		}
-		count, err := h.repo.CountRemoteServers(r.Context())
-		if err == nil && count >= int64(maxServers) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(stdhttp.StatusForbidden)
-			json.NewEncoder(w).Encode(RemoteServerResponse{
-				Success: false,
-				Message: fmt.Sprintf("已达到服务器数量上限 (%d/%d)，请升级许可证", count, maxServers),
-			})
-			return
-		}
-	}
-
 	var req RemoteServerCreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")

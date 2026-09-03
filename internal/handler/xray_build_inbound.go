@@ -21,8 +21,20 @@ type BuildInboundHandler struct{}
 
 func NewBuildInboundHandler() *BuildInboundHandler { return &BuildInboundHandler{} }
 
+// HandleProfiles provides the UI with the same closed catalog used by the
+// request validator. It prevents a separately maintained frontend dropdown
+// from drifting back toward removed protocols.
+func (h *BuildInboundHandler) HandleProfiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"profiles": SupportedProtocolProfiles()})
+}
+
 type buildInboundRequest struct {
-	Protocol   string `json:"protocol"`    // vless / vmess / trojan / shadowsocks / hysteria2
+	Profile    string `json:"profile"`     // required: one of SupportedProtocolProfiles
+	Protocol   string `json:"protocol"`    // ignored; retained only for a clear error on legacy callers
 	Port       int    `json:"port"`        // 监听端口(必填)
 	Tag        string `json:"tag"`         // 入站 tag;留空自动生成 <protocol>-in-<port>
 	Transport  string `json:"transport"`   // tcp(默认) / ws
@@ -31,11 +43,11 @@ type buildInboundRequest struct {
 	Dest       string `json:"dest"`        // reality 偷取目标 host:port;留空则用 server_name:443
 	Path       string `json:"path"`        // ws path,默认 /ws
 	Host       string `json:"host"`        // ws Host header(可选)
-	Method     string `json:"method"`      // shadowsocks 加密方法,默认 2022-blake3-aes-128-gcm
+	Method     string `json:"method"`      // reserved for API compatibility; catalogue profiles do not use it
 	Email      string `json:"email"`       // 客户端标识(email),留空自动生成
-	UUID       string `json:"uuid"`        // vless/vmess 客户端 id,留空自动生成
-	Password   string `json:"password"`    // trojan/ss 密码,留空自动生成
-	Auth       string `json:"auth"`        // hysteria2 客户端密码,留空自动生成
+	UUID       string `json:"uuid"`        // VLESS / Mieru client id, generated when blank
+	Password   string `json:"password"`    // AnyTLS / SOCKS5 password, generated when blank
+	Auth       string `json:"auth"`        // ShadowTLS password, generated when blank
 	CertDomain string `json:"cert_domain"` // TLS 证书域名(tls 安全时,后端按域名解析已签发证书)
 }
 
@@ -52,6 +64,11 @@ func (h *BuildInboundHandler) HandleBuildInbound(w http.ResponseWriter, r *http.
 		return
 	}
 	req.Protocol = strings.ToLower(strings.TrimSpace(req.Protocol))
+	req.Profile = strings.ToLower(strings.TrimSpace(req.Profile))
+	if req.Profile == "" {
+		writeBadRequest(w, "profile 必填；请选择受支持的协议组合")
+		return
+	}
 	if req.Port <= 0 || req.Port > 65535 {
 		writeBadRequest(w, "port 必填且须在 1-65535")
 		return
@@ -71,24 +88,16 @@ func (h *BuildInboundHandler) HandleBuildInbound(w http.ResponseWriter, r *http.
 
 // buildInbound 依据高层意图拼出完整入站 + 汇总生成的凭据。
 func buildInbound(req *buildInboundRequest) (map[string]any, map[string]any, error) {
+	profile := strings.ToLower(strings.TrimSpace(req.Profile))
 	tag := strings.TrimSpace(req.Tag)
 	if tag == "" {
-		tag = fmt.Sprintf("%s-in-%d", req.Protocol, req.Port)
+		tag = fmt.Sprintf("%s-in-%d", profile, req.Port)
 	}
 	email := strings.TrimSpace(req.Email)
 	if email == "" {
 		email = tag
 	}
-	transport := strings.ToLower(strings.TrimSpace(req.Transport))
-	if transport == "" {
-		transport = "tcp"
-	}
-	if transport != "tcp" && transport != "ws" {
-		return nil, nil, fmt.Errorf("transport 仅支持 tcp / ws(冷门传输请用 UI 创建)")
-	}
-
 	inbound := map[string]any{
-		"protocol": req.Protocol,
 		"port":     req.Port,
 		"listen":   "0.0.0.0",
 		"tag":      tag,
@@ -96,84 +105,109 @@ func buildInbound(req *buildInboundRequest) (map[string]any, map[string]any, err
 	}
 	creds := map[string]any{}
 
-	switch req.Protocol {
-	case "vless":
+	switch profile {
+	case "vless-reality-vision":
+		inbound["protocol"] = "vless"
 		uuid := orGen(req.UUID, newUUIDv4)
-		client := map[string]any{"id": uuid, "level": 0, "email": email}
-		security := def(req.Security, "reality")
-		if security == "reality" {
-			client["flow"] = "xtls-rprx-vision"
-		}
+		client := map[string]any{"id": uuid, "level": 0, "email": email, "flow": "xtls-rprx-vision"}
 		inbound["settings"] = map[string]any{"decryption": "none", "clients": []any{client}}
-		ss, c, err := buildStream(req, transport, security)
+		ss, c, err := buildStream(req, "tcp", "reality")
 		if err != nil {
 			return nil, nil, err
 		}
 		inbound["streamSettings"] = ss
 		creds = merge(c, map[string]any{"uuid": uuid, "email": email, "flow": client["flow"]})
 
-	case "vmess":
+	case "vless-xhttp-reality-xmux":
+		inbound["protocol"] = "vless"
 		uuid := orGen(req.UUID, newUUIDv4)
-		inbound["settings"] = map[string]any{"clients": []any{map[string]any{"id": uuid, "email": email}}}
-		security := def(req.Security, "none")
-		ss, c, err := buildStream(req, transport, security)
+		inbound["settings"] = map[string]any{"decryption": "none", "clients": []any{map[string]any{"id": uuid, "level": 0, "email": email}}}
+		ss, c, err := buildXHTTPRealityStream(req)
 		if err != nil {
 			return nil, nil, err
 		}
 		inbound["streamSettings"] = ss
 		creds = merge(c, map[string]any{"uuid": uuid, "email": email})
 
-	case "trojan":
+	case "anytls-shadowtls":
+		inbound["protocol"] = "anytls"
 		pw := orGen(req.Password, genPassword)
-		inbound["settings"] = map[string]any{"clients": []any{map[string]any{"password": pw, "email": email}}}
-		security := def(req.Security, "tls")
-		if security == "none" {
-			return nil, nil, fmt.Errorf("trojan 必须启用 tls(security=tls)")
-		}
-		ss, c, err := buildStream(req, transport, security)
-		if err != nil {
-			return nil, nil, err
-		}
-		inbound["streamSettings"] = ss
-		creds = merge(c, map[string]any{"password": pw, "email": email})
-
-	case "shadowsocks":
-		pw := orGen(req.Password, genSSPassword)
-		method := def(req.Method, "2022-blake3-aes-128-gcm")
-		inbound["settings"] = map[string]any{
-			"method":   method,
-			"password": pw,
-			"network":  "tcp,udp",
-			"clients":  []any{map[string]any{"password": pw, "email": email}},
-		}
-		// SS 无传输层 TLS,streamSettings 只需 network
+		inbound["settings"] = map[string]any{"users": []any{map[string]any{"password": pw, "level": 0, "email": email}}}
 		inbound["streamSettings"] = map[string]any{"network": "tcp"}
-		creds = map[string]any{"method": method, "password": pw, "email": email}
+		handshake := strings.TrimSpace(req.Dest)
+		if handshake == "" {
+			handshake = strings.TrimSpace(req.ServerName)
+		}
+		if handshake == "" {
+			return nil, nil, fmt.Errorf("AnyTLS + ShadowTLS 需要 handshake 目标(如 www.cloudflare.com:443)")
+		}
+		if !strings.Contains(handshake, ":") {
+			handshake += ":443"
+		}
+		// This extension is consumed by mmw-agent.  It is intentionally not an
+		// Xray stream setting: ShadowTLS is a separate, supervised process.
+		shadowPassword := orGen(req.Auth, genPassword)
+		inbound["mmwxShadowTLS"] = map[string]any{"enabled": true, "handshake": handshake, "password": shadowPassword, "public_port": req.Port}
+		creds = map[string]any{"password": pw, "email": email, "shadowtls_handshake": handshake, "shadowtls_password": shadowPassword}
 
-	case "hysteria2":
-		auth := orGen(req.Auth, genPassword)
-		inbound["settings"] = map[string]any{"version": 2, "clients": []any{map[string]any{"auth": auth, "email": email}}}
-		// hy2 固定 network=hysteria + tls
-		tls := map[string]any{}
-		if sni := strings.TrimSpace(req.ServerName); sni != "" {
-			tls["serverName"] = sni
+	case "mieru":
+		inbound["protocol"] = "mieru"
+		username := strings.TrimSpace(req.Email)
+		if username == "" {
+			username = email
 		}
-		if cd := strings.TrimSpace(req.CertDomain); cd != "" {
-			tls["certDomain"] = cd // 后端 resolveInboundCert 按此解析已签发证书
+		pw := orGen(req.Password, genPassword)
+		inbound["settings"] = map[string]any{"transport": "TCP", "users": []any{map[string]any{"username": username, "password": pw, "level": 0, "email": email}}}
+		inbound["streamSettings"] = map[string]any{"network": "tcp"}
+		creds = map[string]any{"username": username, "password": pw, "email": email}
+
+	case "socks5":
+		inbound["protocol"] = "socks"
+		username := strings.TrimSpace(req.Email)
+		if username == "" {
+			username = email
 		}
-		inbound["streamSettings"] = map[string]any{
-			"network":          "hysteria",
-			"security":         "tls",
-			"tlsSettings":      tls,
-			"hysteriaSettings": map[string]any{"version": 2},
-		}
-		creds = map[string]any{"auth": auth, "email": email}
+		pw := orGen(req.Password, genPassword)
+		inbound["settings"] = map[string]any{"auth": "password", "udp": true, "accounts": []any{map[string]any{"user": username, "pass": pw}}}
+		inbound["streamSettings"] = map[string]any{"network": "tcp"}
+		creds = map[string]any{"username": username, "password": pw}
 
 	default:
-		return nil, nil, fmt.Errorf("暂不支持协议 %q(仅 vless/vmess/trojan/shadowsocks/hysteria2;其它请用 UI)", req.Protocol)
+		return nil, nil, fmt.Errorf("不支持 profile %q", profile)
+	}
+	if err := ValidateManagedInbound(inbound); err != nil {
+		return nil, nil, err
 	}
 
 	return inbound, creds, nil
+}
+
+func buildXHTTPRealityStream(req *buildInboundRequest) (map[string]any, map[string]any, error) {
+	ss, creds, err := buildStream(req, "xhttp", "reality")
+	if err != nil {
+		return nil, nil, err
+	}
+	path := strings.TrimSpace(req.Path)
+	if path == "" {
+		path = "/xhttp"
+	}
+	xhttp := map[string]any{
+		"path": path,
+		"mode": "auto",
+		"xmux": map[string]any{
+			// Xray forbids setting maxConnections and maxConcurrency together.
+			"maxConcurrency":   map[string]any{"from": 4, "to": 16},
+			"cMaxReuseTimes":   map[string]any{"from": 0, "to": 0},
+			"hMaxRequestTimes": map[string]any{"from": 0, "to": 0},
+			"hMaxReusableSecs": map[string]any{"from": 0, "to": 0},
+			"hKeepAlivePeriod": 0,
+		},
+	}
+	if host := strings.TrimSpace(req.Host); host != "" {
+		xhttp["host"] = host
+	}
+	ss["xhttpSettings"] = xhttp
+	return ss, creds, nil
 }
 
 // buildStream 拼 streamSettings(传输 tcp/ws + 安全 reality/tls/none),返回 streamSettings 与该安全层生成的凭据。

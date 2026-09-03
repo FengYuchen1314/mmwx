@@ -169,7 +169,7 @@ func computeFallbackNodeOrder(ctx context.Context, repo *storage.TrafficReposito
 		return empty
 	}
 	// 找最早创建的 admin 用户(ListUsers ORDER BY created_at ASC)
-	users, err := repo.ListUsers(ctx, 1000)
+	users, err := repo.ListUsers(ctx, 0)
 	if err != nil {
 		return empty
 	}

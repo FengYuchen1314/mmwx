@@ -45,7 +45,7 @@ func registerNodeTools(s *server.MCPServer, b *bridge) {
 		mcpgo.WithString("name", mcpgo.Required(), mcpgo.Description("节点名称")),
 		mcpgo.WithNumber("server_id", mcpgo.Required(), mcpgo.Description("所属远程服务器 ID")),
 		mcpgo.WithString("inbound_tag", mcpgo.Required(), mcpgo.Description("入站 tag")),
-		mcpgo.WithString("protocol", mcpgo.Required(), mcpgo.Description("协议:vless/vmess/trojan/shadowsocks/hysteria2/anytls")),
+		mcpgo.WithString("protocol", mcpgo.Required(), mcpgo.Description("协议:vless / anytls / mieru / socks（仅受管协议目录）")),
 		mcpgo.WithObject("clash_config", mcpgo.Description("Clash 节点配置 JSON(可选,缺省由主控生成)")),
 		mcpgo.WithString("tag", mcpgo.Description("分组 tag,默认 手动输入")),
 	),

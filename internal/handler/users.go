@@ -92,7 +92,7 @@ func NewUserListHandler(repo *storage.TrafficRepository) http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		users, err := repo.ListUsers(r.Context(), 1000)
+		users, err := repo.ListUsers(r.Context(), 0)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return

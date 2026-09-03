@@ -73,7 +73,7 @@ func (b *NodeTLSFingerprintBackfiller) runOnce(ctx context.Context) (string, err
 	if b.repo == nil {
 		return "", fmt.Errorf("repository not initialized")
 	}
-	users, err := b.repo.ListUsers(ctx, 100000)
+	users, err := b.repo.ListUsers(ctx, 0)
 	if err != nil {
 		return "", err
 	}

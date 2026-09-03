@@ -114,7 +114,7 @@ func registerServerTools(s *server.MCPServer, b *bridge) {
 			return b.send(ctx, http.MethodPost, "/api/admin/remote/services/control", argsBody(req))
 		})
 
-	s.AddTool(writeTool("server_inbound_apply", "在远程服务器上新增/更新/删除一个 xray 入站。action=add/update/remove;add/update 传 inbound 对象,remove 传 tag。", true,
+	s.AddTool(writeTool("server_inbound_apply", "在远程服务器上新增/更新/删除一个受管 Xray 入站。action=add/update/remove；新增或更新只接受 VLESS+REALITY+Vision、VLESS+XHTTP+REALITY+XMUX、AnyTLS+ShadowTLS、Mieru 或 SOCKS5。", true,
 		mcpgo.WithString("server_id", mcpgo.Required(), mcpgo.Description("服务器 ID")),
 		mcpgo.WithString("action", mcpgo.Required(), mcpgo.Description("add / update / remove")),
 		mcpgo.WithObject("inbound", mcpgo.Description("入站对象(add/update 时必填)")),
@@ -128,21 +128,16 @@ func registerServerTools(s *server.MCPServer, b *bridge) {
 			return b.send(ctx, http.MethodPost, "/api/admin/remote/inbounds?server_id="+pathEscape(sid), argsBody(req, "server_id"))
 		})
 
-	// server_inbound_create:高层「加入站」—— 只给协议/端口/域名等意图,服务端拼完整配置并生成密钥,
-	// 再自动 apply 到服务器。免去 agent 复刻前端 3.8k 行配置逻辑。返回 apply 结果 + 自动生成的凭据
-	// (尤其 reality 公钥/shortId,客户端连接必须用)。冷门协议/组合仍需用 UI 或 server_inbound_apply(手拼)。
-	s.AddTool(writeTool("server_inbound_create", "在服务器上快速新增一个标准入站:只需 protocol+port(+域名/安全),服务端自动拼配置、生成密钥并下发。支持 vless(默认 reality)/vmess/trojan/shadowsocks/hysteria2,传输 tcp(默认)/ws。返回生成的连接凭据(reality 公钥等)。", false,
+	// server_inbound_create is the high-level, catalogue-only entrypoint. The
+	// controller builds every security-sensitive field rather than accepting a
+	// client-selected arbitrary transport/security combination.
+	s.AddTool(writeTool("server_inbound_create", "在服务器上快速新增一个标准入站。profile 必须是 vless-reality-vision、vless-xhttp-reality-xmux、anytls-shadowtls、mieru 或 socks5；服务端生成密钥并下发。", false,
 		mcpgo.WithString("server_id", mcpgo.Required(), mcpgo.Description("目标服务器 ID")),
-		mcpgo.WithString("protocol", mcpgo.Required(), mcpgo.Description("vless / vmess / trojan / shadowsocks / hysteria2")),
+		mcpgo.WithString("profile", mcpgo.Required(), mcpgo.Description("vless-reality-vision / vless-xhttp-reality-xmux / anytls-shadowtls / mieru / socks5")),
 		mcpgo.WithNumber("port", mcpgo.Required(), mcpgo.Description("监听端口")),
-		mcpgo.WithString("security", mcpgo.Description("reality / tls / none;留空按协议给默认(vless→reality、trojan/hy2→tls)")),
-		mcpgo.WithString("server_name", mcpgo.Description("reality 偷取目标域名(如 www.microsoft.com)或 TLS SNI")),
-		mcpgo.WithString("transport", mcpgo.Description("tcp(默认) / ws")),
-		mcpgo.WithString("dest", mcpgo.Description("reality 偷取目标 host:port,留空=server_name:443")),
-		mcpgo.WithString("path", mcpgo.Description("ws path,默认 /ws")),
-		mcpgo.WithString("host", mcpgo.Description("ws Host header(可选)")),
-		mcpgo.WithString("method", mcpgo.Description("shadowsocks 加密方法,默认 2022-blake3-aes-128-gcm")),
-		mcpgo.WithString("cert_domain", mcpgo.Description("TLS 证书域名(security=tls/hy2 时,后端按域名取已签发证书)")),
+		mcpgo.WithString("server_name", mcpgo.Description("REALITY 或 ShadowTLS 的 TLS 握手域名")),
+		mcpgo.WithString("dest", mcpgo.Description("REALITY 或 ShadowTLS 的握手目标 host:port；留空时按 server_name:443")),
+		mcpgo.WithString("path", mcpgo.Description("仅 XHTTP profile 使用；默认 /xhttp")),
 		mcpgo.WithString("tag", mcpgo.Description("入站 tag,留空自动生成")),
 	),
 		func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
@@ -174,7 +169,7 @@ func registerServerTools(s *server.MCPServer, b *bridge) {
 				"success":      true,
 				"apply_result": json.RawMessage(applyBody),
 				"credentials":  built.Credentials,
-				"tip":          "credentials 里是自动生成的连接凭据;reality 客户端必须用 reality_public_key。",
+				"tip":          "credentials 里是自动生成的连接凭据；REALITY 客户端必须使用 reality_public_key。",
 			})
 			return mcpgo.NewToolResultText(string(out)), nil
 		})

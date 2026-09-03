@@ -762,7 +762,7 @@ fi
 
 # Step 4: Download and install binary only (without starting)
 echo ""
-echo "[4/6] Downloading MMWX binary..."
+echo "[4/6] Downloading MMWX binary and ShadowTLS sidecar..."
 
 # Detect architecture
 ARCH=$(uname -m)
@@ -790,8 +790,8 @@ MIRRORS=()
 if [ -n "$CDN_BASE" ]; then
     MIRRORS+=("${CDN_BASE}/mmw-agent/mmw-agent-linux-${ARCH_NAME}")
 fi
-MIRRORS+=("https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
-MIRRORS+=("https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
+MIRRORS+=("https://github.com/FengYuchen1314/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
+MIRRORS+=("https://gh-proxy.com/https://github.com/FengYuchen1314/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}")
 
 # Download binary — 优先用 curl(更普遍),没有就用 wget;两者都没就按发行版包管理器装一个,
 # 杜绝 "wget: command not found" 噪声 / "ERROR: 都没装" 卡死。
@@ -818,6 +818,44 @@ ensure_downloader() {
     fi
 }
 ensure_downloader || exit 1
+
+# AnyTLS is fronted by ShadowTLS rather than pretending that it is an Xray
+# transport. Install the exact audited Linux binary on every fresh Agent so
+# the generated AnyTLS + ShadowTLS profile works for bare-metal deployments
+# as well as the Docker image. The hash is checked before the atomic move.
+install_shadow_tls() {
+    case "$ARCH_NAME" in
+        amd64)
+            SHADOWTLS_ASSET="shadow-tls-x86_64-unknown-linux-musl"
+            SHADOWTLS_SHA256="A173F5F2D57F45211B68E10CEEDDC15B1791077B914FA89747BC705FDDC71532"
+            ;;
+        arm64)
+            SHADOWTLS_ASSET="shadow-tls-aarch64-unknown-linux-musl"
+            SHADOWTLS_SHA256="3295476B37F549A68906519D3EAECB74BF3B6EAF9094CEBB16EE84F0151373C6"
+            ;;
+        *)
+            echo "ERROR: ShadowTLS does not support architecture $ARCH_NAME" >&2
+            return 1
+            ;;
+    esac
+    SHADOWTLS_URL="https://github.com/ihciah/shadow-tls/releases/download/v0.2.25/${SHADOWTLS_ASSET}"
+    echo "Downloading verified ShadowTLS v0.2.25..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 180 -o /tmp/shadow-tls "$SHADOWTLS_URL" || return 1
+    else
+        wget -q --connect-timeout=10 --read-timeout=180 -O /tmp/shadow-tls "$SHADOWTLS_URL" || return 1
+    fi
+    echo "${SHADOWTLS_SHA256}  /tmp/shadow-tls" | sha256sum -c - || {
+        rm -f /tmp/shadow-tls
+        echo "ERROR: ShadowTLS checksum mismatch" >&2
+        return 1
+    }
+    chmod 0755 /tmp/shadow-tls
+    mv /tmp/shadow-tls /usr/local/bin/shadow-tls
+    echo "ShadowTLS installed to /usr/local/bin/shadow-tls"
+}
+install_shadow_tls || exit 1
+
 download_ok=0
 for url in "${MIRRORS[@]}"; do
     echo "Downloading from $url ..."

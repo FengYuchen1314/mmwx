@@ -70,7 +70,7 @@ func (m *CredentialEmailMigrator) runOnce(ctx context.Context) {
 	// 它们往往跟 xray routing rule user[] 配套(改 email 会让 routed 出站规则全失效)。
 	// 先一次性拉所有用户的 (username, email),省去每行查表的开销。
 	userEmailByName := map[string]string{}
-	if users, err := m.repo.ListUsers(ctx, 10000); err == nil {
+	if users, err := m.repo.ListUsers(ctx, 0); err == nil {
 		for _, u := range users {
 			userEmailByName[u.Username] = u.Email
 		}

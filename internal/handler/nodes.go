@@ -363,18 +363,8 @@ func (h *nodesHandler) enforceLicenseIfNodeHostMatchesServer(ctx context.Context
 		return "", true
 	}
 
-	// 命中 → 检查 license 配额
-	if h.licenseManager != nil {
-		status := h.licenseManager.GetStatus()
-		maxNodes := 20
-		if status.Plan != nil {
-			maxNodes = status.Plan.MaxNodes
-		}
-		if count, cerr := h.repo.CountLicensedNodes(ctx); cerr == nil && count >= int64(maxNodes) {
-			return fmt.Sprintf("该节点指向已注册服务器 %q,需占用 license 配额,但已达上限 (%d/%d)，请升级许可证", srv.Name, count, maxNodes), false
-		}
-	}
-	// 配额内 → 自动 claim
+	// Matched managed servers are always claimed. Community builds have no
+	// node-count quota, including this direct-import path.
 	node.OriginalServer = srv.Name
 	if strings.TrimSpace(node.Tag) == "" {
 		node.Tag = fmt.Sprintf("远程:%s", srv.Name)
@@ -2645,7 +2635,7 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 		ctx := r.Context()
-		users, err := repo.ListUsers(ctx, 10000)
+		users, err := repo.ListUsers(ctx, 0)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return

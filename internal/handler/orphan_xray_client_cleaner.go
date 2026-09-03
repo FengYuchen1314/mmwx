@@ -94,7 +94,7 @@ func (c *OrphanXrayClientCleaner) runOnce(ctx context.Context) (string, error) {
 	log.Printf("[OrphanXrayClientCleaner] scan started")
 
 	// 1) 白名单收集
-	users, err := c.repo.ListUsers(ctx, 100000)
+	users, err := c.repo.ListUsers(ctx, 0)
 	if err != nil {
 		log.Printf("[OrphanXrayClientCleaner] list users failed: %v", err)
 		return "", err

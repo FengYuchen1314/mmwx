@@ -97,20 +97,6 @@ type createRoutedOutboundReq struct {
 func (h *RoutedOutboundHandler) create(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// 用 license 限 routed 出站节点总数 — 这是真正占 server xray 资源的"节点"。
-	// 同一 inbound 下 N 个 routed outbound 算 N 个,符合"路由出站节点是多个,只有一个入站,也算多个"。
-	if h.licenseManager != nil {
-		status := h.licenseManager.GetStatus()
-		maxNodes := 20
-		if status.Plan != nil {
-			maxNodes = status.Plan.MaxNodes
-		}
-		if count, cerr := h.repo.CountLicensedNodes(ctx); cerr == nil && count >= int64(maxNodes) {
-			writeJSONError(w, http.StatusForbidden, fmt.Sprintf("已达到路由出站节点数量上限 (%d/%d)，请升级许可证", count, maxNodes))
-			return
-		}
-	}
-
 	var req createRoutedOutboundReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")

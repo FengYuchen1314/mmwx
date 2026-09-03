@@ -98,18 +98,7 @@ func (h *UserRoutedOutboundHandler) create(w http.ResponseWriter, r *http.Reques
 		writeJSONError(w, http.StatusForbidden, err.Error())
 		return
 	}
-	// 2. 每日操作次数(create + delete 之和):每次操作会触发 agent 重启 xray,频次受限。
-	cfg := loadUserPermConfig(ctx, h.repo)
-	if cfg.DailyLimitRoutedOutbound > 0 {
-		usedToday, _ := h.repo.CountUserRoutedOutboundActionsToday(ctx, username)
-		if usedToday >= cfg.DailyLimitRoutedOutbound {
-			writeJSONError(w, http.StatusTooManyRequests,
-				fmt.Sprintf("今日操作次数已达上限 (%d/%d),请明天再试", usedToday, cfg.DailyLimitRoutedOutbound))
-			return
-		}
-	}
-
-	// 3. 父节点:必须存在 + 物理节点 + 有 inbound_tag + 用户可见(在套餐里 / 是自己导入的)
+	// 2. 父节点:必须存在 + 物理节点 + 有 inbound_tag + 用户可见(在套餐里 / 是自己导入的)
 	parent, err := h.repo.GetNodeByID(ctx, req.ParentNodeID)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("父节点不存在: %v", err))
@@ -323,17 +312,6 @@ func (h *UserRoutedOutboundHandler) delete(w http.ResponseWriter, r *http.Reques
 	if detail.RoutedOwner != "user" || detail.Username != username {
 		writeJSONError(w, http.StatusForbidden, "只能删除自己创建的路由出站")
 		return
-	}
-
-	// 每日操作次数限制(删除也会触发 agent 重启 xray,所以同样受限)
-	cfg := loadUserPermConfig(ctx, h.repo)
-	if cfg.DailyLimitRoutedOutbound > 0 {
-		usedToday, _ := h.repo.CountUserRoutedOutboundActionsToday(ctx, username)
-		if usedToday >= cfg.DailyLimitRoutedOutbound {
-			writeJSONError(w, http.StatusTooManyRequests,
-				fmt.Sprintf("今日操作次数已达上限 (%d/%d),请明天再试", usedToday, cfg.DailyLimitRoutedOutbound))
-			return
-		}
 	}
 
 	serverID, err := h.resolveServerIDByName(ctx, detail.OriginalServer)

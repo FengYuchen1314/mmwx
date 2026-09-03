@@ -2703,6 +2703,19 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
+	// 协议范围由服务端强制收口。前端只展示五种产品组合，但任何人都可以
+	// 直接调用本 API；在这里校验能同时覆盖新建与更新，不让旧协议绕过 UI 回流到 Agent。
+	if r.Method == http.MethodPost && inboundReq != nil {
+		action, _ := inboundReq["action"].(string)
+		if action == "" || strings.EqualFold(action, "add") {
+			inbound, _ := inboundReq["inbound"].(map[string]interface{})
+			if err := ValidateManagedInbound(inbound); err != nil {
+				remoteWriteError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+	}
+
 	// 删除 reality 入站前，先保存其 serverNames 以便后续恢复路由
 	var preDeleteRealityDomains []string
 	if r.Method == http.MethodPost && inboundReq != nil {
@@ -3448,23 +3461,6 @@ func (h *RemoteManageHandler) syncInboundsToNodes(ctx context.Context, serverID 
 		return response
 	}
 
-	// 计算本次同步允许新建 routed 节点的余额 — 防止用户绕过 RoutedOutbound.create() 走"同步入站"
-	// 路径无限新建 routed 节点。budget < 0 表示禁用限制(开发场景 / 无 license)。
-	routedBudget := -1
-	if h.licenseManager != nil {
-		status := h.licenseManager.GetStatus()
-		maxNodes := 20
-		if status.Plan != nil {
-			maxNodes = status.Plan.MaxNodes
-		}
-		if cur, cerr := h.repo.CountLicensedNodes(ctx); cerr == nil {
-			routedBudget = maxNodes - int(cur)
-			if routedBudget < 0 {
-				routedBudget = 0
-			}
-		}
-	}
-
 	// 调用方显式 override > Domain > 非私有 PullAddress > IPAddress
 	serverHost := strings.TrimSpace(serverHostOverride)
 	if serverHost == "" {
@@ -4073,13 +4069,6 @@ func (h *RemoteManageHandler) syncInboundsToNodes(ctx context.Context, serverID 
 					proxy["cipher"] = cipher
 				}
 				nodeName := fmt.Sprintf("[%s] %s · %s", server.Name, inboundTagStr, email)
-				// license 余额检查 — budget < 0 表示禁用限制,>= 0 时为本次同步还能新建的 routed 节点数
-				if routedBudget == 0 {
-					response.SkippedCount++
-					response.Errors = append(response.Errors, fmt.Sprintf("已达 license 节点上限,跳过新建 routed: %s", nodeName))
-					log.Printf("[Remote Manage] license budget exhausted, skip auto-create routed: %s", nodeName)
-					continue
-				}
 				proxy["name"] = nodeName
 				cfgJSON, err := json.Marshal(proxy)
 				if err != nil {
@@ -4113,9 +4102,6 @@ func (h *RemoteManageHandler) syncInboundsToNodes(ctx context.Context, serverID 
 				// CreateNode 没有写 node_type/parent/routed_outbound_tag,补一刀
 				if err := h.repo.MarkNodeAsRouted(ctx, created.ID, outTag, master); err != nil {
 					log.Printf("[Remote Manage] auto-create: MarkNodeAsRouted id=%d failed: %v", created.ID, err)
-				}
-				if routedBudget > 0 {
-					routedBudget--
 				}
 				existingRoutedTriple[inboundTagStr+":"+outTag] = true
 				response.SyncedCount++
@@ -4488,6 +4474,13 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 	if tunnelPort > 0 {
 		nodePort = tunnelPort
 	}
+	// AnyTLS is kept on an Agent-local loopback port when ShadowTLS fronts it.
+	// The public port is extension metadata persisted by the Agent, not the
+	// Xray inbound's port. Never publish the loopback port to subscribers.
+	shadowTLS, _ := inbound["mmwxShadowTLS"].(map[string]interface{})
+	if publicPort := toInt(shadowTLS["public_port"]); publicPort > 0 {
+		nodePort = publicPort
+	}
 
 	proxy := map[string]interface{}{
 		"name":   nodeName,
@@ -4600,6 +4593,18 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 			proxy["password"] = password
 		}
 		h.addStreamSettings(proxy, streamSettings)
+		if shadowTLS != nil && shadowTLS["enabled"] == true {
+			handshake, _ := shadowTLS["handshake"].(string)
+			shadowPassword, _ := shadowTLS["password"].(string)
+			if sni := shadowTLSSNI(handshake); sni != "" && shadowPassword != "" {
+				// Mihomo supports ShadowTLS as a TLS wrapper on an AnyTLS proxy.
+				// The client reaches the Agent's public sidecar; it never needs to
+				// know the loopback port used by the embedded Xray inbound.
+				proxy["tls"] = true
+				proxy["sni"] = sni
+				proxy["shadow-tls-opts"] = map[string]interface{}{"version": "v3", "password": shadowPassword}
+			}
+		}
 		if sn, ok := proxy["servername"]; ok {
 			proxy["sni"] = sn
 			delete(proxy, "servername")
@@ -4675,6 +4680,14 @@ func (h *RemoteManageHandler) inboundToClashProxy(inbound map[string]interface{}
 	}
 
 	return proxy, nil
+}
+
+func shadowTLSSNI(handshake string) string {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(handshake))
+	if err == nil {
+		return strings.Trim(strings.TrimSpace(host), "[]")
+	}
+	return strings.TrimSpace(strings.Split(strings.TrimSpace(handshake), ":")[0])
 }
 
 // 将流设置添加到 Clash 代理配置

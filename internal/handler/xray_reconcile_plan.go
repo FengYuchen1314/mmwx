@@ -106,14 +106,9 @@ type reconcileInputs struct {
 
 // loadReconcileInputs 一次性拉齐决策所需的一切。
 func loadReconcileInputs(ctx context.Context, repo *storage.TrafficRepository) (*reconcileInputs, error) {
-	const userLimit = 100000
-	// ⚠️ ListUsers 对 limit<=0 会静默 clamp 成 10 —— 传显式大值。
-	users, err := repo.ListUsers(ctx, userLimit)
+	users, err := repo.ListUsers(ctx, 0)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
-	}
-	if len(users) >= userLimit {
-		return nil, fmt.Errorf("user count hit limit %d, refusing to reconcile on a truncated view", userLimit)
 	}
 	nodes, err := repo.ListAllNodes(ctx)
 	if err != nil {

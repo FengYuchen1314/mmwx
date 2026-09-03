@@ -47,6 +47,8 @@ CLAUDE.md
 e2e
 MERGE_PLAN.md
 *_test.go
+!internal/handler/protocol_catalog_test.go
+!internal/handler/xray_build_inbound_test.go
 INTRODUCTION.md
 subscribes
 mmwx.db
@@ -64,4 +66,15 @@ MCP_PLAN.md
 !internal/storage/server_renewal_confirm_test.go
 !internal/handler/traffic_period_baseline_test.go
 !internal/license/ip_region_test.go
+!internal/handler/protocol_catalog_test.go
+!internal/handler/xray_build_inbound_test.go
+
+# The controller embeds this self-maintained frontend at build time. Keep the
+# source and its compiled embed assets, but never vendor node_modules.
+!web/
+!web/**
+web/node_modules/
+!internal/web/
+!internal/web/dist/
+!internal/web/dist/**
 AGENTS.md
