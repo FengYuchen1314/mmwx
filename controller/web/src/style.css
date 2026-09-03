@@ -227,11 +227,54 @@ td.right, th.right { text-align: right; }
 
 .modal-backdrop { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; padding: 22px; background: #2c1812a6; backdrop-filter: blur(3px); }
 .modal { width: min(520px, 100%); max-height: calc(100vh - 44px); overflow: auto; border: 1px solid var(--border); border-radius: 10px; padding: 21px; background: var(--card); box-shadow: 6px 7px 0 #2d18138c; }
+.modal.modal-wide { width: min(920px, 100%); }
 .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
 .modal-head h2 { margin-bottom: 5px; font-size: 17px; }
 .modal-head p { margin: 0; color: var(--muted-foreground); font-size: 10px; }
 .modal-head .btn { width: 30px; padding: 5px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; padding-top: 4px; }
+
+.operation-spinner { width: 14px; height: 14px; display: inline-block; margin-right: 7px; border: 2px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: operation-spin .7s linear infinite; }
+@keyframes operation-spin { to { transform: rotate(360deg); } }
+.card-actions, .action-strip, .row-actions, .inline-options, .agent-log-selectors { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.card-actions { width: 100%; margin-top: auto; }
+.server-card .card-actions .btn:first-child { flex: 1; }
+.server-card dl.detail-grid { width: 100%; margin: 10px 0 14px; }
+.detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.detail-grid > div { border: 1px dashed var(--border); border-radius: 6px; padding: 8px; }
+.detail-grid dt { color: var(--muted-foreground); font-size: 8px; }
+.detail-grid dd { margin: 4px 0 0; font-size: 9px; font-weight: 650; }
+.detail-panels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+.detail-panels section { min-width: 0; border: 1px dashed var(--border); border-radius: 7px; padding: 10px; background: var(--muted); }
+.detail-panels h3, .operation-section h3 { margin: 0 0 8px; font-size: 11px; }
+.detail-panels pre { max-height: 190px; margin: 0; overflow: auto; color: var(--foreground); background: transparent; font: 9px/1.55 Consolas, monospace; white-space: pre-wrap; }
+.progress-log { max-height: 260px; margin: 14px 0 0; overflow: auto; border-radius: 7px; padding: 12px; color: #ecdcd4; background: #1b1614; font: 9px/1.6 Consolas, monospace; white-space: pre-wrap; }
+.result-card { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; padding: 11px 13px; }
+.result-card code { min-width: 0; flex: 1; overflow: hidden; color: var(--foreground); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.selection, .inline-check, .inline-options label { display: inline-flex; align-items: center; gap: 7px; color: var(--muted-foreground); font-size: 10px; }
+.selection input, .inline-check input, .inline-options input, .checkbox-list input { accent-color: var(--primary); }
+.responsive-table .row-actions { justify-content: flex-end; min-width: 300px; }
+.responsive-table .row-actions .btn { padding: 5px 7px; font-size: 8px; }
+.code-editor { min-height: 120px; resize: vertical; font-family: Consolas, "SFMono-Regular", monospace; font-size: 9.5px; line-height: 1.55; tab-size: 2; }
+.checkbox-field { min-width: 0; margin: 0; border: 1px solid var(--border); border-radius: 7px; padding: 10px; }
+.checkbox-field legend { padding: 0 6px; color: var(--muted-foreground); font-size: 9px; }
+.checkbox-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; max-height: 170px; overflow: auto; }
+.checkbox-list.tall { max-height: 280px; }
+.checkbox-list label { display: flex; align-items: center; gap: 8px; min-width: 0; border-radius: 5px; padding: 6px; background: var(--muted); font-size: 9px; cursor: pointer; }
+.checkbox-list label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.checkbox-list label small { color: var(--muted-foreground); font-size: 7.5px; }
+.route-list { margin-top: 16px; }
+.divider { height: 0; margin: 17px 0; border: 0; border-top: 1px dashed var(--border); }
+.operation-section { display: grid; gap: 10px; }
+.aligned-action { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 7px; padding-bottom: 1px; }
+.generated-result { min-height: 280px; display: grid; place-content: center; justify-items: center; gap: 13px; text-align: center; }
+.generated-result code { max-width: 100%; overflow: auto; border: 1px dashed var(--border); border-radius: 6px; padding: 10px; color: var(--foreground); background: var(--muted); font-size: 9px; }
+.generated-result p { margin: 0; color: var(--muted-foreground); font-size: 9px; }
+.btn.primary, a.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--primary); border-radius: 6px; padding: 7px 10px; color: var(--primary-foreground); background: var(--primary); box-shadow: 2px 2px 0 var(--shadow); font-size: 9px; font-weight: 650; text-decoration: none; }
+a.btn.ghost { color: var(--foreground); border-color: transparent; background: transparent; box-shadow: none; }
+.log-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.agent-log-selectors select { width: auto; min-width: 120px; }
+.settings-number-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 
 .auth-shell { min-height: 100vh; display: grid; place-items: center; padding: 64px 20px; background-color: var(--background); background-image: linear-gradient(90deg, transparent 19px, color-mix(in srgb, var(--primary) 10%, transparent) 20px, transparent 21px), linear-gradient(transparent 19px, color-mix(in srgb, var(--primary) 10%, transparent) 20px, transparent 21px); background-size: 40px 40px; }
 .auth-shell::before { content: ''; position: fixed; inset: 0; pointer-events: none; background: radial-gradient(circle at center, transparent 0 190px, color-mix(in srgb, var(--background) 82%, transparent) 560px); }
@@ -295,4 +338,7 @@ td.right, th.right { text-align: right; }
   .subscription-list > div .btn { grid-column: 1 / -1; }
   .auth-card { padding: 22px 18px; }
   .language { top: 14px; right: 14px; }
+  .detail-panels, .checkbox-list, .settings-number-grid { grid-template-columns: 1fr; }
+  .log-toolbar { align-items: stretch; flex-direction: column; }
+  .responsive-table .row-actions { min-width: 250px; }
 }

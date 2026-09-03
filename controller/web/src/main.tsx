@@ -1,6 +1,7 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { api, asList, clearToken, JsonObject, publicApi, readToken, saveToken } from './api'
+import { AdvancedLibraryPage, GeneratorOperationsPage, LogsOperationsPage, NodesOperationsPage, PackagesOperationsPage, ServersOperationsPage, SettingsOperationsPage, SubscriptionsOperationsPage, UsersOperationsPage } from './operations'
 import './style.css'
 
 type Profile = { username?: string; nickname?: string; avatar_url?: string; role?: string; is_admin?: boolean }
@@ -149,17 +150,17 @@ function Shell({ profile, onLogout }: { profile: Profile; onLogout: () => void }
 
 function Route({ path, go }: { path: string; go: (path: string) => void }) {
   if (path === '/') return <Dashboard go={go}/>
-  if (path.startsWith('/xray-servers')) return <ServersPage />
-  if (path.startsWith('/nodes')) return <NodesPage go={go}/>
-  if (path.startsWith('/users')) return <UsersPage />
-  if (path.startsWith('/packages')) return <PackagesPage />
-  if (path.startsWith('/subscription')) return <SubscriptionsPage />
-  if (path.startsWith('/generator')) return <GeneratorPage />
-  if (path.startsWith('/templates')) return <LibraryPage title="模板管理" description="管理订阅转换模板" endpoint="/api/admin/templates" keys={['templates']} action="新建模板" />
-  if (path.startsWith('/subscribe-files')) return <LibraryPage title="订阅管理" description="管理本地订阅文件与外部订阅" endpoint="/api/admin/subscribe-files" keys={['files', 'subscriptions']} action="添加订阅" />
-  if (path.startsWith('/custom-rules')) return <LibraryPage title="覆写管理" description="管理 DNS、规则、规则集与脚本覆写" endpoint="/api/admin/custom-rules" keys={['rules', 'items']} action="新建覆写" />
-  if (path.startsWith('/logs')) return <LogsPage />
-  if (path.startsWith('/system-settings')) return <SettingsPage />
+  if (path.startsWith('/xray-servers')) return <ServersOperationsPage />
+  if (path.startsWith('/nodes')) return <NodesOperationsPage go={go}/>
+  if (path.startsWith('/users')) return <UsersOperationsPage />
+  if (path.startsWith('/packages')) return <PackagesOperationsPage />
+  if (path.startsWith('/subscription')) return <SubscriptionsOperationsPage />
+  if (path.startsWith('/generator')) return <GeneratorOperationsPage />
+  if (path.startsWith('/templates')) return <AdvancedLibraryPage kind="templates" />
+  if (path.startsWith('/subscribe-files')) return <AdvancedLibraryPage kind="subscribe-files" />
+  if (path.startsWith('/custom-rules')) return <AdvancedLibraryPage kind="custom-rules" />
+  if (path.startsWith('/logs')) return <LogsOperationsPage />
+  if (path.startsWith('/system-settings')) return <SettingsOperationsPage />
   return <Card><Empty title="页面不存在" text="这个地址没有对应的管理页面。" /></Card>
 }
 
