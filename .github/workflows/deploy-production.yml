@@ -26,8 +26,6 @@ jobs:
       RELEASE_VERSION: ${{ inputs.release }}
       VPS_HOST: 185.99.135.224
       VPS_USER: root
-      VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
-      VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
     steps:
       - name: Verify immutable release image
         env:
@@ -61,26 +59,64 @@ jobs:
           test "$image_revision" = "$target_commit"
 
       - name: Configure restricted deployment identity
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$VPS_SSH_PRIVATE_KEY"
-          test -n "$VPS_SSH_KNOWN_HOSTS"
+          fail() {
+            printf '::error::%s\n' "$1" >&2
+            exit 1
+          }
 
+          [[ -n "${VPS_SSH_PRIVATE_KEY:-}" ]] || fail "VPS_SSH_PRIVATE_KEY is missing"
+          [[ -n "${VPS_SSH_KNOWN_HOSTS:-}" ]] || fail "VPS_SSH_KNOWN_HOSTS is missing"
+
+          umask 077
           install -d -m 700 "$HOME/.ssh"
-          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 644 "$HOME/.ssh/known_hosts"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" | tr -d '\r' > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" | tr -d '\r' > "$HOME/.ssh/known_hosts.source"
+          unset VPS_SSH_PRIVATE_KEY VPS_SSH_KNOWN_HOSTS
 
-          ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > "$HOME/.ssh/deploy.pub"
-          test "$(ssh-keygen -lf "$HOME/.ssh/deploy.pub" -E sha256 | awk '{print $2}')" \
-            = "SHA256:mlOhHDQZoYXIz4kRLcxInElyc0hM8Ajtb9pJuJwNUzc"
+          if ! ssh-keygen -y -P '' -f "$HOME/.ssh/id_ed25519" \
+            > "$HOME/.ssh/deploy.pub" 2>/dev/null; then
+            fail "Deployment key is not a valid unencrypted OpenSSH private key"
+          fi
+          if ! ssh-keygen -lf "$HOME/.ssh/deploy.pub" -E sha256 \
+            > "$HOME/.ssh/deploy.fp" 2>/dev/null; then
+            fail "Could not fingerprint deployment public key"
+          fi
+          deploy_fp=$(awk 'NR == 1 { print $2 }' "$HOME/.ssh/deploy.fp")
+          [[ "$deploy_fp" == "SHA256:8fguQJ0v/blIBx5fpw29x2UVrE6Bli6+9SS52u/kz80" ]] || \
+            fail "Deployment key does not match the pinned identity"
 
-          ssh-keygen -F "$VPS_HOST" -f "$HOME/.ssh/known_hosts" \
-            | grep -v '^#' | head -n 1 > "$HOME/.ssh/host-key"
-          test "$(ssh-keygen -lf "$HOME/.ssh/host-key" -E sha256 | awk '{print $2}')" \
-            = "SHA256:4jVPtdkmcLxiNRxkpunrZNxiN3WWr4o4gZg7RsnoyAE"
+          if ! ssh-keygen -F "$VPS_HOST" -f "$HOME/.ssh/known_hosts.source" \
+            > "$HOME/.ssh/host.matches" 2>/dev/null; then
+            fail "known_hosts has no entry for the VPS IP used by SSH"
+          fi
+          awk 'NF >= 3 && $1 !~ /^#/ { print }' "$HOME/.ssh/host.matches" \
+            > "$HOME/.ssh/host.records"
+          [[ -s "$HOME/.ssh/host.records" ]] || fail "known_hosts contains no usable VPS host key"
+
+          : > "$HOME/.ssh/known_hosts"
+          while IFS= read -r record || [[ -n "$record" ]]; do
+            printf '%s\n' "$record" > "$HOME/.ssh/host.candidate"
+            if ssh-keygen -lf "$HOME/.ssh/host.candidate" -E sha256 \
+              > "$HOME/.ssh/host.candidate.fp" 2>/dev/null; then
+              candidate_fp=$(awk 'NR == 1 { print $2 }' "$HOME/.ssh/host.candidate.fp")
+              if [[ "$candidate_fp" == "SHA256:4jVPtdkmcLxiNRxkpunrZNxiN3WWr4o4gZg7RsnoyAE" ]]; then
+                printf '%s\n' "$record" >> "$HOME/.ssh/known_hosts"
+              fi
+            fi
+          done < "$HOME/.ssh/host.records"
+          [[ -s "$HOME/.ssh/known_hosts" ]] || \
+            fail "VPS host key does not match the pinned fingerprint"
+
+          chmod 600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          rm -f "$HOME/.ssh/known_hosts.source" "$HOME/.ssh/deploy.fp" \
+            "$HOME/.ssh/host.matches" "$HOME/.ssh/host.records" \
+            "$HOME/.ssh/host.candidate" "$HOME/.ssh/host.candidate.fp"
 
       - name: Replace controller image without replacing data
         shell: bash
