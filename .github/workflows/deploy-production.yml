@@ -1,0 +1,132 @@
+name: Deploy production VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Exact released version to deploy (for example v0.1.16)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: mmwx-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy controller to 185.99.135.224
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE: ghcr.io/fengyuchen1314/mmwx-controller
+      RELEASE_VERSION: ${{ inputs.release }}
+      VPS_HOST: 185.99.135.224
+      VPS_USER: root
+      VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+      VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+    steps:
+      - name: Verify immutable release image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^v0\.1\.[0-9]+$ ]]
+
+          target_commit=$(gh release view "$RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json targetCommitish \
+            --jq .targetCommitish)
+          test -n "$target_commit"
+
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker pull "$IMAGE:$RELEASE_VERSION"
+          docker pull "$IMAGE:latest"
+
+          release_id=$(docker image inspect --format '{{.Id}}' "$IMAGE:$RELEASE_VERSION")
+          latest_id=$(docker image inspect --format '{{.Id}}' "$IMAGE:latest")
+          test "$release_id" = "$latest_id"
+
+          image_version=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+            "$IMAGE:$RELEASE_VERSION")
+          image_revision=$(docker image inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$IMAGE:$RELEASE_VERSION")
+          test "$image_version" = "$RELEASE_VERSION"
+          test "$image_revision" = "$target_commit"
+
+      - name: Configure restricted deployment identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VPS_SSH_PRIVATE_KEY"
+          test -n "$VPS_SSH_KNOWN_HOSTS"
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+          ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > "$HOME/.ssh/deploy.pub"
+          test "$(ssh-keygen -lf "$HOME/.ssh/deploy.pub" -E sha256 | awk '{print $2}')" \
+            = "SHA256:mlOhHDQZoYXIz4kRLcxInElyc0hM8Ajtb9pJuJwNUzc"
+
+          ssh-keygen -F "$VPS_HOST" -f "$HOME/.ssh/known_hosts" \
+            | grep -v '^#' | head -n 1 > "$HOME/.ssh/host-key"
+          test "$(ssh-keygen -lf "$HOME/.ssh/host-key" -E sha256 | awk '{print $2}')" \
+            = "SHA256:4jVPtdkmcLxiNRxkpunrZNxiN3WWr4o4gZg7RsnoyAE"
+
+      - name: Replace controller image without replacing data
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -T -i "$HOME/.ssh/id_ed25519" \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o PasswordAuthentication=no \
+            -o KbdInteractiveAuthentication=no \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            -o ConnectTimeout=15 \
+            "$VPS_USER@$VPS_HOST"
+
+      - name: Verify public application and bundled assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://testpanel.anylocate.cc
+          work_dir=$(mktemp -d)
+          trap 'rm -rf "$work_dir"' EXIT
+
+          curl --fail --silent --show-error --retry 8 --retry-all-errors \
+            "$base/healthz?deploy=$RELEASE_VERSION" > "$work_dir/health"
+          grep -qx 'ok' "$work_dir/health"
+
+          curl --fail --silent --show-error --retry 8 --retry-all-errors \
+            -H 'Cache-Control: no-cache' \
+            "$base/?deploy=$RELEASE_VERSION" > "$work_dir/index.html"
+          grep -q '<div id="root"></div>' "$work_dir/index.html"
+          ! grep -Eq 'index-(BKLyFMPo|gUVMLJR4)\.(css|js)' "$work_dir/index.html"
+
+          mapfile -t assets < <(grep -oE '(src|href)="/assets/[^"]+"' "$work_dir/index.html" \
+            | cut -d '"' -f 2 | sort -u)
+          test "${#assets[@]}" -ge 2
+          for asset in "${assets[@]}"; do
+            curl --fail --silent --show-error --retry 5 --retry-all-errors \
+              -o /dev/null "$base$asset"
+          done
+
+          curl --fail --silent --show-error --retry 5 --retry-all-errors \
+            "$base/login?deploy=$RELEASE_VERSION" > "$work_dir/login.html"
+          grep -q '<div id="root"></div>' "$work_dir/login.html"
+
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            "$base/assets/__deployment_missing__.js")" = 404
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            "$base/api/__deployment_missing__)" = 404

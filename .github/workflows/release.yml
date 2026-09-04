@@ -46,6 +46,8 @@ jobs:
           cache-dependency-path: controller/web/package-lock.json
       - name: Build controller frontend
         working-directory: controller/web
+        env:
+          VITE_SOURCE_REVISION: ${{ github.sha }}
         run: |
           npm ci --no-audit --no-fund
           npm run build
@@ -181,6 +183,8 @@ jobs:
       - name: Build controller web UI
         if: matrix.component == 'controller'
         working-directory: controller/web
+        env:
+          VITE_SOURCE_REVISION: ${{ github.sha }}
         run: |
           npm ci --no-audit --no-fund
           npm run build
@@ -242,11 +246,14 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
           build-args: |
             MMWX_VERSION=${{ needs.validate.outputs.runtime_version }}
+            MMWX_SOURCE_REVISION=${{ github.sha }}
           tags: |
             ghcr.io/fengyuchen1314/mmwx-${{ matrix.component }}:${{ needs.validate.outputs.version }}
             ghcr.io/fengyuchen1314/mmwx-${{ matrix.component }}:latest
           labels: |
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/FengYuchen1314/mmwx
 
   release:
     name: Create GitHub Release

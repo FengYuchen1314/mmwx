@@ -18,7 +18,7 @@ VERSION="${1:-}"
 
 if [ -z "$VERSION" ]; then
     # 没传参 → 从 version.go 读现有版本(用于 build.sh 启动时的幂等同步)
-    VERSION=$(grep 'const Version' "${PROJECT_ROOT}/internal/version/version.go" | sed -n 's/.*"\(.*\)".*/\1/p')
+    VERSION=$(grep -E '^(const|var) Version' "${PROJECT_ROOT}/internal/version/version.go" | sed -n 's/.*"\(.*\)".*/\1/p')
     if [ -z "$VERSION" ]; then
         echo "❌ 无法从 internal/version/version.go 读取版本号"
         exit 1
@@ -28,7 +28,7 @@ fi
 echo "同步版本号: $VERSION"
 
 # 更新 internal/version/version.go(传参时是写入新版本,无参时是无操作覆盖)
-sed -i "s/const Version = \".*\"/const Version = \"$VERSION\"/" "${PROJECT_ROOT}/internal/version/version.go"
+sed -i -E "s/^(const|var) Version = \".*\"/var Version = \"$VERSION\"/" "${PROJECT_ROOT}/internal/version/version.go"
 echo "✓ internal/version/version.go"
 
 # 更新 install.sh

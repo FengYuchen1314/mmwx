@@ -176,9 +176,11 @@ func (h *debugHandler) handleDisable(w http.ResponseWriter, r *http.Request, use
 	}
 
 	if !settings.DebugEnabled {
-		respondJSON(w, http.StatusOK, map[string]any{
+		response := map[string]any{
 			"status": "already_disabled",
-		})
+		}
+		h.attachDebugDownload(response, settings.DebugLogPath)
+		respondJSON(w, http.StatusOK, response)
 		return
 	}
 
@@ -222,7 +224,9 @@ func (h *debugHandler) handleStatus(w http.ResponseWriter, r *http.Request, user
 			settings.DebugStartedAt = nil
 			_ = h.repo.UpsertUserSettings(r.Context(), settings)
 			logger.Info("[Debug日志] 已清理超时残留", "user", username)
-			respondJSON(w, http.StatusOK, map[string]any{"enabled": false})
+			response := map[string]any{"enabled": false}
+			h.attachDebugDownload(response, settings.DebugLogPath)
+			respondJSON(w, http.StatusOK, response)
 			return
 		}
 	}
@@ -245,8 +249,26 @@ func (h *debugHandler) handleStatus(w http.ResponseWriter, r *http.Request, user
 			response["duration"] = formatDuration(duration)
 		}
 	}
+	if !settings.DebugEnabled {
+		h.attachDebugDownload(response, settings.DebugLogPath)
+	}
 
 	respondJSON(w, http.StatusOK, response)
+}
+
+func (h *debugHandler) attachDebugDownload(response map[string]any, logPath string) {
+	if strings.TrimSpace(logPath) == "" {
+		return
+	}
+	filename := filepath.Base(logPath)
+	filePath := filepath.Join(h.logManager.BaseDir, filename)
+	info, err := os.Stat(filePath)
+	if err != nil || info.IsDir() {
+		return
+	}
+	response["log_path"] = logPath
+	response["file_size"] = formatFileSize(info.Size())
+	response["download_url"] = fmt.Sprintf("/api/user/debug/download?file=%s", filename)
 }
 
 func (h *debugHandler) handleDownload(w http.ResponseWriter, r *http.Request, username string) {

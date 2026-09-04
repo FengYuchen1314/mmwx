@@ -2,6 +2,9 @@
 # writes its output to /app/internal/web/dist, ready for go:embed below.
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS frontend-builder
 
+ARG MMWX_SOURCE_REVISION=dev
+ENV VITE_SOURCE_REVISION=$MMWX_SOURCE_REVISION
+
 WORKDIR /app/web
 
 COPY web/package.json web/package-lock.json ./
@@ -10,6 +13,7 @@ RUN npm ci --no-audit --no-fund
 # Copy only project inputs so a developer's host node_modules (especially from
 # Windows) can never overwrite the Linux dependencies installed above.
 COPY web/index.html web/tsconfig.json web/vite.config.ts ./
+COPY web/scripts/ ./scripts/
 COPY web/src/ ./src/
 RUN npm run build
 

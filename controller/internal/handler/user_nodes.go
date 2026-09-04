@@ -12,8 +12,8 @@ import (
 )
 
 type UserNodesHandler struct {
-	repo          *storage.TrafficRepository
-	remoteManage  *RemoteManageHandler
+	repo         *storage.TrafficRepository
+	remoteManage *RemoteManageHandler
 }
 
 func NewUserNodesHandler(repo *storage.TrafficRepository, rm *RemoteManageHandler) *UserNodesHandler {
@@ -245,6 +245,10 @@ func (h *UserNodesHandler) handleRemoveOutbound(w http.ResponseWriter, r *http.R
 		writeJSONError(w, http.StatusNotFound, "出站记录不存在")
 		return
 	}
+	if existing.InboundTag != node.InboundTag {
+		writeJSONError(w, http.StatusForbidden, "节点与出站记录不匹配")
+		return
+	}
 
 	// 获取用户 email 用于匹配路由规则
 	email, _ := h.getUserEmailForInbound(ctx, username, serverID, node.InboundTag)
@@ -294,20 +298,23 @@ func (h *UserNodesHandler) HandleListOutbounds(w http.ResponseWriter, r *http.Re
 	}
 
 	type outboundInfo struct {
-		ID           int64                  `json:"id"`
-		ServerID     int64                  `json:"server_id"`
-		InboundTag   string                 `json:"inbound_tag"`
-		OutboundTag  string                 `json:"outbound_tag"`
-		Outbound     map[string]interface{} `json:"outbound"`
-		CreatedAt    string                 `json:"created_at"`
+		ID          int64                  `json:"id"`
+		NodeID      int64                  `json:"node_id"`
+		ServerID    int64                  `json:"server_id"`
+		InboundTag  string                 `json:"inbound_tag"`
+		OutboundTag string                 `json:"outbound_tag"`
+		Outbound    map[string]interface{} `json:"outbound"`
+		CreatedAt   string                 `json:"created_at"`
 	}
 
+	nodeIDs := h.userOutboundNodeIndex(ctx, username)
 	var items []outboundInfo
 	for _, o := range outbounds {
 		var outboundConfig map[string]interface{}
 		json.Unmarshal([]byte(o.OutboundJSON), &outboundConfig)
 		items = append(items, outboundInfo{
 			ID:          o.ID,
+			NodeID:      nodeIDs[outboundNodeKey(o.ServerID, o.InboundTag)],
 			ServerID:    o.ServerID,
 			InboundTag:  o.InboundTag,
 			OutboundTag: o.OutboundTag,
@@ -321,6 +328,41 @@ func (h *UserNodesHandler) HandleListOutbounds(w http.ResponseWriter, r *http.Re
 		"success":   true,
 		"outbounds": items,
 	})
+}
+
+func outboundNodeKey(serverID int64, inboundTag string) string {
+	return fmt.Sprintf("%d\x00%s", serverID, inboundTag)
+}
+
+// userOutboundNodeIndex returns a package node that can authorize deletion for
+// each server/inbound pair. User outbounds are stored against that pair rather
+// than a concrete node ID, so returning the mapping prevents clients from
+// guessing incorrectly when different servers reuse the same inbound tag.
+func (h *UserNodesHandler) userOutboundNodeIndex(ctx context.Context, username string) map[string]int64 {
+	result := make(map[string]int64)
+	user, err := h.repo.GetUser(ctx, username)
+	if err != nil || user.PackageID == 0 {
+		return result
+	}
+	pkg, err := h.repo.GetPackage(ctx, user.PackageID)
+	if err != nil {
+		return result
+	}
+	for _, nodeID := range pkg.Nodes {
+		node, err := h.repo.GetNodeByID(ctx, nodeID)
+		if err != nil || node.InboundTag == "" || node.OriginalServer == "" {
+			continue
+		}
+		server, err := h.repo.GetRemoteServerByName(ctx, node.OriginalServer)
+		if err != nil {
+			continue
+		}
+		key := outboundNodeKey(server.ID, node.InboundTag)
+		if _, exists := result[key]; !exists {
+			result[key] = node.ID
+		}
+	}
+	return result
 }
 
 // validateNodeAccess 校验节点属于用户套餐，返回节点信息和服务器ID
