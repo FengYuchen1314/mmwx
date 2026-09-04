@@ -126,8 +126,8 @@ func NewTempSubscriptionHandler(repo *storage.TrafficRepository) http.Handler {
 }
 
 func (h *TempSubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 权限:admin 直接放行;普通用户必须节点管理(nodes 页面)对其开放,
-	// 跟节点页"生成临时订阅"按钮的可见性保持一致 — 后端是 source of truth。
+	// 权限:admin 直接放行;普通用户需要生成订阅(generator)页面权限。
+	// 兼容旧前端曾把入口放在节点管理页的策略,已有 nodes 权限也继续放行。
 	ctx := r.Context()
 	username := auth.UsernameFromContext(ctx)
 	if username == "" {
@@ -138,13 +138,13 @@ func (h *TempSubscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		cfg := loadUserPermConfig(ctx, h.repo)
 		allowed := false
 		for _, p := range cfg.Pages {
-			if p == "nodes" {
+			if p == "generator" || p == "nodes" {
 				allowed = true
 				break
 			}
 		}
 		if !allowed {
-			writeError(w, http.StatusForbidden, errors.New("无权限:请联系管理员在妙妙屋功能中开启节点管理"))
+			writeError(w, http.StatusForbidden, errors.New("无权限:请联系管理员在妙妙屋功能中开启生成订阅"))
 			return
 		}
 	}

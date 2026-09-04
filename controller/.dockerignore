@@ -10,6 +10,9 @@ LICENSE
 # Build artifacts
 build/
 dist/
+internal/web/dist/
+web/node_modules/
+web/.vite/
 *.exe
 server
 

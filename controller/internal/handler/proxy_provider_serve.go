@@ -2,17 +2,20 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"miaomiaowux/internal/logger"
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"miaomiaowux/internal/logger"
 	"miaomiaowux/internal/storage"
+	"miaomiaowux/internal/util"
 
 	"github.com/MMWOrg/mmwX-plugins/proxyparser"
 	"gopkg.in/yaml.v3"
@@ -43,7 +46,114 @@ var subscriptionCache = sync.Map{} // map[string]*subscriptionCacheEntry (url ->
 
 // 失效指定URL的订阅内容缓存
 func InvalidateSubscriptionContentCache(url string) {
-	subscriptionCache.Delete(url)
+	prefix := strings.TrimSpace(url) + "\x00"
+	subscriptionCache.Range(func(key, _ any) bool {
+		if value, ok := key.(string); ok && strings.HasPrefix(value, prefix) {
+			subscriptionCache.Delete(key)
+		}
+		return true
+	})
+}
+
+// ProxyProviderServeHandler serves the server-processed ("mmw") form of a
+// Clash proxy-provider. The copied URL carries the stable subscription token;
+// login sessions and API tokens are deliberately not accepted here.
+type ProxyProviderServeHandler struct {
+	repo  *storage.TrafficRepository
+	fetch func(*storage.ExternalSubscription, *storage.ProxyProviderConfig) ([]byte, error)
+}
+
+// NewProxyProviderServeHandler handles GET
+// /api/proxy-provider/{config_id}?token={subscription_token}.
+func NewProxyProviderServeHandler(repo *storage.TrafficRepository) http.Handler {
+	if repo == nil {
+		panic("proxy provider serve handler requires repository")
+	}
+	return &ProxyProviderServeHandler{repo: repo, fetch: FetchAndFilterProxiesYAML}
+}
+
+func (h *ProxyProviderServeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("only GET is supported"))
+		return
+	}
+
+	const prefix = "/api/proxy-provider/"
+	rawID, ok := strings.CutPrefix(r.URL.Path, prefix)
+	if !ok || rawID == "" || strings.Contains(rawID, "/") {
+		writeError(w, http.StatusBadRequest, errors.New("invalid proxy provider path"))
+		return
+	}
+	configID, err := strconv.ParseInt(rawID, 10, 64)
+	if err != nil || configID <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("invalid proxy provider id"))
+		return
+	}
+
+	token := strings.TrimSpace(r.URL.Query().Get("token"))
+	username, tokenErr := h.repo.ValidateUserToken(r.Context(), token)
+	if tokenErr != nil || strings.TrimSpace(username) == "" {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid subscription token"))
+		return
+	}
+
+	settings, err := h.repo.GetUserSettings(r.Context(), username)
+	if err != nil {
+		// enable_proxy_provider has always defaulted to false in both the DB
+		// schema and the user-config response. A historical user without a
+		// settings row therefore remains opted out until they explicitly enable
+		// the feature.
+		if errors.Is(err, storage.ErrUserSettingsNotFound) {
+			writeError(w, http.StatusNotFound, errors.New("proxy provider not found"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !settings.EnableProxyProvider {
+		// Match missing and foreign provider IDs so a disabled account cannot
+		// use this endpoint to enumerate existing sequential config IDs.
+		writeError(w, http.StatusNotFound, errors.New("proxy provider not found"))
+		return
+	}
+
+	config, err := h.repo.GetProxyProviderConfig(r.Context(), configID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// Return the same response for a missing config and a config owned by
+	// another account so sequential IDs cannot be used for discovery.
+	if config == nil || config.Username != username {
+		writeError(w, http.StatusNotFound, errors.New("proxy provider config not found"))
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(config.ProcessMode)) != "mmw" {
+		writeError(w, http.StatusBadRequest, errors.New("proxy provider is configured for client-side processing"))
+		return
+	}
+
+	sub, err := h.repo.GetExternalSubscription(r.Context(), config.ExternalSubscriptionID, username)
+	if err != nil {
+		if errors.Is(err, storage.ErrExternalSubscriptionNotFound) {
+			writeError(w, http.StatusNotFound, errors.New("external subscription not found"))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	content, err := h.fetch(&sub, config)
+	if err != nil {
+		logger.Warn("[ProxyProviderServe] failed to build provider", "config_id", configID, "error", err)
+		writeError(w, http.StatusBadGateway, errors.New("failed to fetch or process external subscription"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
 }
 
 // 查询 IP 的国家代码
@@ -96,7 +206,20 @@ func getGeoIPCountryCode(ipOrHost string) string {
 
 // 通过缓存获取订阅内容（5 分钟 TTL）
 func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error) {
-	cacheKey := sub.URL
+	return fetchSubscriptionContentWithHeaders(sub, "")
+}
+
+func fetchSubscriptionContentWithHeaders(sub *storage.ExternalSubscription, rawHeaders string) ([]byte, error) {
+	if sub == nil {
+		return nil, errors.New("external subscription is required")
+	}
+	userAgent := strings.TrimSpace(sub.UserAgent)
+	if userAgent == "" {
+		userAgent = "clash-meta/2.4.0"
+	}
+	// The same URL can return account-specific data according to User-Agent or
+	// Authorization. Keep those variants isolated in the in-memory cache.
+	cacheKey := strings.TrimSpace(sub.URL) + "\x00" + userAgent + "\x00" + strings.TrimSpace(rawHeaders)
 
 	// 检查缓存
 	if cached, ok := subscriptionCache.Load(cacheKey); ok {
@@ -122,11 +245,10 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	userAgent := sub.UserAgent
-	if userAgent == "" {
-		userAgent = "clash-meta/2.4.0"
-	}
 	req.Header.Set("User-Agent", userAgent)
+	if err := applyProxyProviderRequestHeaders(req, rawHeaders); err != nil {
+		return nil, err
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -151,6 +273,61 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 	})
 
 	return body, nil
+}
+
+func applyProxyProviderRequestHeaders(req *http.Request, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var values map[string]any
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return fmt.Errorf("invalid provider header json: %w", err)
+	}
+	if values == nil || len(values) > 32 {
+		return errors.New("provider header must be a JSON object with at most 32 fields")
+	}
+	blocked := map[string]struct{}{
+		"Connection": {}, "Content-Length": {}, "Host": {}, "Proxy-Connection": {},
+		"Te": {}, "Trailer": {}, "Transfer-Encoding": {}, "Upgrade": {},
+	}
+	totalBytes := 0
+	for key, rawValue := range values {
+		key = http.CanonicalHeaderKey(strings.TrimSpace(key))
+		if key == "" {
+			continue
+		}
+		if _, denied := blocked[key]; denied {
+			return fmt.Errorf("provider request header %s is not allowed", key)
+		}
+		var items []string
+		switch value := rawValue.(type) {
+		case string:
+			items = []string{value}
+		case []any:
+			for _, item := range value {
+				text, ok := item.(string)
+				if !ok {
+					return fmt.Errorf("provider request header %s must contain strings", key)
+				}
+				items = append(items, text)
+			}
+		default:
+			return fmt.Errorf("provider request header %s must be a string or string array", key)
+		}
+		for index, value := range items {
+			totalBytes += len(key) + len(value)
+			if len(value) > 8192 || totalBytes > 32768 {
+				return errors.New("provider request headers are too large")
+			}
+			if index == 0 {
+				req.Header.Set(key, value)
+			} else {
+				req.Header.Add(key, value)
+			}
+		}
+	}
+	return nil
 }
 
 // preprocessSubscriptionContent 预处理订阅内容。
@@ -395,4 +572,140 @@ func checkFilterMatches(sub *storage.ExternalSubscription, filter, excludeFilter
 
 	logger.Info("[checkFilterMatches] 匹配结果", "filter", filter, "geo_ip_filter", geoIPFilter, "match_count", matchCount)
 	return matchCount, nil
+}
+
+// FetchAndFilterProxiesYAML fetches one owned external subscription and emits
+// the compact document format required by a Clash proxy-provider.
+func FetchAndFilterProxiesYAML(sub *storage.ExternalSubscription, config *storage.ProxyProviderConfig) ([]byte, error) {
+	if sub == nil || config == nil {
+		return nil, errors.New("subscription and provider config are required")
+	}
+	body, err := fetchSubscriptionContentWithHeaders(sub, config.Header)
+	if err != nil {
+		return nil, err
+	}
+	body, err = preprocessSubscriptionContent(body)
+	if err != nil {
+		return nil, fmt.Errorf("preprocess subscription content: %w", err)
+	}
+
+	var root yaml.Node
+	if err := yaml.Unmarshal(body, &root); err != nil {
+		return nil, fmt.Errorf("parse subscription yaml: %w", err)
+	}
+	proxies := findProxiesNode(&root)
+	if proxies == nil || proxies.Kind != yaml.SequenceNode {
+		return nil, errors.New("subscription contains no proxies list")
+	}
+
+	filtered, err := filterProxyProviderNodes(proxies, config)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyProxyProviderOverrides(filtered, config.Override); err != nil {
+		return nil, err
+	}
+	for index, proxy := range filtered.Content {
+		if proxy.Kind == yaml.MappingNode {
+			filtered.Content[index] = util.ReorderProxyNode(proxy)
+		}
+	}
+
+	output := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{
+		Kind: yaml.MappingNode,
+		Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Value: "proxies"},
+			filtered,
+		},
+	}}}
+	encoded, err := MarshalYAMLWithIndent(output)
+	if err != nil {
+		return nil, fmt.Errorf("encode proxy provider yaml: %w", err)
+	}
+	return []byte(RemoveUnicodeEscapeQuotes(string(encoded))), nil
+}
+
+func filterProxyProviderNodes(proxies *yaml.Node, config *storage.ProxyProviderConfig) (*yaml.Node, error) {
+	result := &yaml.Node{Kind: yaml.SequenceNode, Content: make([]*yaml.Node, 0, len(proxies.Content))}
+
+	var include, exclude *regexp.Regexp
+	var err error
+	if pattern := strings.TrimSpace(config.Filter); pattern != "" {
+		include, err = regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid include filter: %w", err)
+		}
+	}
+	if pattern := strings.TrimSpace(config.ExcludeFilter); pattern != "" {
+		exclude, err = regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid exclude filter: %w", err)
+		}
+	}
+
+	excludedTypes := make(map[string]struct{})
+	for _, proxyType := range strings.Split(config.ExcludeType, ",") {
+		if proxyType = strings.ToLower(strings.TrimSpace(proxyType)); proxyType != "" {
+			excludedTypes[proxyType] = struct{}{}
+		}
+	}
+	geoCountries := make(map[string]struct{})
+	for _, country := range strings.Split(config.GeoIPFilter, ",") {
+		if country = strings.ToUpper(strings.TrimSpace(country)); country != "" {
+			geoCountries[country] = struct{}{}
+		}
+	}
+
+	for _, proxy := range proxies.Content {
+		if proxy.Kind != yaml.MappingNode {
+			continue
+		}
+		name := util.GetNodeFieldValue(proxy, "name")
+		if exclude != nil && exclude.MatchString(name) {
+			continue
+		}
+		if _, blocked := excludedTypes[strings.ToLower(util.GetNodeFieldValue(proxy, "type"))]; blocked {
+			continue
+		}
+
+		nameMatched := include != nil && include.MatchString(name)
+		geoMatched := false
+		if len(geoCountries) > 0 {
+			country := getGeoIPCountryCode(util.GetNodeFieldValue(proxy, "server"))
+			_, geoMatched = geoCountries[country]
+		}
+		if include != nil || len(geoCountries) > 0 {
+			if !nameMatched && !geoMatched {
+				continue
+			}
+		}
+		result.Content = append(result.Content, proxy)
+	}
+	return result, nil
+}
+
+func applyProxyProviderOverrides(proxies *yaml.Node, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var overrides map[string]any
+	if err := json.Unmarshal([]byte(raw), &overrides); err != nil {
+		return fmt.Errorf("invalid provider override json: %w", err)
+	}
+	if overrides == nil {
+		return errors.New("provider override must be a JSON object")
+	}
+	for _, proxy := range proxies.Content {
+		if proxy.Kind != yaml.MappingNode {
+			continue
+		}
+		for key, value := range overrides {
+			key = strings.TrimSpace(key)
+			if key != "" {
+				util.SetNodeField(proxy, key, value)
+			}
+		}
+	}
+	return nil
 }

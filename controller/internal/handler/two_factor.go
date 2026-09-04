@@ -85,17 +85,32 @@ func NewRecoveryLoginHandler(tokens *auth.TokenStore, repo *storage.TrafficRepos
 			return
 		}
 
-		valid, _ := auth.ValidateRecoveryCode(payload.RecoveryCode, hashedCodes)
+		valid, remainingCodes := auth.ValidateRecoveryCode(payload.RecoveryCode, hashedCodes)
 		if !valid {
 			writeError(w, http.StatusUnauthorized, errors.New("invalid recovery code"))
 			return
 		}
 
-		tfStore.Consume(payload.TwoFactorToken)
-
-		if err := repo.DisableUserTOTP(r.Context(), username); err != nil {
-			logger.Warn("[2FA] 恢复码重设失败", "username", username, "error", err)
+		remainingJSON, err := json.Marshal(remainingCodes)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
+		consumed, err := repo.ConsumeUserRecoveryCodes(r.Context(), username, user.RecoveryCodes, string(remainingJSON))
+		if err != nil {
+			logger.Warn("[2FA] 恢复码消费失败", "username", username, "error", err)
+			writeError(w, http.StatusInternalServerError, errors.New("failed to consume recovery code"))
+			return
+		}
+		if !consumed {
+			// Another request changed the recovery-code set after it was read.
+			// Treat the code as invalid so a one-time code can never create two
+			// sessions under concurrent use.
+			writeError(w, http.StatusUnauthorized, errors.New("invalid recovery code"))
+			return
+		}
+
+		tfStore.Consume(payload.TwoFactorToken)
 
 		issueLoginSession(w, r, tokens, repo, user, rememberMe)
 	})

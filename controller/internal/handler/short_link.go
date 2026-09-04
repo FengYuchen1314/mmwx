@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,25 @@ type shortLinkHandler struct {
 	repo                *storage.TrafficRepository
 	subscriptionHandler *SubscriptionHandler
 	packageHandler      http.Handler
+}
+
+// shortLinksGloballyEnabled and userShortLinksEnabled are intentionally
+// fail-closed. A disabled switch (or an unreadable setting) must not leave an
+// already-issued /x/{code} usable.
+func shortLinksGloballyEnabled(ctx context.Context, repo *storage.TrafficRepository) bool {
+	if repo == nil {
+		return false
+	}
+	cfg, err := repo.GetSystemConfig(ctx)
+	return err == nil && cfg.EnableShortLink
+}
+
+func userShortLinksEnabled(ctx context.Context, repo *storage.TrafficRepository, username string) bool {
+	if repo == nil || strings.TrimSpace(username) == "" {
+		return false
+	}
+	settings, err := repo.GetUserSettings(ctx, username)
+	return err == nil && settings.EnableShortLink
 }
 
 func NewShortLinkHandler(repo *storage.TrafficRepository, subscriptionHandler *SubscriptionHandler, packageHandler http.Handler) *shortLinkHandler {
@@ -46,11 +66,14 @@ func (h *shortLinkHandler) TryServe(w http.ResponseWriter, r *http.Request) bool
 	}
 
 	ctx := r.Context()
+	if !shortLinksGloballyEnabled(ctx, h.repo) {
+		return false
+	}
 
 	// 新逻辑：直接用 code 查 subscribe_files 表（custom_short_code 或 file_short_code）
 	if sf, err := h.repo.GetSubscribeFileByShortCode(ctx, code); err == nil {
 		username := sf.CreatedBy
-		if username == "" {
+		if username == "" || !userShortLinksEnabled(ctx, h.repo, username) {
 			return false
 		}
 
@@ -115,6 +138,9 @@ func (h *shortLinkHandler) TryServe(w http.ResponseWriter, r *http.Request) bool
 	}
 
 	if !matched {
+		return false
+	}
+	if !userShortLinksEnabled(ctx, h.repo, username) {
 		return false
 	}
 

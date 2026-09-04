@@ -405,6 +405,22 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
+	if req.ChallengeMode == storage.CertChallengeDNS {
+		if req.DNSProviderID <= 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "DNS 验证必须选择 DNS 凭据"})
+			return
+		}
+		dnsProvider, dnsErr := h.repo.GetDNSProvider(ctx, req.DNSProviderID)
+		if dnsErr != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "所选 DNS 凭据不存在"})
+			return
+		}
+		var credentials map[string]string
+		if json.Unmarshal([]byte(dnsProvider.Credentials), &credentials) != nil || acme.ValidateDNSCredentials(dnsProvider.ProviderType, credentials) != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "所选 DNS 凭据无效，请重新保存"})
+			return
+		}
+	}
 
 	// 检查现有证书
 	existing, err := h.repo.GetCertificateByDomain(ctx, req.Domain, req.RemoteServerID)
@@ -1310,6 +1326,39 @@ type DNSProviderRequest struct {
 	Credentials  string `json:"credentials"` // JSON 字符串
 }
 
+type dnsProviderResponse struct {
+	ID                int64     `json:"id"`
+	Name              string    `json:"name"`
+	ProviderType      string    `json:"provider_type"`
+	CredentialsStored bool      `json:"credentials_stored"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+func safeDNSProvider(provider storage.DNSProvider) dnsProviderResponse {
+	return dnsProviderResponse{
+		ID: provider.ID, Name: provider.Name, ProviderType: provider.ProviderType,
+		CredentialsStored: strings.TrimSpace(provider.Credentials) != "",
+		CreatedAt:         provider.CreatedAt, UpdatedAt: provider.UpdatedAt,
+	}
+}
+
+func validateDNSProviderRequest(req *DNSProviderRequest) error {
+	req.Name = strings.TrimSpace(req.Name)
+	req.ProviderType = strings.ToLower(strings.TrimSpace(req.ProviderType))
+	if req.Name == "" || req.ProviderType == "" || strings.TrimSpace(req.Credentials) == "" {
+		return fmt.Errorf("名称、类型和凭证不能为空")
+	}
+	var credentials map[string]string
+	if err := json.Unmarshal([]byte(req.Credentials), &credentials); err != nil {
+		return fmt.Errorf("凭证必须是字符串键值组成的有效 JSON")
+	}
+	if err := acme.ValidateDNSCredentials(req.ProviderType, credentials); err != nil {
+		return fmt.Errorf("DNS 凭证与服务商不匹配: %v", err)
+	}
+	return nil
+}
+
 // 处理 GET /api/admin/dns-providers
 func (h *CertificateHandler) ListDNSProviders(w http.ResponseWriter, r *http.Request) {
 	if !h.requireAdmin(r) {
@@ -1326,7 +1375,11 @@ func (h *CertificateHandler) ListDNSProviders(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	respondJSON(w, http.StatusOK, map[string]any{"success": true, "providers": providers})
+	safeProviders := make([]dnsProviderResponse, 0, len(providers))
+	for _, provider := range providers {
+		safeProviders = append(safeProviders, safeDNSProvider(provider))
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"success": true, "providers": safeProviders})
 }
 
 // 处理 POST /api/admin/dns-providers
@@ -1342,8 +1395,8 @@ func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if req.Name == "" || req.ProviderType == "" || req.Credentials == "" {
-		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "名称、类型和凭证不能为空"})
+	if err := validateDNSProviderRequest(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
 		return
 	}
 
@@ -1361,7 +1414,7 @@ func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	respondJSON(w, http.StatusOK, map[string]any{"success": true, "provider": p})
+	respondJSON(w, http.StatusOK, map[string]any{"success": true, "provider": safeDNSProvider(*p)})
 }
 
 // 处理 PUT /api/admin/dns-providers/{id}
@@ -1381,6 +1434,10 @@ func (h *CertificateHandler) UpdateDNSProvider(w http.ResponseWriter, r *http.Re
 	var req DNSProviderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "无效的请求数据"})
+		return
+	}
+	if err := validateDNSProviderRequest(&req); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
 		return
 	}
 

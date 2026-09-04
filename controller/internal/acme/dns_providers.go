@@ -23,6 +23,38 @@ var DNSProviderEnvKeys = map[string][]string{
 	"godaddy":      {"GODADDY_API_KEY", "GODADDY_API_SECRET"},
 }
 
+var dnsProviderCredentialSets = map[string][][]string{
+	"cloudflare":   {{"CF_DNS_API_TOKEN"}, {"CF_API_EMAIL", "CF_API_KEY"}},
+	"alidns":       {{"ALICLOUD_ACCESS_KEY", "ALICLOUD_SECRET_KEY"}},
+	"tencentcloud": {{"TENCENTCLOUD_SECRET_ID", "TENCENTCLOUD_SECRET_KEY"}},
+	"dnspod":       {{"DNSPOD_API_KEY"}},
+	"namesilo":     {{"NAMESILO_API_KEY"}},
+	"godaddy":      {{"GODADDY_API_KEY", "GODADDY_API_SECRET"}},
+}
+
+// ValidateDNSCredentials verifies that a supported provider has one complete
+// credential set. Credential names deliberately match lego's environment
+// variables exactly so invalid aliases are rejected when saved, not at renewal.
+func ValidateDNSCredentials(providerType string, credentials map[string]string) error {
+	sets, ok := dnsProviderCredentialSets[providerType]
+	if !ok {
+		return fmt.Errorf("unsupported DNS provider type: %s", providerType)
+	}
+	for _, set := range sets {
+		complete := true
+		for _, key := range set {
+			if credentials[key] == "" {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			return nil
+		}
+	}
+	return fmt.Errorf("incomplete credentials for DNS provider %s", providerType)
+}
+
 // NewDNSProviderByName 按名称创建 DNS 质询提供程序。
 // 仅导入我们支持的特定提供程序以避免依赖膨胀。
 func NewDNSProviderByName(name string) (challenge.Provider, error) {
@@ -51,6 +83,9 @@ func SetDNSCredentialEnv(providerType string, credentials map[string]string) (cl
 	if !ok {
 		return nil, fmt.Errorf("unsupported DNS provider type: %s", providerType)
 	}
+	if err := ValidateDNSCredentials(providerType, credentials); err != nil {
+		return nil, err
+	}
 
 	var setKeys []string
 	for _, key := range keys {
@@ -58,10 +93,6 @@ func SetDNSCredentialEnv(providerType string, credentials map[string]string) (cl
 			os.Setenv(key, val)
 			setKeys = append(setKeys, key)
 		}
-	}
-
-	if len(setKeys) == 0 {
-		return nil, fmt.Errorf("no valid credentials provided for DNS provider %s", providerType)
 	}
 
 	cleanup = func() {

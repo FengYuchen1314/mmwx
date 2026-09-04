@@ -199,9 +199,12 @@ func (m *SilentModeManager) isAllowedPath(path string) bool {
 	return false
 }
 
+// isAlphanumericPath accepts the same short-code alphabet as the account API
+// and the root mux. The historical name is retained to keep this helper local
+// to silent-mode routing without widening its use.
 func isAlphanumericPath(s string) bool {
 	for _, r := range s {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
 			return false
 		}
 	}

@@ -39,8 +39,17 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 
 	username := auth.UsernameFromContext(r.Context())
 	if username == "" {
-		writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
-		return
+		// /api/package/subscribe is the long-link counterpart of /x/{code}.
+		// It accepts the stable, subscription-only user token and never exposes a
+		// login session or API token in a copied subscription URL.
+		token := strings.TrimSpace(r.URL.Query().Get("token"))
+		resolved, tokenErr := h.repo.ValidateUserToken(r.Context(), token)
+		if tokenErr != nil || resolved == "" {
+			writeError(w, http.StatusUnauthorized, errors.New("invalid subscription token"))
+			return
+		}
+		username = resolved
+		r = r.WithContext(auth.ContextWithUsername(r.Context(), username))
 	}
 
 	user, err := h.repo.GetUser(r.Context(), username)

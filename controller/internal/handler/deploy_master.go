@@ -2,8 +2,11 @@ package handler
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -60,6 +63,91 @@ func (h *CertificateHandler) findCertForDomain(ctx context.Context, domain strin
 	return nil, fmt.Errorf("未找到域名 %s 的有效证书", domain)
 }
 
+type masterHTTPSRequest struct {
+	CertificateID int64  `json:"certificate_id"`
+	Domain        string `json:"domain"`
+}
+
+func normalizeMasterDomain(raw string) (string, error) {
+	domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+	if domain == "" {
+		return "", fmt.Errorf("未配置主控域名")
+	}
+	if len(domain) > 253 || strings.HasPrefix(domain, "*.") || net.ParseIP(domain) != nil || strings.ContainsAny(domain, "/\\:@?#%") {
+		return "", fmt.Errorf("主控域名格式无效")
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", fmt.Errorf("主控域名格式无效")
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+				return "", fmt.Errorf("主控域名格式无效；国际化域名请使用 Punycode")
+			}
+		}
+	}
+	return domain, nil
+}
+
+func certificatePEMCoversDomain(certPEM, domain string) bool {
+	rest := []byte(certPEM)
+	now := time.Now()
+	for len(rest) > 0 {
+		block, remaining := pem.Decode(rest)
+		rest = remaining
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err == nil && !now.Before(cert.NotBefore) && now.Before(cert.NotAfter) && cert.VerifyHostname(domain) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *CertificateHandler) resolveMasterHTTPSSelection(r *http.Request) (string, *storage.Certificate, error) {
+	var req masterHTTPSRequest
+	if r.Body != nil {
+		err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
+		if err != nil && err != io.EOF {
+			return "", nil, fmt.Errorf("请求内容格式无效")
+		}
+	}
+
+	rawDomain := req.Domain
+	if strings.TrimSpace(rawDomain) == "" {
+		rawDomain = getDomainFromMasterURL(h.repo, r.Context())
+	}
+	domain, err := normalizeMasterDomain(rawDomain)
+	if err != nil {
+		return "", nil, err
+	}
+
+	if req.CertificateID <= 0 {
+		cert, findErr := h.findCertForDomain(r.Context(), domain, 0)
+		if findErr != nil {
+			return "", nil, findErr
+		}
+		return domain, cert, nil
+	}
+
+	cert, err := h.repo.GetCertificate(r.Context(), req.CertificateID)
+	if err != nil {
+		return "", nil, fmt.Errorf("所选证书不存在")
+	}
+	if strings.TrimSpace(cert.CertPEM) == "" || strings.TrimSpace(cert.KeyPEM) == "" {
+		return "", nil, fmt.Errorf("所选证书缺少证书链或私钥")
+	}
+	if !certificatePEMCoversDomain(cert.CertPEM, domain) {
+		return "", nil, fmt.Errorf("所选证书无效、已过期或不覆盖域名 %s", domain)
+	}
+	return domain, cert, nil
+}
+
 // GetMasterCertStatus 返回主控证书是否待部署
 func (h *CertificateHandler) GetMasterCertStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -106,15 +194,9 @@ func (h *CertificateHandler) DeployMasterCert(w http.ResponseWriter, r *http.Req
 	}
 
 	ctx := r.Context()
-	domain := getDomainFromMasterURL(h.repo, ctx)
-	if domain == "" {
-		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "未配置主控域名"})
-		return
-	}
-
-	cert, err := h.findCertForDomain(ctx, domain, 0)
+	domain, cert, err := h.resolveMasterHTTPSSelection(r)
 	if err != nil {
-		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "未找到主控域名的有效证书"})
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
 		return
 	}
 
@@ -261,19 +343,12 @@ func (h *CertificateHandler) EnableHTTPS(w http.ResponseWriter, r *http.Request)
 	}
 
 	ctx := r.Context()
-	domain := getDomainFromMasterURL(h.repo, ctx)
-	if domain == "" {
-		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "未配置主控域名"})
-		return
-	}
-	domain = strings.ToLower(strings.TrimSpace(domain))
-	rootDomain := extractRootDomain(domain)
-
-	cert, err := h.findCertForDomain(ctx, domain, 0)
+	domain, cert, err := h.resolveMasterHTTPSSelection(r)
 	if err != nil {
-		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "未找到主控域名的有效证书"})
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
 		return
 	}
+	rootDomain := extractRootDomain(domain)
 
 	if !isNginxInstalled() {
 		log.Printf("[EnableHTTPS] Nginx 未安装，开始安装...")

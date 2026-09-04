@@ -1,9 +1,9 @@
 @echo off
-REM 后端打包脚本 (Windows)
+REM 前后端统一打包脚本 (Windows)
 setlocal enabledelayedexpansion
 
 echo ========================================
-echo 开始构建后端项目
+echo 开始构建前后端项目
 echo ========================================
 
 REM 设置变量
@@ -16,9 +16,32 @@ if exist "%BUILD_DIR%" (
     rmdir /s /q "%BUILD_DIR%"
 )
 
-REM 1. 构建 Go 后端 (Linux)
+REM 1. 构建并刷新嵌入式前端
 echo.
-echo [1/2] 构建 Linux 版本后端...
+echo [1/3] 构建前端项目...
+pushd web
+if errorlevel 1 (
+    echo 无法进入前端目录！
+    exit /b 1
+)
+call npm ci --no-audit --no-fund
+if errorlevel 1 (
+    echo 前端依赖安装失败！
+    popd
+    exit /b 1
+)
+call npm run build
+if errorlevel 1 (
+    echo 前端构建失败！
+    popd
+    exit /b 1
+)
+popd
+echo 前端构建完成 ✓
+
+REM 2. 构建 Go 后端 (Linux)
+echo.
+echo [2/3] 构建 Linux 版本后端...
 set GOOS=linux
 set GOARCH=amd64
 go build -ldflags="-s -w" -o %BUILD_DIR%\mmwx-linux-amd64 ./cmd/server
@@ -28,9 +51,9 @@ if errorlevel 1 (
 )
 echo Linux 后端构建完成 ✓
 
-REM 2. 构建 Go 后端 (Windows)
+REM 3. 构建 Go 后端 (Windows)
 echo.
-echo [2/2] 构建 Windows 版本后端...
+echo [3/3] 构建 Windows 版本后端...
 set GOOS=windows
 set GOARCH=amd64
 go build -ldflags="-s -w" -o %BUILD_DIR%\mmwx-windows-amd64.exe ./cmd/server

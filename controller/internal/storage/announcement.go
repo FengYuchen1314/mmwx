@@ -45,7 +45,7 @@ func (r *TrafficRepository) DeleteAnnouncementsByNode(ctx context.Context, nodeI
 // ListActiveAnnouncements 列当前生效(未过期)的公告,按创建时间倒序。
 // miniappOnly=true 时只返回 via_miniapp 的(供 miniapp/Web 横幅)。
 func (r *TrafficRepository) ListActiveAnnouncements(ctx context.Context, miniappOnly bool) ([]Announcement, error) {
-	q := `SELECT id, type, title, body, via_bot, via_miniapp, created_at, expires_at
+	q := `SELECT id, type, title, body, node_id, via_bot, via_miniapp, created_at, expires_at
 	        FROM announcements
 	       WHERE (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`
 	if miniappOnly {
@@ -58,7 +58,7 @@ func (r *TrafficRepository) ListActiveAnnouncements(ctx context.Context, miniapp
 // ListPendingBotAnnouncements 列需 bot 推送但尚未推送的公告(via_bot + 未过期 + 未投递)。
 func (r *TrafficRepository) ListPendingBotAnnouncements(ctx context.Context) ([]Announcement, error) {
 	return r.queryAnnouncements(ctx,
-		`SELECT id, type, title, body, via_bot, via_miniapp, created_at, expires_at
+		`SELECT id, type, title, body, node_id, via_bot, via_miniapp, created_at, expires_at
 		   FROM announcements
 		  WHERE via_bot = 1 AND bot_delivered_at IS NULL
 		    AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
@@ -146,7 +146,7 @@ func (r *TrafficRepository) queryAnnouncements(ctx context.Context, query string
 		var a Announcement
 		var viaBot, viaMiniapp int
 		var exp sql.NullTime
-		if err := rows.Scan(&a.ID, &a.Type, &a.Title, &a.Body, &viaBot, &viaMiniapp, &a.CreatedAt, &exp); err != nil {
+		if err := rows.Scan(&a.ID, &a.Type, &a.Title, &a.Body, &a.NodeID, &viaBot, &viaMiniapp, &a.CreatedAt, &exp); err != nil {
 			return nil, err
 		}
 		a.ViaBot = viaBot != 0

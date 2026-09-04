@@ -68,6 +68,16 @@ MCP_PLAN.md
 !internal/license/ip_region_test.go
 !internal/handler/protocol_catalog_test.go
 !internal/handler/xray_build_inbound_test.go
+!internal/handler/probe_public_series_test.go
+!internal/handler/announcement_test.go
+!internal/handler/proxy_provider_serve_test.go
+!internal/handler/short_link_test.go
+
+# Keep the root short-link router's contract test while continuing to ignore
+# local debugger binaries created beside cmd/server/main.go.
+!cmd/server/
+cmd/server/__debug_bin*
+!cmd/server/main_test.go
 
 # The controller embeds this self-maintained frontend at build time. Keep the
 # source and its compiled embed assets, but never vendor node_modules.

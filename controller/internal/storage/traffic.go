@@ -14474,6 +14474,27 @@ func (r *TrafficRepository) EnableUserTOTP(ctx context.Context, username, recove
 	return err
 }
 
+// ConsumeUserRecoveryCodes atomically replaces a user's recovery-code hashes
+// only when they still match the set that was validated by the caller. The
+// compare-and-swap prevents concurrent logins from consuming the same
+// one-time recovery code more than once, while deliberately leaving the TOTP
+// secret and enabled state unchanged.
+func (r *TrafficRepository) ConsumeUserRecoveryCodes(ctx context.Context, username, previousCodes, remainingCodes string) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE users
+		SET recovery_codes = ?, updated_at = CURRENT_TIMESTAMP
+		WHERE username = ? AND recovery_codes = ? AND totp_enabled = 1`,
+		remainingCodes, username, previousCodes)
+	if err != nil {
+		return false, fmt.Errorf("consume user recovery codes: %w", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("consume user recovery codes rows affected: %w", err)
+	}
+	return updated == 1, nil
+}
+
 func (r *TrafficRepository) DisableUserTOTP(ctx context.Context, username string) error {
 	_, err := r.db.ExecContext(ctx, `UPDATE users SET totp_enabled = 0, totp_secret = '', recovery_codes = '[]', updated_at = CURRENT_TIMESTAMP WHERE username = ?`, username)
 	return err

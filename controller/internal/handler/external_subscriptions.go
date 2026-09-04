@@ -453,8 +453,8 @@ func NewExternalSubscriptionNodesHandler(repo *storage.TrafficRepository) http.H
 			return
 		}
 
-		// 获取外部订阅
-		sub, err := repo.GetExternalSubscription(r.Context(), id, username)
+		// 管理员可以查看任意 owner 的订阅；普通用户仍限定自己的记录。
+		sub, err := fetchExternalSubForAccess(r, repo, id, username, userIsAdmin(r.Context(), repo, username))
 		if err != nil {
 			if errors.Is(err, storage.ErrExternalSubscriptionNotFound) {
 				writeError(w, http.StatusNotFound, errors.New("subscription not found"))
@@ -515,8 +515,8 @@ func NewExternalSubscriptionCheckFilterHandler(repo *storage.TrafficRepository) 
 			return
 		}
 
-		// 获取外部订阅
-		sub, err := repo.GetExternalSubscription(r.Context(), req.SubscriptionID, username)
+		// 过滤预检沿用列表/编辑接口的访问范围，避免管理员看到记录却无法预检。
+		sub, err := fetchExternalSubForAccess(r, repo, req.SubscriptionID, username, userIsAdmin(r.Context(), repo, username))
 		if err != nil {
 			if errors.Is(err, storage.ErrExternalSubscriptionNotFound) {
 				writeError(w, http.StatusNotFound, errors.New("subscription not found"))

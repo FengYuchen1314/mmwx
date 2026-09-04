@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -20,7 +21,8 @@ func TestDatabaseConfigRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
+	// Windows does not expose persisted POSIX permission bits through os.Stat.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatalf("mode=%o", info.Mode().Perm())
 	}
 	got, _, err := LoadDatabaseConfig(dir)
@@ -397,7 +399,11 @@ func TestReplacePostgresScalarMax(t *testing.T) {
 }
 
 func TestRoutingRulePresetsUpsertDeduplicatesAndPrunes(t *testing.T) {
-	repo := newTestRepo(t)
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "routing-rule-presets.db"))
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
 	ctx := context.Background()
 	if err := repo.CreateUser(ctx, "preset-admin", "preset-admin@example.com", "Admin", "hash", RoleAdmin, ""); err != nil {
 		t.Fatalf("CreateUser: %v", err)

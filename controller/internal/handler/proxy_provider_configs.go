@@ -157,6 +157,14 @@ func (h *ProxyProviderConfigsHandler) handleCreate(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, errors.New("name is required"))
 		return
 	}
+	if dto.ExternalSubscriptionID <= 0 {
+		writeError(w, http.StatusBadRequest, errors.New("external_subscription_id is required"))
+		return
+	}
+	if _, err := h.repo.GetExternalSubscription(r.Context(), dto.ExternalSubscriptionID, username); err != nil {
+		writeError(w, http.StatusForbidden, errors.New("只能为自己创建的外部订阅建立 Proxy Provider"))
+		return
+	}
 	cfg := dto.toStorage(username)
 	id, err := h.repo.CreateProxyProviderConfig(r.Context(), cfg)
 	if err != nil {

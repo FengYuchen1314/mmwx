@@ -228,6 +228,7 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	isAdmin := userIsAdmin(r.Context(), repo, username)
 
 	// 验证匹配规则
 	matchRule := strings.TrimSpace(payload.MatchRule)
@@ -261,11 +262,15 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		useNewTemplateSystem = *payload.UseNewTemplateSystem
 	}
 
-	// 验证并清理代理组源 URL
-	proxyGroupsSourceURL := strings.TrimSpace(payload.ProxyGroupsSourceURL)
-	if err := validateProxyGroupsSourceURL(proxyGroupsSourceURL); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
+	// 代理组与订阅信息节点属于全局 system_config。普通用户只能更新自己的
+	// UserSettings，不能借由这个 RequireToken 端点改变所有账号的订阅输出。
+	proxyGroupsSourceURL := ""
+	if isAdmin {
+		proxyGroupsSourceURL = strings.TrimSpace(payload.ProxyGroupsSourceURL)
+		if err := validateProxyGroupsSourceURL(proxyGroupsSourceURL); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 	}
 
 	// node_order 用指针区分"未提供"与"显式清空":系统设置页等不管节点顺序的调用不会带 node_order,
@@ -314,16 +319,19 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("get system config: %w", err))
 		return
 	}
-	systemConfig.ProxyGroupsSourceURL = proxyGroupsSourceURL
-	systemConfig.ClientCompatibilityMode = payload.ClientCompatibilityMode
-	systemConfig.EnableSubInfoNodes = payload.EnableSubInfoNodes
-	systemConfig.SubInfoV2RayOnly = payload.SubInfoV2RayOnly
-	systemConfig.SubInfoExpirePrefix = payload.SubInfoExpirePrefix
-	systemConfig.SubInfoTrafficPrefix = payload.SubInfoTrafficPrefix
-	if err := repo.UpdateSystemConfig(r.Context(), systemConfig); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("update system config: %w", err))
-		return
+	if isAdmin {
+		systemConfig.ProxyGroupsSourceURL = proxyGroupsSourceURL
+		systemConfig.ClientCompatibilityMode = payload.ClientCompatibilityMode
+		systemConfig.EnableSubInfoNodes = payload.EnableSubInfoNodes
+		systemConfig.SubInfoV2RayOnly = payload.SubInfoV2RayOnly
+		systemConfig.SubInfoExpirePrefix = payload.SubInfoExpirePrefix
+		systemConfig.SubInfoTrafficPrefix = payload.SubInfoTrafficPrefix
+		if err := repo.UpdateSystemConfig(r.Context(), systemConfig); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("update system config: %w", err))
+			return
+		}
 	}
+	proxyGroupsSourceURL = systemConfig.ProxyGroupsSourceURL
 
 	resp := userConfigResponse{
 		ForceSyncExternal:       settings.ForceSyncExternal,
@@ -340,7 +348,7 @@ func handleUpdateUserConfig(w http.ResponseWriter, r *http.Request, repo *storag
 		EnableProxyProvider:     settings.EnableProxyProvider,
 		NodeOrder:               settings.NodeOrder,
 		ProxyGroupsSourceURL:    proxyGroupsSourceURL,
-		ClientCompatibilityMode: payload.ClientCompatibilityMode,
+		ClientCompatibilityMode: systemConfig.ClientCompatibilityMode,
 		EnableSubInfoNodes:      systemConfig.EnableSubInfoNodes,
 		SubInfoV2RayOnly:        systemConfig.SubInfoV2RayOnly,
 		SubInfoExpirePrefix:     systemConfig.SubInfoExpirePrefix,

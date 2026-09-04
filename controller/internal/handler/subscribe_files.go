@@ -220,7 +220,6 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 
 	file := storage.SubscribeFile{
 		Name:                      req.Name,
-		Description:               req.Description,
 		URL:                       req.URL,
 		Type:                      req.Type,
 		Filename:                  req.Filename,
@@ -232,6 +231,9 @@ func (h *subscribeFilesHandler) handleCreate(w http.ResponseWriter, r *http.Requ
 		StatsServerIDs:            req.StatsServerIDs,
 		TrafficLimit:              req.TrafficLimit,
 		CreatedBy:                 username,
+	}
+	if req.Description != nil {
+		file.Description = *req.Description
 	}
 	if req.RawOutput != nil {
 		file.RawOutput = *req.RawOutput
@@ -573,8 +575,8 @@ func (h *subscribeFilesHandler) handleUpdate(w http.ResponseWriter, r *http.Requ
 	if req.Name != "" {
 		existing.Name = req.Name
 	}
-	if req.Description != "" {
-		existing.Description = req.Description
+	if req.Description != nil {
+		existing.Description = *req.Description
 	}
 	if req.URL != "" {
 		existing.URL = req.URL
@@ -940,7 +942,7 @@ func parseFilenameFromContentDisposition(header string) string {
 
 type subscribeFileRequest struct {
 	Name                      string   `json:"name"`
-	Description               string   `json:"description"`
+	Description               *string  `json:"description,omitempty"`
 	URL                       string   `json:"url"`
 	Type                      string   `json:"type"`
 	Filename                  string   `json:"filename"`
@@ -964,6 +966,7 @@ type subscribeFileDTO struct {
 	ID                        int64     `json:"id"`
 	Name                      string    `json:"name"`
 	Description               string    `json:"description"`
+	URL                       string    `json:"url"`
 	Type                      string    `json:"type"`
 	Filename                  string    `json:"filename"`
 	FileShortCode             string    `json:"file_short_code"`
@@ -1006,6 +1009,7 @@ func convertSubscribeFile(file storage.SubscribeFile) subscribeFileDTO {
 		ID:                        file.ID,
 		Name:                      file.Name,
 		Description:               file.Description,
+		URL:                       file.URL,
 		Type:                      file.Type,
 		Filename:                  file.Filename,
 		FileShortCode:             file.FileShortCode,
@@ -1092,11 +1096,24 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 	if filename == "" {
 		filename = req.Name
 	}
-
-	// 确保文件名有.yaml或.yml扩展名
-	ext := filepath.Ext(filename)
-	if ext != ".yaml" && ext != ".yml" {
-		filename = filename + ".yaml"
+	// 与 create/import/upload 共用同一套纯文件名校验。create-from-config
+	// 最终也会写入 subscribes 目录，不能因为它接收的是 JSON 而绕过路径穿越保护。
+	var filenameErr error
+	filename, filenameErr = sanitizeSubscribeFilename(filename)
+	if filenameErr != nil {
+		writeBadRequest(w, filenameErr.Error())
+		return
+	}
+	// create-from-config 也会写物理文件，必须在写盘前做与其它三条创建路径
+	// 相同的归属和配额检查。旧实现先 WriteFile，重名时会覆盖现有订阅，随后
+	// 数据库插入失败又把文件删掉，造成已有订阅内容永久丢失。
+	if err := h.ensureFilenameWritable(r.Context(), filename, username); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
+		writeError(w, http.StatusForbidden, err)
+		return
 	}
 
 	// 验证YAML格式，使用Node API保持顺序和格式
@@ -1184,15 +1201,24 @@ func (h *subscribeFilesHandler) handleCreateFromConfig(w http.ResponseWriter, r 
 	}
 
 	filePath := filepath.Join(subscribesDir, filename)
-	if err := os.WriteFile(filePath, []byte(fixedContent), 0644); err != nil {
+	output, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if errors.Is(err, os.ErrExist) {
+		writeError(w, http.StatusConflict, errors.New("订阅文件已存在，请更换文件名"))
+		return
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
-
-	// 配额校验:普通用户创建订阅受全局配额限制(admin 不限)。
-	if err := checkUserQuota(r.Context(), h.repo, username, "subscribe"); err != nil {
+	if _, err := output.Write([]byte(fixedContent)); err != nil {
+		_ = output.Close()
 		_ = os.Remove(filePath)
-		writeError(w, http.StatusForbidden, err)
+		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
+		return
+	}
+	if err := output.Close(); err != nil {
+		_ = os.Remove(filePath)
+		writeError(w, http.StatusInternalServerError, errors.New("保存订阅文件失败"))
 		return
 	}
 

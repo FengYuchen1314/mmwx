@@ -201,7 +201,13 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	}
 
 	servers, _ := h.repo.ListRemoteServers(ctx)
-	dailyTraffic := h.loadDailyTraffic(ctx, servers, 30)
+	var dailyTraffic map[int64][]probeDailyTraffic
+	if onTraffic {
+		// Daily ledger rows are traffic data too. Besides avoiding needless DB
+		// work, keeping this read behind the switch prevents the 30-day history
+		// from bypassing metric_traffic=false while current totals stay hidden.
+		dailyTraffic = h.loadDailyTraffic(ctx, servers, 30)
+	}
 	var returnRoutes map[int64][]storage.ServerReturnRoute
 	if showReturnRoute {
 		ids := make([]int64, 0, len(idSet))
@@ -216,15 +222,12 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		if !idSet[s.ID] {
 			continue
 		}
-		used, _ := h.repo.GetServerTrafficUsed(ctx, s.ID)
-		used += s.TrafficUsedOffset
 		online := (h.wsHandler != nil && h.wsHandler.IsConnected(s.Token)) || s.Status == "connected"
 		ps := probeServer{
 			Online: online, Region: s.Region, RegionCountry: s.RegionCountry,
 			RegionName: s.RegionName, RegionCity: s.RegionCity,
 			TelecomPaidPeer: s.TelecomPaidPeer,
 		}
-		ps.DailyTraffic = dailyTraffic[s.ID]
 		if onSpeed {
 			up, down := s.CurrentUploadSpeed, s.CurrentDownloadSpeed
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
@@ -246,8 +249,11 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 			}
 		}
 		if onTraffic {
+			used, _ := h.repo.GetServerTrafficUsed(ctx, s.ID)
+			used += s.TrafficUsedOffset
 			tu, tl := used, s.TrafficLimit
 			ps.TrafficUsed, ps.TrafficLimit = &tu, &tl
+			ps.DailyTraffic = dailyTraffic[s.ID]
 			// 累计上下行:仅 system-source 服务器有 rx/tx cycle;>0 才带(前端据此显示"已用上下行"行)。
 			if s.SystemTxCycle > 0 || s.SystemRxCycle > 0 {
 				up, down := s.SystemTxCycle, s.SystemRxCycle

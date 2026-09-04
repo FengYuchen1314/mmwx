@@ -1,3 +1,18 @@
+# Build the architecture-independent Vite bundle on the build platform. Vite
+# writes its output to /app/internal/web/dist, ready for go:embed below.
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS frontend-builder
+
+WORKDIR /app/web
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+# Copy only project inputs so a developer's host node_modules (especially from
+# Windows) can never overwrite the Linux dependencies installed above.
+COPY web/index.html web/tsconfig.json web/vite.config.ts ./
+COPY web/src/ ./src/
+RUN npm run build
+
 # Build stage for backend
 FROM golang:1.26-bookworm AS backend-builder
 
@@ -26,8 +41,18 @@ COPY go.mod go.sum ./
 # Download dependencies
 RUN go mod download
 
-# Copy source code
-COPY . .
+# Copy only the Go build inputs. Keeping web/node_modules out of this stage
+# avoids sending host-specific frontend binaries through the backend build.
+COPY cmd ./cmd
+COPY internal ./internal
+COPY rule_templates ./rule_templates
+COPY subscribes ./subscribes
+COPY templates ./templates
+
+# Always use the bundle built in this image rather than a possibly stale local
+# dist directory from the Docker build context.
+RUN rm -rf internal/web/dist
+COPY --from=frontend-builder /app/internal/web/dist ./internal/web/dist
 
 # Build backend with optimizations (CGO enabled for SQLite WAL support)
 # Use TARGETOS and TARGETARCH for multi-platform builds

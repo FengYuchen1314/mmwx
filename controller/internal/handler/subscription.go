@@ -1441,14 +1441,13 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 		for providerName, provider := range proxyProviders {
 			if providerMap, ok := provider.(map[string]any); ok {
 				if urlStr, ok := providerMap["url"].(string); ok && urlStr != "" {
-					// 检查是否为内部 API 端点：/api/proxy-provider/{id}
-					if configIDStr, found := strings.CutPrefix(urlStr, "/api/proxy-provider/"); found {
-						if configID, err := strconv.ParseInt(configIDStr, 10, 64); err == nil {
-							if url, ok := configIDToURL[configID]; ok {
-								usedURLs[url] = true
-								logger.Info("[Subscription] 从 proxy-providers 找到外部订阅URL",
-									"provider_name", providerName, "config_id", configID, "url", url)
-							}
+					// 前端生成绝对 URL 并附订阅 token；旧文件也可能只保存相对路径。
+					// 两种形式都只按 path 中的配置 ID 解析，query 中的 token 不参与匹配。
+					if configID, found := internalProxyProviderConfigID(urlStr); found {
+						if url, ok := configIDToURL[configID]; ok {
+							usedURLs[url] = true
+							logger.Info("[Subscription] 从 proxy-providers 找到外部订阅URL",
+								"provider_name", providerName, "config_id", configID, "url", url)
 						}
 					}
 				}
@@ -1458,6 +1457,20 @@ func GetExternalSubscriptionsFromFile(ctx context.Context, data []byte, username
 
 	logger.Info("[Subscription] 找到当前文件引用的外部订阅URL", "count", len(usedURLs))
 	return usedURLs, nil
+}
+
+func internalProxyProviderConfigID(raw string) (int64, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, false
+	}
+	const prefix = "/api/proxy-provider/"
+	rawID, found := strings.CutPrefix(parsed.Path, prefix)
+	if !found || rawID == "" || strings.Contains(rawID, "/") {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(rawID, 10, 64)
+	return id, err == nil && id > 0
 }
 
 // 仅同步指定的外部订阅

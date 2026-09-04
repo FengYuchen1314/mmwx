@@ -101,6 +101,9 @@ type RemoteServerCreateRequest struct {
 	TrafficStatsMode  string `json:"traffic_stats_mode"`  // "both"(默认) | "upload" | "download" — 节点流量统计方向
 	TrafficSource     string `json:"traffic_source"`      // "xray"(默认,聚合 node_traffic) | "system"(用 agent 上报系统级网卡累计)
 	IPv6Enabled       *bool  `json:"ipv6_enabled"`        // 指针:nil=默认启用;false=创建时即关闭 v6
+	LockEntryIP       bool   `json:"lock_entry_ip"`       // 创建时即锁定节点入口为服务器 IP
+	PortRangeMin      int    `json:"port_range_min"`      // 新节点随机端口下限，0 表示关闭
+	PortRangeMax      int    `json:"port_range_max"`      // 新节点随机端口上限，0 表示关闭
 	// DDNS 自动同步:开启时 PullAddress 必须是域名,agent 上报新 IP 时自动更新 A/AAAA 记录。
 	// DDNSProviderID=0 → 自动模式(按 PullAddress 找匹配的通配符证书,取证书的 dns_provider_id);>0 → 显式指定
 	DDNSEnabled    bool  `json:"ddns_enabled"`
@@ -509,6 +512,11 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 	if trafficSource != "xray" {
 		trafficSource = "system"
 	}
+	portRangeMin, portRangeMax := req.PortRangeMin, req.PortRangeMax
+	if portRangeMin < 0 || portRangeMax < 0 || portRangeMin > 65535 || portRangeMax > 65535 ||
+		(portRangeMin > 0 && portRangeMax > 0 && portRangeMin > portRangeMax) {
+		portRangeMin, portRangeMax = 0, 0
+	}
 
 	// DDNS 开启时必须用域名 — agent 上报 IP 漂移后,DDNS 把这个域名的 A/AAAA 指到新 IP
 	if req.DDNSEnabled {
@@ -567,6 +575,9 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		TrafficStatsMode:  trafficStatsMode,
 		TrafficSource:     trafficSource,
 		IPv6Enabled:       req.IPv6Enabled == nil || *req.IPv6Enabled, // 默认启用;仅显式 false 才关闭
+		LockEntryIP:       req.LockEntryIP,
+		PortRangeMin:      portRangeMin,
+		PortRangeMax:      portRangeMax,
 		DDNSEnabled:       req.DDNSEnabled,
 		DDNSProviderID:    req.DDNSProviderID,
 	}
@@ -577,6 +588,14 @@ func (h *XrayServerHandler) CreateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			Success: false,
 			Message: fmt.Sprintf("创建服务器失败: %s", err.Error()),
 		})
+		return
+	}
+	// remote_servers 的基础 INSERT 保持兼容旧 schema；扩展节点策略由幂等列更新落库。
+	// 创建接口既然接受并回显这组字段，就不能像旧实现那样静默忽略用户选择。
+	if err := h.repo.SetServerNodeSettings(ctx, server.ID, server.LockEntryIP, server.PortRangeMin, server.PortRangeMax); err != nil {
+		_ = h.repo.DeleteRemoteServer(ctx, server.ID)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(RemoteServerResponse{Success: false, Message: fmt.Sprintf("保存节点入口策略失败: %s", err.Error())})
 		return
 	}
 	var defaultExpiry *time.Time
@@ -1061,7 +1080,13 @@ func (h *XrayServerHandler) UpdateRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		if connMode == "" {
 			connMode = oldServer.ConnectionMode
 		}
-		if err := h.repo.UpdateRemoteServerConfig(ctx, req.ID, connMode, req.PullAddress, req.PullPort, req.PullToken); err != nil {
+		// 列表接口会脱敏 PullToken，所以表单的空值表示“未提供”，不能
+		// 覆盖数据库里的真实密钥。令牌轮换走专用端点。
+		pullToken := req.PullToken
+		if pullToken == "" {
+			pullToken = oldServer.PullToken
+		}
+		if err := h.repo.UpdateRemoteServerConfig(ctx, req.ID, connMode, req.PullAddress, req.PullPort, pullToken); err != nil {
 			log.Printf("[Remote Server] Failed to update pull config for server %d: %v", req.ID, err)
 			// 之前这里只 log 不返 error,导致用户看到 success 但 pull_address 没真更新;
 			// 现在向前端透出错误,起码用户能感知失败并 retry。

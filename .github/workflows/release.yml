@@ -39,6 +39,16 @@ jobs:
             controller/go.sum
             agent/go.sum
             xray-core/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: controller/web/package-lock.json
+      - name: Build controller frontend
+        working-directory: controller/web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
       - name: Test controller
         working-directory: controller
         run: |
@@ -162,6 +172,18 @@ jobs:
             controller/go.sum
             agent/go.sum
             xray-core/go.sum
+      - uses: actions/setup-node@v4
+        if: matrix.component == 'controller'
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: controller/web/package-lock.json
+      - name: Build controller web UI
+        if: matrix.component == 'controller'
+        working-directory: controller/web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
       - name: Cross-compile binary
         env:
           DIRECTORY: ${{ matrix.directory }}

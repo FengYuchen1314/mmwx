@@ -1939,7 +1939,7 @@ func (h *RemoteManageHandler) HandleXrayConfigFiles(w http.ResponseWriter, r *ht
 		}
 	}
 
-	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/xray/config/files"+query, body)
+	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/xray/config-files"+query, body)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadGateway, err.Error())
 		return
@@ -1979,7 +1979,7 @@ func (h *RemoteManageHandler) HandleNginxConfigFiles(w http.ResponseWriter, r *h
 		}
 	}
 
-	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/nginx/config/files"+query, body)
+	result, err := h.forwardToRemoteServer(r.Context(), id, r.Method, "/api/child/nginx/config-files"+query, body)
 	if err != nil {
 		remoteWriteError(w, http.StatusBadGateway, err.Error())
 		return

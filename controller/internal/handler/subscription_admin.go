@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -447,12 +448,10 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 			}
 		}
 
-		// 从系统设置检查是否全局启用短链接
-		systemConfig, sysErr := repo.GetSystemConfig(r.Context())
-		enableShortLink := true
-		if sysErr == nil {
-			enableShortLink = systemConfig.EnableShortLink
-		}
+		// 短链接只有在全局和当前用户两层开关都启用时才可生成。
+		// 设置不可读时回退到令牌长链，不会泄露一条实际应当失效的短链。
+		enableShortLink := shortLinksGloballyEnabled(r.Context(), repo) &&
+			userShortLinksEnabled(r.Context(), repo, username)
 
 		// 仅在启用短链接时获取用户短代码(优先用户自定义短码,否则系统自动短码)。
 		// 管理员现在也能编辑自己的 user_short_code(订阅文件 popover 里),所以订阅链接也拼上,
@@ -466,6 +465,15 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 				userShortCode = ""
 			}
 		}
+		// The list API returns the final usable URL. This keeps the UI correct when
+		// the subscription domain differs from the panel domain and when short
+		// links are globally disabled.
+		subscriptionBase, _ := repo.GetSystemSetting(r.Context(), "subscription_url")
+		subscriptionBase = strings.TrimRight(strings.TrimSpace(subscriptionBase), "/")
+		if subscriptionBase == "" {
+			subscriptionBase = observedPublicBaseURL(r)
+		}
+		userToken, tokenErr := repo.GetOrCreateUserToken(r.Context(), username)
 		_ = user // role 字段不再用于此处的短码逻辑(保留 user 变量供其他地方使用)
 
 		type item struct {
@@ -476,6 +484,7 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 			Type            string     `json:"type"`
 			FileShortCode   string     `json:"file_short_code,omitempty"`
 			CustomShortCode string     `json:"custom_short_code,omitempty"`
+			URL             string     `json:"url,omitempty"`
 			ExpireAt        *time.Time `json:"expire_at"`
 			UpdatedAt       time.Time  `json:"updated_at"`
 			LatestVersion   int64      `json:"latest_version,omitempty"`
@@ -495,6 +504,25 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 				customShortCode = file.CustomShortCode
 			}
 
+			linkPath := ""
+			shortCode := customShortCode
+			if shortCode == "" {
+				shortCode = fileShortCode
+			}
+			if enableShortLink && shortCode != "" && userShortCode != "" {
+				linkPath = "/x/" + url.PathEscape(shortCode+userShortCode)
+			} else if tokenErr == nil && userToken != "" {
+				if file.Type == "package" || file.Filename == "__package__" {
+					linkPath = "/api/package/subscribe?token=" + url.QueryEscape(userToken)
+				} else if file.Filename != "" {
+					linkPath = "/api/clash/subscribe?filename=" + url.QueryEscape(file.Filename) + "&token=" + url.QueryEscape(userToken)
+				}
+			}
+			publicURL := linkPath
+			if linkPath != "" && subscriptionBase != "" {
+				publicURL = subscriptionBase + linkPath
+			}
+
 			payload = append(payload, item{
 				ID:              file.ID,
 				Name:            file.Name,
@@ -503,6 +531,7 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 				Type:            file.Type,
 				FileShortCode:   fileShortCode,
 				CustomShortCode: customShortCode,
+				URL:             publicURL,
 				ExpireAt:        file.ExpireAt,
 				UpdatedAt:       file.UpdatedAt,
 				LatestVersion:   latestVersion,
@@ -510,8 +539,9 @@ func NewSubscriptionListHandler(repo *storage.TrafficRepository) http.Handler {
 		}
 
 		respondJSON(w, http.StatusOK, map[string]any{
-			"subscriptions":   payload,
-			"user_short_code": userShortCode,
+			"subscriptions":    payload,
+			"user_short_code":  userShortCode,
+			"subscription_url": subscriptionBase,
 		})
 	})
 }

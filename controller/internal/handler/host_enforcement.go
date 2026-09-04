@@ -91,6 +91,7 @@ func (e *hostEnforcer) shouldBlock(r *http.Request) bool {
 func isSubscriptionPath(path string) bool {
 	return strings.HasPrefix(path, "/x/") ||
 		path == "/api/clash/subscribe" ||
+		path == "/api/package/subscribe" ||
 		path == "/api/user/package-subscribe" ||
 		path == "/api/subscribe"
 }

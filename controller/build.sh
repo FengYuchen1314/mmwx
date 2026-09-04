@@ -1,9 +1,9 @@
 #!/bin/bash
-# 后端打包脚本 (Linux/Mac)
+# 前后端统一打包脚本 (Linux/Mac)
 set -e
 
 echo "========================================"
-echo "开始构建后端项目"
+echo "开始构建前后端项目"
 echo "========================================"
 
 # 设置变量
@@ -13,7 +13,7 @@ LDFLAGS="-s -w"
 
 # 0. 同步版本号
 echo ""
-echo "[0/2] 同步版本号..."
+echo "[0/3] 同步版本号..."
 bash scripts/sync-version.sh
 echo "版本号同步完成 ✓"
 
@@ -23,15 +23,25 @@ if [ -d "$BUILD_DIR" ]; then
     rm -rf "$BUILD_DIR"
 fi
 
-# 1. 构建 Go 后端 (Linux)
+# 1. 构建并刷新嵌入式前端
 echo ""
-echo "[1/2] 构建 Linux 版本后端..."
+echo "[1/3] 构建前端项目..."
+(
+    cd web
+    npm ci --no-audit --no-fund
+    npm run build
+)
+echo "前端构建完成 ✓"
+
+# 2. 构建 Go 后端 (Linux)
+echo ""
+echo "[2/3] 构建 Linux 版本后端..."
 GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o "${BUILD_DIR}/mmwx-linux-amd64" ./cmd/server
 echo "Linux 后端构建完成 ✓"
 
-# 2. 构建 Go 后端 (Windows)
+# 3. 构建 Go 后端 (Windows)
 echo ""
-echo "[2/2] 构建 Windows 版本后端..."
+echo "[3/3] 构建 Windows 版本后端..."
 GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o "${BUILD_DIR}/mmwx-windows-amd64.exe" ./cmd/server
 echo "Windows 后端构建完成 ✓"
 

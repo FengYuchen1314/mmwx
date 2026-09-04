@@ -36,6 +36,7 @@ import (
 	inttgbot "miaomiaowux/internal/tgbot"
 	"miaomiaowux/internal/traffic"
 	"miaomiaowux/internal/version"
+	webui "miaomiaowux/internal/web"
 	ruletemplates "miaomiaowux/rule_templates"
 	"miaomiaowux/subscribes"
 
@@ -429,7 +430,7 @@ func main() {
 	mux.Handle("/api/admin/template-v3/", auth.RequireToken(tokenStore, userRepo, templateV3Handler))
 
 	// 包管理端点（仅限管理员）— list/create 不依赖 limiterPusher;delete 需解绑用户,延后到 remoteManageHandler/limiterPusher 创建后注册
-	mux.Handle("/api/admin/packages", auth.RequireAdmin(tokenStore, userRepo, handler.NewPackageListHandler(repo)))
+	mux.Handle("/api/admin/packages", auth.RequireAdmin(tokenStore, userRepo, handler.NewPackageListHandler(repo, licenseManager)))
 	packageCreateHandler := handler.NewPackageCreateHandler(repo)
 	packageCreateHandler.SetLicenseManager(licenseManager)
 	mux.Handle("/api/admin/packages/create", auth.RequireAdmin(tokenStore, userRepo, packageCreateHandler))
@@ -449,6 +450,8 @@ func main() {
 	mux.Handle("/api/user/token", auth.RequireToken(tokenStore, userRepo, handler.NewUserTokenHandler(repo)))
 	// 代理集合(Clash proxy-provider)配置 — 用户自己 CRUD;handler 内做 username 隔离
 	mux.Handle("/api/user/proxy-provider-configs", auth.RequireToken(tokenStore, userRepo, handler.NewProxyProviderConfigsHandler(repo)))
+	// 服务端处理的 Provider 内容使用订阅专用稳定 token 自鉴权，供 Clash/Mihomo 直接拉取。
+	mux.Handle("/api/proxy-provider/", handler.NewProxyProviderServeHandler(repo))
 	// 每用户 API 令牌(供 MCP / 程序化访问);明文仅创建时返回一次
 	mux.Handle("/api/user/api-tokens", auth.RequireToken(tokenStore, userRepo, handler.NewUserAPITokensHandler(repo)))
 	mux.Handle("/api/user/api-tokens/", auth.RequireToken(tokenStore, userRepo, handler.NewUserAPITokensHandler(repo)))
@@ -463,6 +466,7 @@ func main() {
 	mux.Handle("/api/traffic/summary/aggregated", auth.RequireToken(tokenStore, userRepo, trafficHandler))
 	mux.Handle("/api/subscriptions", auth.RequireToken(tokenStore, userRepo, handler.NewSubscriptionListHandler(repo)))
 	mux.Handle("/api/user/package-subscribe", auth.RequireToken(tokenStore, userRepo, packageSubscribeHandler))
+	mux.Handle("/api/package/subscribe", packageSubscribeHandler)
 	mux.Handle("/api/dns/resolve", auth.RequireToken(tokenStore, userRepo, handler.NewDNSHandler()))
 	mux.Handle("/api/subscribe-files", auth.RequireToken(tokenStore, userRepo, handler.NewSubscribeFilesListHandler(repo)))
 	mux.Handle("/api/clash/subscribe", handler.NewSubscriptionEndpoint(tokenStore, repo, subscribeDir))
@@ -1266,6 +1270,11 @@ func main() {
 	// /t/{id} 路径路由到临时订阅处理程序
 	// 所有其他路径都转到 Web 处理程序
 	shortLinkHandler := handler.NewShortLinkHandler(repo, subscriptionHandler, packageSubscribeHandler)
+	webHandler, err := webui.NewHandler(dataDir)
+	if err != nil {
+		logger.Error("嵌入式 Web 前端初始化失败", "error", err)
+		os.Exit(1)
+	}
 	// 暴力防护 / 订阅频率限制 用前面 LoadSecuritySettings 拿到的同一份 secCfg 构造,
 	// system_settings 里有自定义阈值就用它们,没有就 fallback 到 hardcoded 默认值(24h/24h/30 次/2h)。
 	bruteForceProtector := handler.NewBruteForceProtectorWithConfig(
@@ -1288,6 +1297,8 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	// data/public 中的普通文件由受限文件根目录提供，目录遍历和越界符号链接会被拒绝。
+	mux.Handle("/public/", webHandler)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		path := strings.Trim(r.URL.Path, "/")
@@ -1302,7 +1313,7 @@ func main() {
 		}
 
 		isSubscriptionFetch := isTempSub ||
-			(strings.HasPrefix(path, "x/") && len(path) > 2 && isAlphanumeric(path[2:]))
+			(strings.HasPrefix(path, "x/") && len(path) > 2 && isShortCodeSegment(path[2:]))
 		if isSubscriptionFetch && !subRateLimiter.Allow(clientIP) {
 			http.Error(w, "请求过于频繁，请稍后再试", http.StatusTooManyRequests)
 			return
@@ -1320,7 +1331,7 @@ func main() {
 		// 可变长度短链接匹配（/x/{fileCode}{userCode} 格式）
 		if strings.HasPrefix(path, "x/") {
 			code := path[2:]
-			if len(code) >= 2 && isAlphanumeric(code) {
+			if len(code) >= 2 && isShortCodeSegment(code) {
 				if shortLinkHandler.TryServe(w, r) {
 					return
 				}
@@ -1330,8 +1341,9 @@ func main() {
 			}
 		}
 
-		// 本项目不再内置前端；未知路径统一返回 404。
-		http.NotFound(w, r)
+		// 未命中短链接的普通页面交给嵌入式 SPA；API/MCP/健康检查等保留路径
+		// 会在 Web handler 内继续返回 404，不会被 history fallback 吞掉。
+		webHandler.ServeHTTP(w, r)
 	})
 
 	// 嵌入式 MCP server(streamable-HTTP):供 OpenClaw 等 agent 运维。鉴权在工具调用时按 API 令牌经 mux 复用现有链。
@@ -1560,10 +1572,13 @@ func getAddr(config *ServerConfig, repo *storage.TrafficRepository) string {
 	return host + ":" + port
 }
 
-// 检查字符串是否仅包含字母数字字符
-func isAlphanumeric(s string) bool {
+// isShortCodeSegment mirrors the short-code alphabet accepted by the user
+// settings API: ASCII letters, digits, underscore, and hyphen. Keeping this
+// check at the root mux prevents valid custom short codes from being rejected
+// before shortLinkHandler can resolve them.
+func isShortCodeSegment(s string) bool {
 	for _, r := range s {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
 			return false
 		}
 	}

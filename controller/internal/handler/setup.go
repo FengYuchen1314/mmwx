@@ -216,6 +216,14 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		domain := ""
+		if strings.TrimSpace(payload.Domain) != "" {
+			domain, err = normalizeMasterDomain(payload.Domain)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+		}
 
 		if nickname == "" {
 			nickname = username
@@ -304,10 +312,7 @@ func NewInitialSetupHandler(repo *storage.TrafficRepository, dataDir ...string) 
 			Email:    email,
 		}
 
-		domain := strings.TrimSpace(payload.Domain)
 		if domain != "" {
-			domain = strings.ToLower(domain)
-
 			port := "12889"
 			if _, p, err := net.SplitHostPort(r.Host); err == nil && p != "" {
 				port = p
@@ -354,10 +359,14 @@ func NewVerifyDomainHandler() http.Handler {
 			return
 		}
 
-		domain := strings.TrimSpace(strings.ToLower(req.Domain))
-		if domain == "" {
+		if strings.TrimSpace(req.Domain) == "" {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "域名不能为空"})
+			return
+		}
+		domain, err := normalizeMasterDomain(req.Domain)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 

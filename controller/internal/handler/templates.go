@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/storage"
-	"github.com/MMWOrg/mmwX-plugins/proxyparser/substore"
 )
 
 type templateRequest struct {
@@ -287,14 +287,20 @@ func handleUpdateTemplate(w http.ResponseWriter, r *http.Request, repo *storage.
 		return
 	}
 
-	// 归属校验:普通用户不能改别人的模板。
+	// 归属校验:普通用户不能改别人的模板。无论谁执行更新,所有权都保留原值。
 	username := auth.UsernameFromContext(r.Context())
-	if !userIsAdmin(r.Context(), repo, username) {
-		existing, gerr := repo.GetTemplateByID(r.Context(), id)
-		if gerr != nil || existing.CreatedBy != username {
+	existing, gerr := repo.GetTemplateByID(r.Context(), id)
+	if gerr != nil {
+		if errors.Is(gerr, storage.ErrTemplateNotFound) {
 			writeError(w, http.StatusNotFound, storage.ErrTemplateNotFound)
 			return
 		}
+		writeError(w, http.StatusInternalServerError, gerr)
+		return
+	}
+	if !userIsAdmin(r.Context(), repo, username) && existing.CreatedBy != username {
+		writeError(w, http.StatusNotFound, storage.ErrTemplateNotFound)
+		return
 	}
 
 	t := storage.Template{
@@ -305,7 +311,7 @@ func handleUpdateTemplate(w http.ResponseWriter, r *http.Request, repo *storage.
 		RuleSource:       req.RuleSource,
 		UseProxy:         req.UseProxy,
 		EnableIncludeAll: req.EnableIncludeAll,
-		CreatedBy:        username,
+		CreatedBy:        existing.CreatedBy,
 	}
 
 	if err := repo.UpdateTemplate(r.Context(), t); err != nil {

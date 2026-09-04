@@ -25,11 +25,12 @@ import (
 
 // PackageListHandler 处理列出所有包模板
 type PackageListHandler struct {
-	repo *storage.TrafficRepository
+	repo           *storage.TrafficRepository
+	licenseManager *license.Manager
 }
 
-func NewPackageListHandler(repo *storage.TrafficRepository) *PackageListHandler {
-	return &PackageListHandler{repo: repo}
+func NewPackageListHandler(repo *storage.TrafficRepository, licenseManager *license.Manager) *PackageListHandler {
+	return &PackageListHandler{repo: repo, licenseManager: licenseManager}
 }
 
 func (h *PackageListHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -45,8 +46,13 @@ func (h *PackageListHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	limiterAvailable := true
+	if h.licenseManager != nil {
+		limiterAvailable = h.licenseManager.HasFeature("limiter")
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"packages": packages,
+		"features": map[string]bool{"limiter": limiterAvailable},
 	})
 }
 

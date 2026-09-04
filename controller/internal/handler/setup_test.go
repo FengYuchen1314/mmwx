@@ -49,11 +49,41 @@ func TestInitialSetupValidatesRegistrationFields(t *testing.T) {
 		{"invalid username", map[string]any{"username": "a_b", "password": "password123"}},
 		{"short password", map[string]any{"username": "owner", "password": "short"}},
 		{"invalid email", map[string]any{"username": "owner", "password": "password123", "email": "not-an-email"}},
+		{"domain with scheme", map[string]any{"username": "owner", "password": "password123", "domain": "https://panel.example.com"}},
+		{"domain with port", map[string]any{"username": "owner", "password": "password123", "domain": "panel.example.com:443"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if rec := setupRequestForTest(t, h, tc.payload); rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestNormalizeMasterDomain(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+		ok    bool
+	}{
+		{" Panel.Example.COM. ", "panel.example.com", true},
+		{"xn--fsqu00a.xn--0zwm56d", "xn--fsqu00a.xn--0zwm56d", true},
+		{"https://panel.example.com", "", false},
+		{"panel.example.com/path", "", false},
+		{"panel.example.com:443", "", false},
+		{"127.0.0.1", "", false},
+		{"*.example.com", "", false},
+		{"bad_label.example.com", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got, err := normalizeMasterDomain(tc.input)
+			if tc.ok && (err != nil || got != tc.want) {
+				t.Fatalf("normalizeMasterDomain(%q) = %q, %v; want %q", tc.input, got, err, tc.want)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("normalizeMasterDomain(%q) unexpectedly succeeded with %q", tc.input, got)
 			}
 		})
 	}
@@ -91,6 +121,25 @@ func TestInitialSetupCreatesOnlyOneAdministratorAndPreservesPassword(t *testing.
 	second := setupRequestForTest(t, h, map[string]any{"username": "owner-2", "password": "password456"})
 	if second.Code != http.StatusConflict {
 		t.Fatalf("second setup status = %d, want %d; body=%s", second.Code, http.StatusConflict, second.Body.String())
+	}
+}
+
+func TestInitialSetupStoresNormalizedDomain(t *testing.T) {
+	repo := newSetupTestRepository(t)
+	rec := setupRequestForTest(t, NewInitialSetupHandler(repo, t.TempDir()), map[string]any{
+		"username": "owner",
+		"password": "password123",
+		"domain":   " Panel.Example.COM. ",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	got, err := repo.GetSystemSetting(context.Background(), "master_url")
+	if err != nil {
+		t.Fatalf("load master_url: %v", err)
+	}
+	if want := "http://panel.example.com:12889"; got != want {
+		t.Fatalf("master_url = %q, want %q", got, want)
 	}
 }
 

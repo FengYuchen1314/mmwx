@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"miaomiaowux/internal/auth"
 )
@@ -37,15 +38,22 @@ func NewPasswordHandler(manager *auth.Manager) http.Handler {
 			return
 		}
 
-		current := strings.TrimSpace(payload.CurrentPassword)
-		newPassword := strings.TrimSpace(payload.NewPassword)
-		if current == "" || newPassword == "" {
+		// Passwords are byte-sensitive credentials. Preserve the exact values for
+		// verification and hashing; trimming here would make accounts whose valid
+		// password starts or ends with whitespace unable to change it.
+		current := payload.CurrentPassword
+		newPassword := payload.NewPassword
+		if strings.TrimSpace(current) == "" || strings.TrimSpace(newPassword) == "" {
 			writeError(w, http.StatusBadRequest, errors.New("current and new passwords are required"))
 			return
 		}
 
-		if len(newPassword) < 8 {
+		if utf8.RuneCountInString(newPassword) < 8 {
 			writeError(w, http.StatusBadRequest, errors.New("new password must be at least 8 characters"))
+			return
+		}
+		if len([]byte(newPassword)) > 72 {
+			writeError(w, http.StatusBadRequest, errors.New("new password must not exceed 72 bytes"))
 			return
 		}
 

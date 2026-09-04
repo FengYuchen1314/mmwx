@@ -125,8 +125,28 @@ func (h *ProbeSeriesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if metric == "system" {
+		series := aggregateProbeSystemSeries(view.System, rng.Buckets, rng.BucketSec)
+		// The store intentionally keeps one complete in-memory snapshot so a
+		// later configuration change can take effect without rebuilding rings.
+		// Public history must still obey the same display/collection switches as
+		// the list payload; otherwise callers could bypass a disabled metric by
+		// querying this endpoint directly.
+		if v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricCPUKey); v != "1" {
+			series.CPUPct = nil
+		}
+		if v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricMemKey); v != "1" {
+			series.MemUsed, series.MemTotal = nil, nil
+		}
+		// Traffic and speed are default-on display switches: only the explicit
+		// value "0" disables them, matching GetProbeDisguise/buildPayload.
+		if v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricSpeedKey); v == "0" {
+			series.UploadSpeed, series.DownloadSpeed = nil, nil
+		}
+		if v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseMetricTrafficKey); v == "0" {
+			series.CumulativeUp, series.CumulativeDown = nil, nil
+		}
 		json.NewEncoder(w).Encode(map[string]any{
-			"success": true, "series": aggregateProbeSystemSeries(view.System, rng.Buckets, rng.BucketSec),
+			"success": true, "series": series,
 			"bucket_sec": rng.BucketSec, "generated_at": time.Now().Unix(),
 		})
 		return
@@ -188,13 +208,13 @@ type probeMetricPoint struct {
 }
 
 type probeSystemSeries struct {
-	CPUPct         []probeMetricPoint `json:"cpu_pct"`
-	MemUsed        []probeMetricPoint `json:"mem_used"`
-	MemTotal       []probeMetricPoint `json:"mem_total"`
-	UploadSpeed    []probeMetricPoint `json:"upload_speed"`
-	DownloadSpeed  []probeMetricPoint `json:"download_speed"`
-	CumulativeUp   []probeMetricPoint `json:"cumulative_up"`
-	CumulativeDown []probeMetricPoint `json:"cumulative_down"`
+	CPUPct         []probeMetricPoint `json:"cpu_pct,omitempty"`
+	MemUsed        []probeMetricPoint `json:"mem_used,omitempty"`
+	MemTotal       []probeMetricPoint `json:"mem_total,omitempty"`
+	UploadSpeed    []probeMetricPoint `json:"upload_speed,omitempty"`
+	DownloadSpeed  []probeMetricPoint `json:"download_speed,omitempty"`
+	CumulativeUp   []probeMetricPoint `json:"cumulative_up,omitempty"`
+	CumulativeDown []probeMetricPoint `json:"cumulative_down,omitempty"`
 }
 
 func aggregateProbeSystemSeries(slots []probeSystemSlot, buckets, bucketSec int) probeSystemSeries {

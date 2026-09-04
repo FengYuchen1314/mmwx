@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"miaomiaowux/internal/auth"
 	"miaomiaowux/internal/license"
 	"miaomiaowux/internal/storage"
 )
@@ -194,6 +195,7 @@ func (h *AnnouncementHandler) createInstance(w http.ResponseWriter, r *http.Requ
 		Type           string `json:"type"`
 		Title          string `json:"title"`
 		Body           string `json:"body"`
+		NodeID         int64  `json:"node_id"`
 		ExpiresMinutes int    `json:"expires_minutes"` // 0 = 永不过期
 		ViaBot         bool   `json:"via_bot"`
 		ViaMiniapp     bool   `json:"via_miniapp"`
@@ -209,6 +211,19 @@ func (h *AnnouncementHandler) createInstance(w http.ResponseWriter, r *http.Requ
 	if req.Type == "" {
 		req.Type = AnnounceTypeGeneral
 	}
+	isNodeAnnouncement := req.Type == AnnounceTypeNodeBlocked || req.Type == AnnounceTypeNodeRecovered
+	if isNodeAnnouncement {
+		if req.NodeID <= 0 {
+			writeError(w, http.StatusBadRequest, errors.New("节点类公告必须选择节点"))
+			return
+		}
+		if _, err := h.repo.GetNodeByID(r.Context(), req.NodeID); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("所选节点不存在"))
+			return
+		}
+	} else {
+		req.NodeID = 0
+	}
 	var expiresAt *time.Time
 	if req.ExpiresMinutes > 0 {
 		t := time.Now().Add(time.Duration(req.ExpiresMinutes) * time.Minute)
@@ -216,7 +231,7 @@ func (h *AnnouncementHandler) createInstance(w http.ResponseWriter, r *http.Requ
 	}
 	id, err := h.PublishAnnouncement(r.Context(), storage.Announcement{
 		Type: req.Type, Title: strings.TrimSpace(req.Title), Body: strings.TrimSpace(req.Body),
-		ViaBot: req.ViaBot, ViaMiniapp: req.ViaMiniapp, ExpiresAt: expiresAt,
+		NodeID: req.NodeID, ViaBot: req.ViaBot, ViaMiniapp: req.ViaMiniapp, ExpiresAt: expiresAt,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -260,6 +275,7 @@ func (h *AnnouncementHandler) GetActive(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	items = filterAnnouncementsForUser(r.Context(), h.repo, auth.UsernameFromContext(r.Context()), items)
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "announcements": items})
 }
 
@@ -268,8 +284,13 @@ func (h *AnnouncementHandler) GetActive(w http.ResponseWriter, r *http.Request) 
 //   - 节点相关公告(node_id!=0)→ 仅当用户套餐内含该节点才显示。
 func filterAnnouncementsForUser(ctx context.Context, repo *storage.TrafficRepository, username string, items []storage.Announcement) []storage.Announcement {
 	empty := []storage.Announcement{}
-	if strings.TrimSpace(username) == "" {
+	username = strings.TrimSpace(username)
+	if username == "" {
 		return empty
+	}
+	// 管理员需要看到完整公告集合以便确认发布结果；普通用户才按套餐节点隔离。
+	if userIsAdmin(ctx, repo, username) {
+		return items
 	}
 	user, err := repo.GetUser(ctx, username)
 	if err != nil || user.PackageID <= 0 {

@@ -1,7 +1,8 @@
 # MMWX
 
-MMWX is a backend-only repository containing the control plane API, Agent, and
-the paired Xray runtime fork. It does not bundle or serve a web frontend.
+MMWX contains the Go control plane, its embedded React/Vite management UI, the
+managed Agent, and the paired Xray runtime fork. The controller serves the UI
+and API from the same binary.
 
 ## 项目来源与二次开发声明
 
@@ -14,11 +15,12 @@ OSI 认可的开源许可证；使用、修改和分发本项目时仍须遵守�
 
 本仓库的主要修改包括：整合 Controller、Agent 与配套 Xray runtime；将协议范围调整为
 VLESS + REALITY + Vision、VLESS + XHTTP + REALITY + XMUX、AnyTLS + ShadowTLS、Mieru
-和 SOCKS5；移除内置 Web 前端并改为纯后端发布结构。
+和 SOCKS5；并根据当前 Controller API 重建了内嵌 Web 管理端，覆盖管理员与普通用户流程。
 
 ## Layout
 
-- `controller/` — Go control plane API
+- `controller/` — Go control plane API and embedded web console
+- `controller/web/` — React/Vite web console source
 - `agent/` — managed server Agent and ShadowTLS sidecar supervisor
 - `xray-core/` — paired Xray runtime fork
 
@@ -31,5 +33,6 @@ Agent images to GHCR, and uploads cross-platform binaries to GitHub Releases.
 It intentionally contains no VPS deployment job; published releases never
 modify an existing server automatically.
 
-The controller exposes `/healthz` for health checks. Its root path and other
-unknown routes return `404`; use the HTTP API or MCP endpoint to manage it.
+The controller exposes `/healthz` for health checks, `/api/*` for the HTTP API,
+`/mcp` for agent tooling, and the embedded management console at `/`. Client-side
+console routes use an SPA fallback while unknown API and asset paths remain 404.
