@@ -102,17 +102,23 @@ func TestTrafficLimitEnforcerSuspendsSharedRoutedSubaccount(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	enforcer := NewTrafficLimitEnforcer(repo, NewRemoteManageHandler(repo, nil), nil)
+	remoteManage := NewRemoteManageHandler(repo, nil)
+	enforcer := NewTrafficLimitEnforcer(repo, remoteManage, nil)
 	if ok := enforcer.suspendUserRoutedAccess(ctx, "alice"); !ok {
 		t.Fatal("shared routed access was not fully suspended")
 	}
+	remoteManage.snapshotRefreshWG.Wait()
 	sa, err := repo.GetUserSubaccount(ctx, routed.ID, "alice")
 	if err != nil || sa == nil || sa.IsActive {
 		t.Fatalf("subaccount must be retained but inactive: %#v, %v", sa, err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(paths) != 2 || paths[0] != "/api/child/routing" || paths[1] != "/api/child/inbounds" {
+	counts := make(map[string]int, 3)
+	for _, path := range paths {
+		counts[path]++
+	}
+	if len(paths) != 4 || counts["/api/child/routing"] != 1 || counts["/api/child/inbounds"] != 1 || counts["/api/child/xray/config"] != 2 {
 		t.Fatalf("unexpected agent calls: %v", paths)
 	}
 }

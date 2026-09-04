@@ -47,6 +47,7 @@ type RemoteManageHandler struct {
 	onMasterMigrated    func(context.Context, string)
 	yamlSyncManager     *YAMLSyncManager
 	serverAddressSyncMu sync.Mutex
+	snapshotRefreshWG   sync.WaitGroup
 }
 
 // SetSubscribeDir enables synchronization of persisted YAML subscriptions when
@@ -1540,7 +1541,11 @@ func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverI
 	// (用 defer + named return 统一处理所有 return 分支,无需在每个 return 点重复)
 	defer func() {
 		if err == nil && shouldRefreshXraySnapshotAfter(method, path) {
-			go h.refreshXraySnapshot(serverID)
+			h.snapshotRefreshWG.Add(1)
+			go func() {
+				defer h.snapshotRefreshWG.Done()
+				h.refreshXraySnapshot(serverID)
+			}()
 		}
 	}()
 
